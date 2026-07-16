@@ -37,3 +37,8 @@ winit = "0.30"
 cosmic-text = "0.19"
 ropey = "1.6"
 pollster = "1.0"
+# Wayland-first system clipboard. `wayland-data-control` adds the wl-clipboard-rs
+# backend (works without a focused surface); default features (image-data) are
+# off since a text editor never puts images on the clipboard. Resolved to
+# arboard 3.6.1 against crates.io on 2026-07-16.
+arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }

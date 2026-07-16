@@ -14,12 +14,13 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use umber_kernel::{Command, CommandRegistry, Config, FeatureRegistry};
 use umber_text::TextBuffer;
-use umber_ui::{Renderer, ScrollbarInfo};
+use umber_ui::{OverlaySpec, Renderer, ScrollbarInfo, SelSpan};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
@@ -34,9 +35,72 @@ const WHEEL_LINES: f32 = 3.0;
 /// Base line height in logical px, for converting pixel-delta scroll to lines.
 const BASE_LINE_PX: f64 = 20.0;
 
-/// How long the overlay scrollbar lingers after the last scroll/hover/drag
-/// (Ghostty-style auto-hide).
-const SCROLLBAR_LINGER: Duration = Duration::from_millis(800);
+/// Number of rows on the settings page (drives selection clamping).
+const SETTINGS_ROWS: usize = 6;
+
+/// The current top-level input surface. A single keyboard dispatch point routes
+/// by this state (Slice 2): the editor path is unchanged from Slice 1; the
+/// three modals capture all input while open and render over a dimmed editor
+/// frame.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum View {
+    Editor,
+    Palette,
+    Settings,
+    Modules,
+}
+
+/// The full command set (D6). Registration order is the palette's default
+/// listing order and the tie-break for equal fuzzy scores.
+fn build_command_registry() -> CommandRegistry {
+    let mut reg = CommandRegistry::new();
+    for (id, title, key) in [
+        ("file.save", "File: Save", "Ctrl+S"),
+        ("edit.undo", "Edit: Undo", "Ctrl+Z"),
+        ("edit.redo", "Edit: Redo", "Ctrl+Shift+Z"),
+        ("edit.copy", "Edit: Copy", "Ctrl+C"),
+        ("edit.cut", "Edit: Cut", "Ctrl+X"),
+        ("edit.paste", "Edit: Paste", "Ctrl+V"),
+        ("edit.selectAll", "Edit: Select All", "Ctrl+A"),
+        ("goto.fileStart", "Go: File Start", "Ctrl+Home"),
+        ("goto.fileEnd", "Go: File End", "Ctrl+End"),
+        (
+            "view.commandPalette",
+            "View: Command Palette",
+            "Ctrl+Shift+P",
+        ),
+        ("view.settings", "Preferences: Open Settings", "Ctrl+,"),
+        ("view.modules", "Modules: Manage", ""),
+        (
+            "view.toggle.gutter",
+            "View: Toggle Gutter / Line Numbers",
+            "",
+        ),
+        (
+            "view.toggle.scrollbar",
+            "View: Toggle Overlay Scrollbar",
+            "",
+        ),
+        ("view.toggle.latencyHud", "View: Toggle Latency HUD", ""),
+        ("app.quit", "Application: Quit", "Ctrl+Q"),
+    ] {
+        reg.register(Command {
+            id,
+            title,
+            keybinding: key,
+        });
+    }
+    reg
+}
+
+/// Human ON/OFF label for a boolean setting/feature.
+fn onoff(v: bool) -> String {
+    if v {
+        "ON".to_string()
+    } else {
+        "OFF".to_string()
+    }
+}
 
 fn main() -> ExitCode {
     // Cold-start clock starts at the earliest point in the process (docs/PLAN.md
@@ -65,12 +129,42 @@ fn main() -> ExitCode {
         }
     };
 
+    // Wayland-first clipboard (arboard + wayland-data-control). A failure here
+    // must not sink the editor \u{2014} degrade to no clipboard.
+    let clipboard = match arboard::Clipboard::new() {
+        Ok(cb) => Some(cb),
+        Err(err) => {
+            eprintln!("umber: clipboard unavailable ({err}); copy/paste disabled");
+            None
+        }
+    };
+
+    let config = Config::load();
+    let features = FeatureRegistry::from_config(&config);
+    let commands = build_command_registry();
+    let scrollbar_linger = Duration::from_millis(config.scrollbar_linger_ms);
+
     let mut app = App {
         buffer,
         renderer: None,
+        view: View::Editor,
+        config,
+        features,
+        commands,
+        palette_query: String::new(),
+        palette_filtered: Vec::new(),
+        palette_sel: 0,
+        settings_sel: 0,
+        modules_sel: 0,
+        modules_hint: None,
+        scrollbar_linger,
         cursor_char: 0,
-        first_visible_line: 0,
         goal_col: 0,
+        selection_anchor: None,
+        selecting: false,
+        clipboard,
+        sel_spans: Vec::new(),
+        first_visible_line: 0,
         modifiers: ModifiersState::empty(),
         pointer: (0.0, 0.0),
         scrollbar_deadline: None,
@@ -100,10 +194,45 @@ struct App {
     buffer: TextBuffer,
     renderer: Option<Renderer>,
 
+    // --- Slice 2: kernel + modal views ---
+    /// Current input surface (editor or a modal).
+    view: View,
+    /// Loaded config (D13); live-applied and persisted on change.
+    config: Config,
+    /// Feature/module registry (D10).
+    features: FeatureRegistry,
+    /// Command registry (D6), the palette's source.
+    commands: CommandRegistry,
+    /// Palette query, filtered command indices, and selected row.
+    palette_query: String,
+    palette_filtered: Vec<usize>,
+    palette_sel: usize,
+    /// Settings page selected row.
+    settings_sel: usize,
+    /// Modules page selected row + a transient status hint (e.g. kernel
+    /// refusal per D10).
+    modules_sel: usize,
+    modules_hint: Option<String>,
+    /// Scrollbar auto-hide linger from config (replaces the old fixed const).
+    scrollbar_linger: Duration,
+
     /// Single cursor as an absolute char index into the buffer (multi-cursor is
     /// P1). `goal_col` preserves the visual column across vertical moves.
     cursor_char: usize,
     goal_col: usize,
+
+    /// Selection anchor as an absolute char index; the head is `cursor_char`.
+    /// `None` = no selection; a non-empty selection is `anchor != cursor_char`.
+    selection_anchor: Option<usize>,
+    /// True while the left button is held after a text press, so `CursorMoved`
+    /// extends the selection (drag-select).
+    selecting: bool,
+    /// System clipboard (arboard). `None` when init failed \u{2014} copy/cut/paste
+    /// then degrade to a no-op with an eprintln, never a panic.
+    clipboard: Option<arboard::Clipboard>,
+    /// Reused buffer for the per-view selection highlight spans, rebuilt in
+    /// `apply_view` and handed to the renderer.
+    sel_spans: Vec<SelSpan>,
 
     /// First document line drawn; the scroll window is `[first_visible_line ..
     /// first_visible_line + capacity + MARGIN)`.
@@ -195,13 +324,18 @@ impl App {
             None
         };
 
+        let dirty = if self.buffer.is_dirty() {
+            "\u{2022} "
+        } else {
+            ""
+        };
         let name = self
             .buffer
             .path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "*scratch*".to_string());
         let prefix = format!(
-            "umber P0 \u{2014} {name} \u{2014} {} lines, {} bytes \u{2014} Ln {}, Col {}",
+            "umber P0 \u{2014} {dirty}{name} \u{2014} {} lines, {} bytes \u{2014} Ln {}, Col {}",
             self.buffer.len_lines(),
             self.buffer.len_bytes(),
             cl + 1,
@@ -223,12 +357,48 @@ impl App {
             let _ = write!(numbers, "{:>width$}", ln + 1, width = digits);
         }
 
+        // Selection highlight spans for the visible window (window-relative
+        // lines). Interior lines are full-width (`end_col = None`); the first and
+        // last selected lines are partial. Off-screen lines are skipped. Taken
+        // out of `self` so the span build can borrow the buffer immutably.
+        let mut spans = std::mem::take(&mut self.sel_spans);
+        spans.clear();
+        if let Some((sel_s, sel_e)) = self.selection_range() {
+            let s_line = self.buffer.char_to_line(sel_s);
+            let e_line = self.buffer.char_to_line(sel_e);
+            let win_start = self.first_visible_line;
+            let win_end = self.first_visible_line + cap; // exclusive
+            let last_line = self.buffer.len_lines().saturating_sub(1);
+            let from = s_line.max(win_start);
+            let to = e_line.min(win_end.saturating_sub(1)).min(last_line);
+            for line in from..=to {
+                let line_start = self.buffer.line_to_char(line);
+                let start_col = if line == s_line {
+                    sel_s - line_start
+                } else {
+                    0
+                };
+                let end_col = if line == e_line {
+                    Some(sel_e - line_start)
+                } else {
+                    None
+                };
+                spans.push(SelSpan {
+                    line: line - win_start,
+                    start_col,
+                    end_col,
+                });
+            }
+        }
+
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.set_gutter(&numbers, digits);
             renderer.set_document(&text);
             renderer.set_cursor(cursor);
+            renderer.set_selection(&spans);
             renderer.set_stats_prefix(prefix);
         }
+        self.sel_spans = spans;
     }
 
     /// Adjust the scroll offset by `delta` lines, clamped to the buffer.
@@ -239,7 +409,9 @@ impl App {
 
     /// Show the scrollbar and (re)start its linger countdown.
     fn poke_scrollbar(&mut self) {
-        self.scrollbar_deadline = Some(Instant::now() + SCROLLBAR_LINGER);
+        if self.config.scrollbar {
+            self.scrollbar_deadline = Some(Instant::now() + self.scrollbar_linger);
+        }
     }
 
     /// Whether the scrollbar should paint right now.
@@ -339,15 +511,15 @@ impl App {
     /// Returns `true` if the caret moved (caller marks latency + redraws). Uses
     /// the same gutter/cell arithmetic as cursor rendering so click and caret
     /// agree.
-    fn click_to_position(&mut self) -> bool {
+    fn pointer_to_char(&self) -> Option<usize> {
         let (doc_top, line_px, text_left, cell_w) = match self.renderer.as_ref() {
             Some(r) => (r.doc_top(), r.line_px(), r.text_left(), r.cell_w()),
-            None => return false,
+            None => return None,
         };
         let x = self.pointer.0 as f32;
         let y = self.pointer.1 as f32;
         if y < doc_top {
-            return false; // banner, not the document
+            return None; // banner, not the document
         }
         let rel_line = ((y - doc_top) / line_px).floor() as i64;
         let last = self.buffer.len_lines().saturating_sub(1) as i64;
@@ -355,8 +527,160 @@ impl App {
         let col_f = ((x - text_left) / cell_w).round();
         let col = if col_f < 0.0 { 0 } else { col_f as usize };
         let col = col.min(self.buffer.visual_line_len_chars(line));
-        self.cursor_char = self.buffer.line_to_char(line) + col;
+        Some(self.buffer.line_to_char(line) + col)
+    }
+
+    /// Ordered non-empty selection range `(start, end)` in char indices, or
+    /// `None` when there is no selection (anchor absent or collapsed onto the
+    /// caret).
+    fn selection_range(&self) -> Option<(usize, usize)> {
+        match self.selection_anchor {
+            Some(a) if a != self.cursor_char => {
+                Some((a.min(self.cursor_char), a.max(self.cursor_char)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Prepare for a cursor move: end the typing-coalesce run, and either open
+    /// an anchor (shift held, extending the selection) or drop the selection
+    /// (plain move collapses).
+    fn begin_move(&mut self, shift: bool) {
+        self.buffer.break_coalescing();
+        if shift {
+            if self.selection_anchor.is_none() {
+                self.selection_anchor = Some(self.cursor_char);
+            }
+        } else {
+            self.selection_anchor = None;
+        }
+    }
+
+    /// Delete the current selection, collapsing the caret to the range start.
+    /// Returns `true` if anything was removed. One undo group unless already
+    /// inside a transaction.
+    fn delete_selection(&mut self) -> bool {
+        if let Some((s, e)) = self.selection_range() {
+            self.buffer.remove_char_range(s, e);
+            self.cursor_char = s;
+            self.selection_anchor = None;
+            self.update_goal_col();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Replace the selection (if any) with `text`, else insert at the caret. A
+    /// replacement is one atomic undo group (delete + insert). Used by paste and
+    /// by typing/Enter/Tab when a selection is active.
+    fn replace_selection_with(&mut self, text: &str) {
+        if self.selection_range().is_some() {
+            self.buffer.begin_transaction();
+            self.delete_selection();
+            self.buffer.insert_str(self.cursor_char, text);
+            self.cursor_char += text.chars().count();
+            self.buffer.end_transaction();
+        } else {
+            self.buffer.insert_str(self.cursor_char, text);
+            self.cursor_char += text.chars().count();
+        }
+        self.selection_anchor = None;
         self.update_goal_col();
+    }
+
+    /// Select the whole buffer (Ctrl+A): anchor at 0, head at the end.
+    fn select_all(&mut self) {
+        self.buffer.break_coalescing();
+        self.selection_anchor = Some(0);
+        self.cursor_char = self.buffer.len_chars();
+        self.update_goal_col();
+    }
+
+    /// Undo one group; move the caret to the returned op site and drop any
+    /// selection. Returns `true` if the buffer changed.
+    fn do_undo(&mut self) -> bool {
+        match self.buffer.undo() {
+            Some(pos) => {
+                self.cursor_char = pos;
+                self.selection_anchor = None;
+                self.update_goal_col();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Redo one group; symmetric to [`App::do_undo`].
+    fn do_redo(&mut self) -> bool {
+        match self.buffer.redo() {
+            Some(pos) => {
+                self.cursor_char = pos;
+                self.selection_anchor = None;
+                self.update_goal_col();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Write the buffer to disk (Ctrl+S). Scratch buffers have no path yet.
+    fn do_save(&mut self) {
+        match self.buffer.save() {
+            Ok(true) => {}
+            Ok(false) => eprintln!("umber: no path to save (scratch buffer)"),
+            Err(err) => eprintln!("umber: save failed: {err}"),
+        }
+    }
+
+    /// Copy the selection to the system clipboard (no-op without a selection or
+    /// clipboard).
+    fn clipboard_copy(&mut self) {
+        let (s, e) = match self.selection_range() {
+            Some(r) => r,
+            None => return,
+        };
+        let text = self.buffer.slice_chars(s, e);
+        match self.clipboard.as_mut() {
+            Some(cb) => {
+                if let Err(err) = cb.set_text(text) {
+                    eprintln!("umber: clipboard copy failed: {err}");
+                }
+            }
+            None => eprintln!("umber: clipboard unavailable"),
+        }
+    }
+
+    /// Copy then delete the selection (Ctrl+X). Returns `true` if the buffer
+    /// changed.
+    fn clipboard_cut(&mut self) -> bool {
+        if self.selection_range().is_none() {
+            return false;
+        }
+        self.clipboard_copy();
+        self.delete_selection()
+    }
+
+    /// Paste clipboard text over the selection (Ctrl+V). Returns `true` if the
+    /// buffer changed.
+    fn clipboard_paste(&mut self) -> bool {
+        let text = match self.clipboard.as_mut() {
+            Some(cb) => match cb.get_text() {
+                Ok(t) => t,
+                Err(err) => {
+                    eprintln!("umber: clipboard paste failed: {err}");
+                    return false;
+                }
+            },
+            None => {
+                eprintln!("umber: clipboard unavailable");
+                return false;
+            }
+        };
+        if text.is_empty() {
+            return false;
+        }
+        self.replace_selection_with(&text);
         true
     }
 
@@ -386,6 +710,413 @@ impl App {
             None => event_loop.set_control_flow(ControlFlow::Wait),
         }
     }
+
+    // ===================================================================
+    //  Slice 2: config live-apply, modal views, command dispatch.
+    // ===================================================================
+
+    /// Push the current config into the renderer + event loop and re-render the
+    /// editor view. Called at startup and after any config/feature change so
+    /// font size, line height, gutter, latency HUD, and scrollbar settings take
+    /// effect live (font/line rebuild renderer metrics like a scale change).
+    fn apply_config(&mut self) {
+        self.scrollbar_linger = Duration::from_millis(self.config.scrollbar_linger_ms);
+        if !self.config.scrollbar {
+            self.scrollbar_deadline = None;
+            self.scrollbar_dragging = false;
+        }
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_metrics(self.config.font_size, self.config.line_height);
+            r.set_gutter_enabled(self.config.gutter);
+            r.set_latency_hud(self.config.latency_hud);
+        }
+        self.apply_view(true);
+    }
+
+    /// Rebuild the overlay spec for the current view and hand it to the renderer
+    /// (or clear it in the editor), then request a redraw. All modal text is
+    /// shaped here (the state-change path), never in `render`.
+    fn refresh_overlay(&mut self) {
+        let spec = self.build_overlay_spec();
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_overlay(spec);
+            r.window().request_redraw();
+        }
+    }
+
+    /// Build the overlay spec for the current modal, or `None` for the editor.
+    fn build_overlay_spec(&self) -> Option<OverlaySpec> {
+        match self.view {
+            View::Editor => None,
+            View::Palette => {
+                let cap = self
+                    .renderer
+                    .as_ref()
+                    .map(|r| r.overlay_row_capacity())
+                    .unwrap_or(1);
+                let n = self.palette_filtered.len();
+                let sel = if n == 0 {
+                    0
+                } else {
+                    self.palette_sel.min(n - 1)
+                };
+                let start = if sel < cap { 0 } else { sel + 1 - cap };
+                let end = (start + cap).min(n);
+                let mut rows = Vec::with_capacity(end - start);
+                for &ci in &self.palette_filtered[start..end] {
+                    let c = self.commands.commands()[ci];
+                    rows.push((c.title.to_string(), c.keybinding.to_string()));
+                }
+                Some(OverlaySpec {
+                    title: None,
+                    input: Some(format!("> {}", self.palette_query)),
+                    rows,
+                    left_color: [225, 225, 230],
+                    right_color: [135, 135, 150],
+                    split_frac: 0.62,
+                    selected: if n == 0 { None } else { Some(sel - start) },
+                    hint: Some(format!(
+                        "{n} commands  \u{2014}  \u{2191}\u{2193} select \u{2022} Enter run \u{2022} Esc close"
+                    )),
+                })
+            }
+            View::Settings => {
+                let c = &self.config;
+                let rows = vec![
+                    ("Font size (px)".to_string(), format!("{}", c.font_size)),
+                    ("Line height (px)".to_string(), format!("{}", c.line_height)),
+                    (
+                        "Scrollbar linger (ms)".to_string(),
+                        format!("{}", c.scrollbar_linger_ms),
+                    ),
+                    ("Line-number gutter".to_string(), onoff(c.gutter)),
+                    ("Overlay scrollbar".to_string(), onoff(c.scrollbar)),
+                    ("Latency HUD".to_string(), onoff(c.latency_hud)),
+                ];
+                Some(OverlaySpec {
+                    title: Some("Preferences \u{2014} Settings".to_string()),
+                    input: None,
+                    rows,
+                    left_color: [150, 150, 162],
+                    right_color: [228, 228, 234],
+                    split_frac: 0.5,
+                    selected: Some(self.settings_sel),
+                    hint: Some(
+                        "\u{2191}\u{2193} select \u{2022} \u{2190}/\u{2192} or +/- adjust \u{2022} Enter toggle \u{2022} Esc save & close"
+                            .to_string(),
+                    ),
+                })
+            }
+            View::Modules => {
+                let mut rows = Vec::new();
+                for f in self.features.features() {
+                    let state = if f.enabled { "ON " } else { "OFF" };
+                    let tag = if f.removable { "" } else { "  [kernel]" };
+                    rows.push((
+                        f.name.to_string(),
+                        format!("{state}  \u{2022}  {}{tag}", f.description),
+                    ));
+                }
+                let hint = self.modules_hint.clone().unwrap_or_else(|| {
+                    "\u{2191}\u{2193} select \u{2022} Enter toggle \u{2022} Esc save & close"
+                        .to_string()
+                });
+                Some(OverlaySpec {
+                    title: Some("Modules \u{2014} Manage".to_string()),
+                    input: None,
+                    rows,
+                    left_color: [225, 225, 230],
+                    right_color: [150, 150, 162],
+                    split_frac: 0.30,
+                    selected: Some(self.modules_sel),
+                    hint: Some(hint),
+                })
+            }
+        }
+    }
+
+    /// Open the command palette (Ctrl+Shift+P, D6).
+    fn open_palette(&mut self) {
+        self.view = View::Palette;
+        self.palette_query.clear();
+        self.palette_sel = 0;
+        self.palette_filtered = self.commands.filter("");
+        self.refresh_overlay();
+    }
+
+    /// Open the settings page (Ctrl+, / "Preferences: Open Settings").
+    fn open_settings(&mut self) {
+        self.view = View::Settings;
+        self.settings_sel = 0;
+        self.refresh_overlay();
+    }
+
+    /// Open the modules page ("Modules: Manage").
+    fn open_modules(&mut self) {
+        self.view = View::Modules;
+        self.modules_sel = 0;
+        self.modules_hint = None;
+        self.refresh_overlay();
+    }
+
+    /// Return to the editor, clearing any overlay and repainting.
+    fn close_overlay(&mut self) {
+        self.view = View::Editor;
+        self.apply_view(false);
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_overlay(None);
+            r.window().request_redraw();
+        }
+    }
+
+    /// Recompute the palette filter after the query changed.
+    fn repalette(&mut self) {
+        self.palette_filtered = self.commands.filter(&self.palette_query);
+        self.palette_sel = 0;
+        self.refresh_overlay();
+    }
+
+    /// Command palette keyboard handling (captures all input while open).
+    fn palette_key(&mut self, event: KeyEvent, event_loop: &ActiveEventLoop) {
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.close_overlay();
+                return;
+            }
+            Key::Named(NamedKey::Enter) => {
+                let id = self
+                    .palette_filtered
+                    .get(self.palette_sel)
+                    .map(|&i| self.commands.commands()[i].id);
+                self.view = View::Editor;
+                match id {
+                    Some(id) => self.execute_command(id, event_loop),
+                    None => self.close_overlay(),
+                }
+                return;
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                let n = self.palette_filtered.len();
+                if n > 0 {
+                    self.palette_sel = (self.palette_sel + 1) % n;
+                }
+                self.refresh_overlay();
+                return;
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                let n = self.palette_filtered.len();
+                if n > 0 {
+                    self.palette_sel = (self.palette_sel + n - 1) % n;
+                }
+                self.refresh_overlay();
+                return;
+            }
+            Key::Named(NamedKey::Backspace) => {
+                self.palette_query.pop();
+                self.repalette();
+                return;
+            }
+            _ => {}
+        }
+        if let Some(text) = &event.text {
+            let mut added = false;
+            for ch in text.chars() {
+                if !ch.is_control() {
+                    self.palette_query.push(ch);
+                    added = true;
+                }
+            }
+            if added {
+                self.repalette();
+            }
+        }
+    }
+
+    /// Settings page keyboard handling.
+    fn settings_key(&mut self, event: KeyEvent, _event_loop: &ActiveEventLoop) {
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                let _ = self.config.save();
+                self.close_overlay();
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                self.settings_sel = self.settings_sel.saturating_sub(1);
+                self.refresh_overlay();
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                self.settings_sel = (self.settings_sel + 1).min(SETTINGS_ROWS - 1);
+                self.refresh_overlay();
+            }
+            Key::Named(NamedKey::Enter) => {
+                // Enter toggles booleans; numeric rows ignore it.
+                if self.settings_sel >= 3 {
+                    self.settings_adjust(1);
+                }
+            }
+            Key::Named(NamedKey::ArrowLeft) => self.settings_adjust(-1),
+            Key::Named(NamedKey::ArrowRight) => self.settings_adjust(1),
+            _ => {
+                if let Some(text) = &event.text {
+                    match text.as_str() {
+                        "+" | "=" => self.settings_adjust(1),
+                        "-" | "_" => self.settings_adjust(-1),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// Apply a +/- step to the selected setting, then persist + live-apply.
+    fn settings_adjust(&mut self, dir: i32) {
+        match self.settings_sel {
+            0 => {
+                self.config.font_size = (self.config.font_size + dir as f32)
+                    .clamp(umber_kernel::FONT_MIN, umber_kernel::FONT_MAX);
+            }
+            1 => {
+                self.config.line_height = (self.config.line_height + dir as f32)
+                    .clamp(umber_kernel::LINE_MIN, umber_kernel::LINE_MAX);
+            }
+            2 => {
+                let v = self.config.scrollbar_linger_ms as i64 + dir as i64 * 100;
+                self.config.scrollbar_linger_ms = v.clamp(
+                    umber_kernel::LINGER_MIN as i64,
+                    umber_kernel::LINGER_MAX as i64,
+                ) as u64;
+            }
+            3 => self.config.gutter = !self.config.gutter,
+            4 => self.config.scrollbar = !self.config.scrollbar,
+            5 => self.config.latency_hud = !self.config.latency_hud,
+            _ => {}
+        }
+        // Keep the feature registry in step with the config booleans.
+        self.features = FeatureRegistry::from_config(&self.config);
+        let _ = self.config.save();
+        self.apply_config();
+        self.refresh_overlay();
+    }
+
+    /// Modules page keyboard handling.
+    fn modules_key(&mut self, event: KeyEvent, _event_loop: &ActiveEventLoop) {
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                let _ = self.config.save();
+                self.close_overlay();
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                self.modules_sel = self.modules_sel.saturating_sub(1);
+                self.modules_hint = None;
+                self.refresh_overlay();
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                let n = self.features.features().len();
+                self.modules_sel = (self.modules_sel + 1).min(n.saturating_sub(1));
+                self.modules_hint = None;
+                self.refresh_overlay();
+            }
+            Key::Named(NamedKey::Enter) => self.modules_toggle_current(),
+            _ => {}
+        }
+    }
+
+    /// Toggle the selected feature (D10). Kernel entries refuse with a hint.
+    fn modules_toggle_current(&mut self) {
+        match self.features.toggle(self.modules_sel) {
+            Ok(_) => {
+                self.modules_hint = None;
+                self.features.apply_to_config(&mut self.config);
+                let _ = self.config.save();
+                self.apply_config();
+            }
+            Err(hint) => self.modules_hint = Some(hint.to_string()),
+        }
+        self.refresh_overlay();
+    }
+
+    /// Toggle a feature by id (from a palette command). Kernel entries no-op,
+    /// leaving a hint for the modules page.
+    fn toggle_feature(&mut self, id: &str) {
+        if let Some(idx) = self.features.index_of(id) {
+            match self.features.toggle(idx) {
+                Ok(_) => {
+                    self.features.apply_to_config(&mut self.config);
+                    let _ = self.config.save();
+                    self.apply_config();
+                }
+                Err(hint) => self.modules_hint = Some(hint.to_string()),
+            }
+        }
+    }
+
+    /// Run a registered command by id. Commands that open a modal switch the
+    /// view and return; in-place commands run and drop back to the editor.
+    fn execute_command(&mut self, id: &str, event_loop: &ActiveEventLoop) {
+        // Commands that move the caret must scroll the view to it after the
+        // overlay closes (matching the apply_view(true) their keyboard paths
+        // use) — close_overlay alone would leave the viewport behind.
+        let mut follow = false;
+        match id {
+            "view.commandPalette" => {
+                self.open_palette();
+                return;
+            }
+            "view.settings" => {
+                self.open_settings();
+                return;
+            }
+            "view.modules" => {
+                self.open_modules();
+                return;
+            }
+            "app.quit" => {
+                event_loop.exit();
+                return;
+            }
+            "file.save" => self.do_save(),
+            "edit.undo" => {
+                self.do_undo();
+                follow = true;
+            }
+            "edit.redo" => {
+                self.do_redo();
+                follow = true;
+            }
+            "edit.copy" => self.clipboard_copy(),
+            "edit.cut" => {
+                self.clipboard_cut();
+                follow = true;
+            }
+            "edit.paste" => {
+                self.clipboard_paste();
+                follow = true;
+            }
+            "edit.selectAll" => self.select_all(),
+            "goto.fileStart" => {
+                self.buffer.break_coalescing();
+                self.selection_anchor = None;
+                self.cursor_char = 0;
+                self.update_goal_col();
+                follow = true;
+            }
+            "goto.fileEnd" => {
+                self.buffer.break_coalescing();
+                self.selection_anchor = None;
+                self.cursor_char = self.buffer.len_chars();
+                self.update_goal_col();
+                follow = true;
+            }
+            "view.toggle.gutter" => self.toggle_feature("gutter"),
+            "view.toggle.scrollbar" => self.toggle_feature("scrollbar"),
+            "view.toggle.latencyHud" => self.toggle_feature("latency-hud"),
+            _ => {}
+        }
+        // In-place command finished: return to the editor and repaint.
+        self.close_overlay();
+        if follow {
+            self.apply_view(true);
+        }
+    }
 }
 
 impl ApplicationHandler for App {
@@ -411,7 +1142,8 @@ impl ApplicationHandler for App {
 
         let renderer = Renderer::new(window, event_loop);
         self.renderer = Some(renderer);
-        self.apply_view(true);
+        // Push config metrics/toggles into the fresh renderer, then draw.
+        self.apply_config();
         if let Some(renderer) = self.renderer.as_ref() {
             renderer.window().request_redraw();
         }
@@ -433,6 +1165,12 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size.width, size.height);
+                }
+                // Modal overlays are shaped to the surface width at set_overlay
+                // time; a resize while one is open must re-spec it or its text
+                // stays laid out for the old geometry.
+                if self.view != View::Editor {
+                    self.refresh_overlay();
                 }
                 self.apply_view(false);
                 if let Some(renderer) = self.renderer.as_ref() {
@@ -457,6 +1195,9 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
+                if self.view != View::Editor {
+                    return;
+                }
                 // Scroll is a P0 exit-criterion path (100 MB fixture), so it
                 // feeds the D4 latency ring exactly like keystrokes do. It also
                 // reveals the overlay scrollbar (Ghostty-style).
@@ -482,6 +1223,19 @@ impl ApplicationHandler for App {
                 self.pointer = (position.x, position.y);
                 if self.scrollbar_dragging {
                     self.drag_scrollbar(position.y);
+                } else if self.selecting {
+                    // Drag-extend the selection. Throttle: only re-render when the
+                    // mapped char actually changes, not on raw mouse motion.
+                    if let Some(pos) = self.pointer_to_char() {
+                        if pos != self.cursor_char {
+                            self.cursor_char = pos;
+                            self.update_goal_col();
+                            self.apply_view(true);
+                            if let Some(renderer) = self.renderer.as_ref() {
+                                renderer.window().request_redraw();
+                            }
+                        }
+                    }
                 } else if self.pointer_in_scrollbar_zone() {
                     // Only the hidden->visible transition needs a frame; while
                     // already visible, hovering just extends the linger timer
@@ -498,6 +1252,9 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
+                if self.view != View::Editor {
+                    return;
+                }
                 if button != MouseButton::Left {
                     return;
                 }
@@ -512,9 +1269,23 @@ impl ApplicationHandler for App {
                             }
                             return;
                         }
-                        // Click-to-position: mark it in the D4 ring like a
-                        // keystroke so pointer placement is measured too.
-                        if self.click_to_position() {
+                        // Text press: place the caret and set the selection
+                        // anchor. Shift extends from the existing anchor/caret; a
+                        // plain press collapses (anchor == caret) and arms a drag.
+                        // Marked in the D4 ring like a keystroke.
+                        if let Some(pos) = self.pointer_to_char() {
+                            let shift = self.modifiers.shift_key();
+                            self.buffer.break_coalescing();
+                            if shift {
+                                if self.selection_anchor.is_none() {
+                                    self.selection_anchor = Some(self.cursor_char);
+                                }
+                            } else {
+                                self.selection_anchor = Some(pos);
+                            }
+                            self.cursor_char = pos;
+                            self.selecting = true;
+                            self.update_goal_col();
                             self.apply_view(true);
                             if let Some(renderer) = self.renderer.as_mut() {
                                 renderer.mark_keystroke(t);
@@ -523,6 +1294,7 @@ impl ApplicationHandler for App {
                         }
                     }
                     ElementState::Released => {
+                        self.selecting = false;
                         if self.scrollbar_dragging {
                             self.scrollbar_dragging = false;
                             // Start the linger countdown now the drag ended.
@@ -539,17 +1311,82 @@ impl ApplicationHandler for App {
                 if event.state != ElementState::Pressed {
                     return;
                 }
+                // Slice 2 dispatch: modals capture all input while open; the
+                // editor path below runs only in the editor view.
+                match self.view {
+                    View::Editor => {}
+                    View::Palette => {
+                        self.palette_key(event, event_loop);
+                        return;
+                    }
+                    View::Settings => {
+                        self.settings_key(event, event_loop);
+                        return;
+                    }
+                    View::Modules => {
+                        self.modules_key(event, event_loop);
+                        return;
+                    }
+                }
                 // Timestamp at event receipt — the head of the keystroke->present
                 // latency measurement (D4).
                 let t = Instant::now();
                 let ctrl = self.modifiers.control_key();
+                let shift = self.modifiers.shift_key();
                 let len = self.buffer.len_chars();
+                // `changed` = buffer content changed (feeds the D4 latency ring);
+                // `redraw_only` = view/banner changed without an edit (selection,
+                // save marker) and just needs a repaint.
                 let mut changed = false;
-                let mut follow = true;
+                let mut redraw_only = false;
+
+                // Ctrl chords: clipboard, undo/redo, save, select-all. These
+                // consume the key; the printable path below is already Ctrl-gated.
+                if ctrl {
+                    if let Key::Character(c) = &event.logical_key {
+                        match c.to_lowercase().as_str() {
+                            "p" if shift => {
+                                self.open_palette();
+                                return;
+                            }
+                            "," => {
+                                self.open_settings();
+                                return;
+                            }
+                            "q" => {
+                                event_loop.exit();
+                                return;
+                            }
+                            "a" => {
+                                self.select_all();
+                                redraw_only = true;
+                            }
+                            "c" => self.clipboard_copy(),
+                            "x" => changed = self.clipboard_cut(),
+                            "v" => changed = self.clipboard_paste(),
+                            "z" => {
+                                changed = if shift {
+                                    self.do_redo()
+                                } else {
+                                    self.do_undo()
+                                };
+                            }
+                            "y" => changed = self.do_redo(),
+                            "s" => {
+                                self.do_save();
+                                redraw_only = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
 
                 match &event.logical_key {
                     Key::Named(NamedKey::Backspace) => {
-                        if self.cursor_char > 0 {
+                        if self.selection_range().is_some() {
+                            changed = self.delete_selection();
+                        } else if self.cursor_char > 0 {
+                            self.buffer.break_coalescing();
                             self.buffer
                                 .remove_char_range(self.cursor_char - 1, self.cursor_char);
                             self.cursor_char -= 1;
@@ -558,43 +1395,59 @@ impl ApplicationHandler for App {
                         }
                     }
                     Key::Named(NamedKey::Delete) => {
-                        if self.cursor_char < len {
+                        if self.selection_range().is_some() {
+                            changed = self.delete_selection();
+                        } else if self.cursor_char < len {
+                            self.buffer.break_coalescing();
                             self.buffer
                                 .remove_char_range(self.cursor_char, self.cursor_char + 1);
                             changed = true;
                         }
                     }
                     Key::Named(NamedKey::Enter) => {
-                        self.buffer.insert_char(self.cursor_char, '\n');
-                        self.cursor_char += 1;
-                        self.update_goal_col();
+                        if self.selection_range().is_some() {
+                            self.replace_selection_with("\n");
+                        } else {
+                            self.buffer.insert_char(self.cursor_char, '\n');
+                            self.cursor_char += 1;
+                            self.update_goal_col();
+                        }
                         changed = true;
                     }
                     Key::Named(NamedKey::Tab) => {
-                        self.buffer.insert_char(self.cursor_char, '\t');
-                        self.cursor_char += 1;
-                        self.update_goal_col();
+                        if self.selection_range().is_some() {
+                            self.replace_selection_with("\t");
+                        } else {
+                            self.buffer.insert_char(self.cursor_char, '\t');
+                            self.cursor_char += 1;
+                            self.update_goal_col();
+                        }
                         changed = true;
                     }
                     Key::Named(NamedKey::ArrowLeft) => {
+                        self.begin_move(shift);
                         self.cursor_char = self.cursor_char.saturating_sub(1);
                         self.update_goal_col();
                         changed = true;
                     }
                     Key::Named(NamedKey::ArrowRight) => {
+                        self.begin_move(shift);
                         self.cursor_char = (self.cursor_char + 1).min(len);
                         self.update_goal_col();
                         changed = true;
                     }
                     Key::Named(NamedKey::ArrowUp) => {
+                        self.begin_move(shift);
                         self.move_vertical(-1);
                         changed = true;
                     }
                     Key::Named(NamedKey::ArrowDown) => {
+                        self.begin_move(shift);
                         self.move_vertical(1);
                         changed = true;
                     }
                     Key::Named(NamedKey::Home) => {
+                        self.begin_move(shift);
                         self.cursor_char = if ctrl {
                             0
                         } else {
@@ -605,6 +1458,7 @@ impl ApplicationHandler for App {
                         changed = true;
                     }
                     Key::Named(NamedKey::End) => {
+                        self.begin_move(shift);
                         self.cursor_char = if ctrl {
                             len
                         } else {
@@ -615,42 +1469,59 @@ impl ApplicationHandler for App {
                         changed = true;
                     }
                     Key::Named(NamedKey::PageUp) => {
+                        // Moves the caret a page (and the view follows) so
+                        // Shift+PageUp can extend the selection.
+                        self.begin_move(shift);
                         let cap = self.page();
-                        self.scroll_by(-(cap as i64));
+                        self.move_vertical(-(cap as i64));
                         changed = true;
-                        follow = false;
                     }
                     Key::Named(NamedKey::PageDown) => {
+                        self.begin_move(shift);
                         let cap = self.page();
-                        self.scroll_by(cap as i64);
+                        self.move_vertical(cap as i64);
                         changed = true;
-                        follow = false;
                     }
                     _ => {}
                 }
 
                 // Printable input arrives as `event.text` (layout-resolved).
                 // Skip when Ctrl is held so chords don't type their letter, and
-                // skip control chars (Enter/Tab are handled as named keys).
+                // skip control chars (Enter/Tab are handled as named keys). A
+                // selection is replaced atomically; otherwise chars insert with
+                // typing-coalesced undo.
                 if !ctrl {
                     if let Some(text) = &event.text {
-                        for ch in text.chars() {
-                            if !ch.is_control() {
-                                self.buffer.insert_char(self.cursor_char, ch);
-                                self.cursor_char += 1;
+                        if self.selection_range().is_some() {
+                            let s: String = text.chars().filter(|c| !c.is_control()).collect();
+                            if !s.is_empty() {
+                                self.replace_selection_with(&s);
                                 changed = true;
                             }
-                        }
-                        if changed {
-                            self.update_goal_col();
+                        } else {
+                            let mut typed = false;
+                            for ch in text.chars() {
+                                if !ch.is_control() {
+                                    self.buffer.insert_char(self.cursor_char, ch);
+                                    self.cursor_char += 1;
+                                    typed = true;
+                                }
+                            }
+                            if typed {
+                                self.selection_anchor = None;
+                                self.update_goal_col();
+                                changed = true;
+                            }
                         }
                     }
                 }
 
-                if changed {
-                    self.apply_view(follow);
+                if changed || redraw_only {
+                    self.apply_view(true);
                     if let Some(renderer) = self.renderer.as_mut() {
-                        renderer.mark_keystroke(t);
+                        if changed {
+                            renderer.mark_keystroke(t);
+                        }
                         renderer.window().request_redraw();
                     }
                 }
@@ -660,7 +1531,9 @@ impl ApplicationHandler for App {
                 let now = Instant::now();
                 let total = self.buffer.len_lines();
                 let first = self.first_visible_line;
-                let want_scrollbar = self.scrollbar_visible(now);
+                let want_scrollbar = self.view == View::Editor
+                    && self.config.scrollbar
+                    && self.scrollbar_visible(now);
                 let presented;
                 let drew_scrollbar;
                 match self.renderer.as_mut() {

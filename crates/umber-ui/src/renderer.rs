@@ -16,7 +16,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache};
+use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Wrap};
 use glyphon::{Cache, Resolution, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport};
 use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
@@ -69,9 +69,32 @@ const SCROLLBAR_MIN_THUMB: f32 = 24.0; // floor so the thumb stays grabbable
 const TRACK_COLOR: [f32; 4] = [0.55, 0.55, 0.60, 0.10];
 const THUMB_COLOR: [f32; 4] = [0.55, 0.55, 0.60, 0.55];
 
-/// Max solid quads the overlay pipeline draws per frame (track + thumb, with
-/// headroom); six vertices each. Sizes the reused vertex staging buffer.
-const QUAD_MAX: usize = 4;
+/// Selection highlight fill (straight-alpha RGBA). Muted grey-blue, translucent
+/// so the glyphs drawn over it stay legible \u{2014} deliberately NOT the rust
+/// cursor accent.
+const SELECTION_COLOR: [f32; 4] = [0.30, 0.40, 0.58, 0.35];
+
+/// Modal overlay palette (command palette / settings / modules). All
+/// straight-alpha RGBA. The dim quad darkens the still-visible editor behind
+/// the modal; the box sits behind the palette input; the highlight marks the
+/// selected row (subtle grey-blue, not the rust accent).
+const OVERLAY_DIM_COLOR: [f32; 4] = [0.03, 0.03, 0.04, 0.72];
+const OVERLAY_BOX_COLOR: [f32; 4] = [0.15, 0.15, 0.18, 0.92];
+const OVERLAY_HL_COLOR: [f32; 4] = [0.30, 0.40, 0.58, 0.42];
+
+/// Overlay text colors. Title uses the Crail rust accent (Claude Code
+/// palette); input is bright; hint is dim. Row column colors are supplied
+/// per-page in the [`OverlaySpec`].
+const OVERLAY_TITLE_COLOR: Color = Color::rgb(230, 180, 120);
+const OVERLAY_INPUT_COLOR: Color = Color::rgb(232, 232, 238);
+const OVERLAY_HINT_COLOR: Color = Color::rgb(140, 140, 155);
+
+/// Max solid quads the overlay pipeline draws per frame: one per visible
+/// selected line plus the scrollbar track + thumb; six vertices each. Sizes the
+/// reused vertex staging buffer, so it must cover the tallest realistic visible
+/// line count (a 4K window is ~110 lines). The selection loop clamps to
+/// `QUAD_MAX - 2` so the scrollbar always has room.
+const QUAD_MAX: usize = 256;
 const QUAD_VERTS: usize = QUAD_MAX * 6;
 const QUAD_FLOATS_PER_VERT: usize = 6; // vec2 position + vec4 color
 
@@ -100,12 +123,54 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// A modal overlay to draw on top of (and dimming) the editor frame: the
+/// command palette, settings page, or modules page. Built by the bin on a
+/// state change and handed to [`Renderer::set_overlay`], which shapes it once;
+/// [`Renderer::render`] then draws it every frame with no reshaping until the
+/// next `set_overlay`.
+///
+/// Rows are a two-column layout (monospace): `left` in `left_color`, `right`
+/// in `right_color`, with the right column starting at `split_frac` of the
+/// content width. This covers all three pages without per-glyph rich text
+/// (palette: title/keybinding; settings: label/value; modules: name/state).
+pub struct OverlaySpec {
+    /// Optional title line (settings/modules). Mutually exclusive with `input`
+    /// in practice, but both are supported.
+    pub title: Option<String>,
+    /// Optional input line (palette query); rendered with a trailing caret.
+    pub input: Option<String>,
+    /// The list rows as `(left, right)` column strings.
+    pub rows: Vec<(String, String)>,
+    /// RGB of the left column and right column.
+    pub left_color: [u8; 3],
+    pub right_color: [u8; 3],
+    /// Right column x as a fraction of the content width.
+    pub split_frac: f32,
+    /// Row index (into `rows`) to highlight, or `None` for no highlight.
+    pub selected: Option<usize>,
+    /// Optional bottom status hint.
+    pub hint: Option<String>,
+}
+
 /// Scroll position the caller hands the renderer so it can size/place the
 /// overlay scrollbar thumb. Absent = scrollbar hidden this frame.
 #[derive(Clone, Copy)]
 pub struct ScrollbarInfo {
     pub first_line: usize,
     pub total_lines: usize,
+}
+
+/// One run of selection highlight on a single visible line, in monospace column
+/// units (converted to pixels in [`Renderer::render`] with the same `cell_w`
+/// arithmetic as the caret so highlight and glyphs line up). `line` is
+/// window-relative (0 = first visible line). `end_col == None` means "to the
+/// right text edge" \u{2014} used for the first/interior lines of a multi-line
+/// selection so the trailing newline reads as selected.
+#[derive(Clone, Copy)]
+pub struct SelSpan {
+    pub line: usize,
+    pub start_col: usize,
+    pub end_col: Option<usize>,
 }
 
 /// Physical-pixel scrollbar rectangles, shared by the renderer's draw path and
@@ -272,16 +337,41 @@ pub struct Renderer {
     viewport: Viewport,
     atlas: TextAtlas,
     text_renderer: TextRenderer,
+    /// Second text renderer sharing `atlas`, for the modal overlay so it can be
+    /// composited in its own pass ON TOP of the dim quad (glyphon draws all of
+    /// a renderer's areas in one pass, so the dim layer needs a separate one).
+    overlay_text_renderer: TextRenderer,
 
     // Three shaped surfaces: banner, document window, cursor glyph.
     stats_buffer: Buffer,
     doc_buffer: Buffer,
     cursor_buffer: Buffer,
 
+    // Modal overlay surfaces (command palette / settings / modules). Shaped
+    // only in `set_overlay` (a state-change path), reused every frame.
+    overlay_left: Buffer,
+    overlay_right: Buffer,
+    overlay_input: Buffer,
+    overlay_title: Buffer,
+    overlay_hint: Buffer,
+    overlay_active: bool,
+    overlay_has_input: bool,
+    overlay_has_title: bool,
+    overlay_has_hint: bool,
+    overlay_row_count: usize,
+    overlay_selected: Option<usize>,
+    overlay_left_color: Color,
+    overlay_right_color: Color,
+    overlay_split_frac: f32,
+
     // Line-number gutter, shaped like the document with its own change guard.
     gutter_buffer: Buffer,
     gutter_text: String,
     gutter_digits: usize,
+    /// Real shaped advance width of the gutter digits (physical px), measured
+    /// after shaping so the reserved column reflects the font's true advance,
+    /// not just `digits * cell_w`. See [`Renderer::gutter_text_w`].
+    gutter_measured_w: f32,
 
     // Solid-quad overlay pipeline (scrollbar). `quad_bytes` is reused each
     // frame so render() performs no per-frame heap allocation.
@@ -290,10 +380,22 @@ pub struct Renderer {
     quad_bytes: Vec<u8>,
     /// `Some((first_line, total_lines))` when the scrollbar is visible.
     scrollbar: Option<(usize, usize)>,
+    /// Selection highlight spans for the current view (window-relative lines).
+    /// Reused across frames; rebuilt by the bin only when the selection changes.
+    selection: Vec<SelSpan>,
 
     /// Physical-pixel HiDPI scale (window.scale_factor()); folded into metrics,
     /// padding, bounds, and the cursor position.
     scale_factor: f64,
+    /// Body-text metrics at scale 1.0 (logical px), from the TOML config (D13)
+    /// and live-updated by [`Renderer::set_metrics`]. Multiplied by
+    /// `scale_factor` for HiDPI. Default to the `BASE_FONT`/`BASE_LINE` consts.
+    base_font: f32,
+    base_line: f32,
+    /// Live feature toggles (D10): the gutter column and the latency banner
+    /// segment can be turned off, reclaiming their space.
+    gutter_enabled: bool,
+    latency_hud: bool,
 
     /// Cursor position as `(line_in_window, column_in_chars)`, or `None` when
     /// the cursor is scrolled out of the visible window.
@@ -304,9 +406,11 @@ pub struct Renderer {
     doc_text: String,
     /// The file-info half of the banner (the latency half is appended live).
     stats_prefix: String,
-    /// The last fully-rendered banner string, to skip re-shaping unchanged
-    /// banners on idle frames.
-    last_stats: String,
+    /// Banner rebuild flag + last latency sample count. The banner string is
+    /// composed only when an input changed (prefix, HUD toggle, geometry, or
+    /// a new latency sample) — idle redraws allocate nothing.
+    banner_dirty: bool,
+    last_lat_n: u64,
 
     /// Keystroke receipt timestamps awaiting the present that includes them.
     pending: Vec<Instant>,
@@ -365,14 +469,36 @@ impl Renderer {
         let mut atlas = TextAtlas::new(&device, &queue, &cache, swapchain_format);
         let text_renderer =
             TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
+        let overlay_text_renderer =
+            TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
 
         let metrics = Metrics::new(
             BASE_FONT * scale_factor as f32,
             BASE_LINE * scale_factor as f32,
         );
-        let stats_buffer = Buffer::new(&mut font_system, metrics);
-        let doc_buffer = Buffer::new(&mut font_system, metrics);
-        let gutter_buffer = Buffer::new(&mut font_system, metrics);
+        // Wrapping is off on every multi-line surface: the click->line mapping
+        // and cursor math assume one buffer line per visual line, so a wrapped
+        // long line would corrupt caret targeting (and the gutter numbers would
+        // wrap when the column is narrow). Long lines clip at the right edge.
+        // TODO(P1): horizontal scroll for long lines.
+        let mut stats_buffer = Buffer::new(&mut font_system, metrics);
+        stats_buffer.set_wrap(Wrap::None);
+        let mut doc_buffer = Buffer::new(&mut font_system, metrics);
+        doc_buffer.set_wrap(Wrap::None);
+        let mut gutter_buffer = Buffer::new(&mut font_system, metrics);
+        gutter_buffer.set_wrap(Wrap::None);
+
+        // Modal overlay surfaces (shaped on demand by `set_overlay`).
+        let mut overlay_left = Buffer::new(&mut font_system, metrics);
+        overlay_left.set_wrap(Wrap::None);
+        let mut overlay_right = Buffer::new(&mut font_system, metrics);
+        overlay_right.set_wrap(Wrap::None);
+        let mut overlay_input = Buffer::new(&mut font_system, metrics);
+        overlay_input.set_wrap(Wrap::None);
+        let mut overlay_title = Buffer::new(&mut font_system, metrics);
+        overlay_title.set_wrap(Wrap::None);
+        let mut overlay_hint = Buffer::new(&mut font_system, metrics);
+        overlay_hint.set_wrap(Wrap::None);
 
         // The cursor is a single glyph, shaped once here and re-shaped only on a
         // scale change.
@@ -451,21 +577,43 @@ impl Renderer {
             viewport,
             atlas,
             text_renderer,
+            overlay_text_renderer,
             stats_buffer,
             doc_buffer,
             cursor_buffer,
             gutter_buffer,
             gutter_text: String::new(),
             gutter_digits: 0,
+            gutter_measured_w: 0.0,
+            overlay_active: false,
+            overlay_left,
+            overlay_right,
+            overlay_input,
+            overlay_title,
+            overlay_hint,
+            overlay_has_input: false,
+            overlay_has_title: false,
+            overlay_has_hint: false,
+            overlay_row_count: 0,
+            overlay_selected: None,
+            overlay_left_color: Color::rgb(220, 220, 220),
+            overlay_right_color: Color::rgb(150, 150, 150),
+            overlay_split_frac: 0.5,
             quad_pipeline,
             quad_vbuf,
             quad_bytes: Vec::with_capacity(QUAD_VERTS * QUAD_FLOATS_PER_VERT * 4),
             scrollbar: None,
+            selection: Vec::new(),
             scale_factor,
+            base_font: BASE_FONT,
+            base_line: BASE_LINE,
+            gutter_enabled: true,
+            latency_hud: true,
             cursor: None,
             doc_text: String::new(),
             stats_prefix: String::new(),
-            last_stats: String::new(),
+            banner_dirty: true,
+            last_lat_n: 0,
             pending: Vec::new(),
             latency: LatencyRing::new(),
             window,
@@ -485,11 +633,11 @@ impl Renderer {
     // --- HiDPI-scaled geometry (all physical pixels) -----------------------
 
     fn font_px(&self) -> f32 {
-        BASE_FONT * self.scale_factor as f32
+        self.base_font * self.scale_factor as f32
     }
 
     pub fn line_px(&self) -> f32 {
-        BASE_LINE * self.scale_factor as f32
+        self.base_line * self.scale_factor as f32
     }
 
     fn pad_px(&self) -> f32 {
@@ -500,15 +648,19 @@ impl Renderer {
         self.font_px() * MONO_ADVANCE_RATIO
     }
 
-    /// Width in px of just the right-aligned digits (no padding).
+    /// Width in px reserved for the gutter's digits (no trailing gap). Taken as
+    /// the larger of the arithmetic `digits * cell_w` estimate and the real
+    /// shaped advance measured in [`Renderer::set_gutter`], so a font whose
+    /// monospace advance disagrees with `MONO_ADVANCE_RATIO` never clips.
     fn gutter_text_w(&self) -> f32 {
-        self.gutter_digits as f32 * self.cell_w()
+        let arithmetic = self.gutter_digits as f32 * self.cell_w();
+        arithmetic.max(self.gutter_measured_w)
     }
 
     /// Total px reserved for the gutter column (digits + trailing gap), or 0
     /// when no line count has been supplied yet.
     fn gutter_width(&self) -> f32 {
-        if self.gutter_digits == 0 {
+        if !self.gutter_enabled || self.gutter_digits == 0 {
             0.0
         } else {
             self.gutter_text_w() + GUTTER_GAP * self.scale_factor as f32
@@ -632,6 +784,15 @@ impl Renderer {
         self.gutter_buffer
             .shape_until_scroll(&mut self.font_system, false);
 
+        // Measure the real shaped width so `gutter_text_w` (hence the document
+        // origin) tracks the font's actual advance, not just the arithmetic
+        // estimate. Wrapping is off, so `line_w` is the natural unclipped width.
+        let mut measured = 0.0_f32;
+        for run in self.gutter_buffer.layout_runs() {
+            measured = measured.max(run.line_w);
+        }
+        self.gutter_measured_w = measured;
+
         // A digit-count change moves the document origin: adopt the new box
         // size but leave the (single) reshape to the `set_document` call that
         // follows in the same `apply_view` — reshaping here too would layout
@@ -648,7 +809,10 @@ impl Renderer {
     /// Set the file-info half of the stats banner; the latency half is appended
     /// live in [`Renderer::render`].
     pub fn set_stats_prefix(&mut self, prefix: String) {
-        self.stats_prefix = prefix;
+        if prefix != self.stats_prefix {
+            self.stats_prefix = prefix;
+            self.banner_dirty = true;
+        }
     }
 
     /// Set the cursor position as `(line_in_window, column_in_chars)`, or
@@ -664,6 +828,134 @@ impl Renderer {
         self.scrollbar = info.map(|i| (i.first_line, i.total_lines));
     }
 
+    /// Replace the selection highlight spans (window-relative lines). The bin
+    /// rebuilds these only when the selection changes; they land in a reused
+    /// Vec so [`Renderer::render`] performs no per-frame allocation.
+    pub fn set_selection(&mut self, spans: &[SelSpan]) {
+        self.selection.clear();
+        self.selection.extend_from_slice(spans);
+    }
+
+    // --- modal overlay (command palette / settings / modules) --------------
+
+    /// Left x of the overlay content box (physical px).
+    fn overlay_content_left(&self) -> f32 {
+        self.pad_px() * 3.0
+    }
+
+    /// Width of the overlay content box (physical px).
+    fn overlay_content_width(&self) -> f32 {
+        (self.surface_config.width as f32 - self.overlay_content_left() * 2.0).max(1.0)
+    }
+
+    /// Y of the overlay header line (title or input).
+    fn overlay_top(&self) -> f32 {
+        self.pad_px() + self.line_px()
+    }
+
+    /// Y of the first overlay list row (below the header, if any).
+    fn overlay_rows_top(&self) -> f32 {
+        if self.overlay_has_input || self.overlay_has_title {
+            self.overlay_top() + self.line_px() * 1.6
+        } else {
+            self.overlay_top()
+        }
+    }
+
+    /// How many list rows fit below the overlay header and above the hint line.
+    /// The bin uses this to window a long command list around the selection.
+    pub fn overlay_row_capacity(&self) -> usize {
+        let top = self.pad_px() + self.line_px() + self.line_px() * 1.6;
+        let avail = self.surface_config.height as f32 - top - self.pad_px() - self.line_px();
+        if avail <= 0.0 {
+            1
+        } else {
+            (avail / self.line_px()).floor().max(1.0) as usize
+        }
+    }
+
+    /// Install (or clear with `None`) the modal overlay. Shapes the supplied
+    /// text once here (the change path); [`Renderer::render`] then draws it
+    /// every frame with no reshaping until the next `set_overlay`.
+    pub fn set_overlay(&mut self, spec: Option<OverlaySpec>) {
+        let spec = match spec {
+            Some(s) => s,
+            None => {
+                self.overlay_active = false;
+                return;
+            }
+        };
+        self.overlay_active = true;
+        self.overlay_row_count = spec.rows.len();
+        self.overlay_selected = spec.selected;
+        self.overlay_left_color =
+            Color::rgb(spec.left_color[0], spec.left_color[1], spec.left_color[2]);
+        self.overlay_right_color = Color::rgb(
+            spec.right_color[0],
+            spec.right_color[1],
+            spec.right_color[2],
+        );
+        self.overlay_split_frac = spec.split_frac;
+
+        let attrs = Attrs::new().family(Family::Monospace);
+        let content_w = self.overlay_content_width();
+        let tall = self.surface_config.height as f32;
+        let line_px = self.line_px();
+
+        // Two-column list shaped as two multi-line buffers (monospace, so
+        // per-column uniform color needs no rich text).
+        let mut left = String::new();
+        let mut right = String::new();
+        for (i, (l, r)) in spec.rows.iter().enumerate() {
+            if i > 0 {
+                left.push('\n');
+                right.push('\n');
+            }
+            left.push_str(l);
+            right.push_str(r);
+        }
+        self.overlay_left
+            .set_text(&left, &attrs, Shaping::Advanced, None);
+        self.overlay_left.set_size(Some(content_w), Some(tall));
+        self.overlay_left
+            .shape_until_scroll(&mut self.font_system, false);
+        let right_w = (content_w * (1.0 - self.overlay_split_frac)).max(1.0);
+        self.overlay_right
+            .set_text(&right, &attrs, Shaping::Advanced, None);
+        self.overlay_right.set_size(Some(right_w), Some(tall));
+        self.overlay_right
+            .shape_until_scroll(&mut self.font_system, false);
+
+        self.overlay_has_input = spec.input.is_some();
+        if let Some(input) = &spec.input {
+            // A trailing one-eighth block reads as the input caret.
+            let line = format!("{input}\u{258f}");
+            self.overlay_input
+                .set_text(&line, &attrs, Shaping::Advanced, None);
+            self.overlay_input.set_size(Some(content_w), Some(line_px));
+            self.overlay_input
+                .shape_until_scroll(&mut self.font_system, false);
+        }
+
+        self.overlay_has_title = spec.title.is_some();
+        if let Some(title) = &spec.title {
+            self.overlay_title
+                .set_text(title, &attrs, Shaping::Advanced, None);
+            self.overlay_title.set_size(Some(content_w), Some(line_px));
+            self.overlay_title
+                .shape_until_scroll(&mut self.font_system, false);
+        }
+
+        self.overlay_has_hint = spec.hint.is_some();
+        if let Some(hint) = &spec.hint {
+            self.overlay_hint
+                .set_text(hint, &attrs, Shaping::Advanced, None);
+            self.overlay_hint.set_size(Some(content_w), Some(line_px));
+            self.overlay_hint
+                .shape_until_scroll(&mut self.font_system, false);
+        }
+    }
+
     /// Record the receipt time of a keystroke; the next present that includes
     /// its edit will close the keystroke->present latency sample.
     pub fn mark_keystroke(&mut self, t: Instant) {
@@ -675,20 +967,36 @@ impl Renderer {
         self.latency.summary()
     }
 
-    /// Adopt a new HiDPI scale factor (winit `ScaleFactorChanged`). Re-creates
-    /// the shaped buffers at the new metrics and re-shapes current content.
-    pub fn set_scale_factor(&mut self, scale_factor: f64) {
-        if (scale_factor - self.scale_factor).abs() < f64::EPSILON {
-            return;
-        }
-        self.scale_factor = scale_factor;
+    /// Re-create every shaped buffer at the current metrics and re-shape the
+    /// current content. Shared by [`Renderer::set_scale_factor`] (HiDPI change)
+    /// and [`Renderer::set_metrics`] (live config font/line change).
+    fn rebuild_shaped_buffers(&mut self) {
         let metrics = self.metrics();
         self.stats_buffer = Buffer::new(&mut self.font_system, metrics);
+        self.stats_buffer.set_wrap(Wrap::None);
         self.doc_buffer = Buffer::new(&mut self.font_system, metrics);
-        self.cursor_buffer = Buffer::new(&mut self.font_system, metrics);
+        self.doc_buffer.set_wrap(Wrap::None);
         self.gutter_buffer = Buffer::new(&mut self.font_system, metrics);
+        self.gutter_buffer.set_wrap(Wrap::None);
+        self.cursor_buffer = Buffer::new(&mut self.font_system, metrics);
+        // Overlay surfaces carry the metrics too; recreate them empty and let
+        // the next `set_overlay` repopulate (the bin refreshes the overlay
+        // right after a live metrics change).
+        self.overlay_left = Buffer::new(&mut self.font_system, metrics);
+        self.overlay_left.set_wrap(Wrap::None);
+        self.overlay_right = Buffer::new(&mut self.font_system, metrics);
+        self.overlay_right.set_wrap(Wrap::None);
+        self.overlay_input = Buffer::new(&mut self.font_system, metrics);
+        self.overlay_input.set_wrap(Wrap::None);
+        self.overlay_title = Buffer::new(&mut self.font_system, metrics);
+        self.overlay_title.set_wrap(Wrap::None);
+        self.overlay_hint = Buffer::new(&mut self.font_system, metrics);
+        self.overlay_hint.set_wrap(Wrap::None);
+
         // Force the gutter to re-shape at the new metrics on the next view push.
         self.gutter_text.clear();
+        // Advance scales with the font, so the measured gutter width is stale.
+        self.gutter_measured_w = 0.0;
 
         self.cursor_buffer.set_text(
             CURSOR_GLYPH,
@@ -701,9 +1009,57 @@ impl Renderer {
         self.cursor_buffer
             .shape_until_scroll(&mut self.font_system, false);
 
-        self.last_stats.clear();
+        self.banner_dirty = true;
         let text = std::mem::take(&mut self.doc_text);
         self.set_document(&text);
+    }
+
+    /// Adopt a new HiDPI scale factor (winit `ScaleFactorChanged`). Re-creates
+    /// the shaped buffers at the new metrics and re-shapes current content.
+    pub fn set_scale_factor(&mut self, scale_factor: f64) {
+        if (scale_factor - self.scale_factor).abs() < f64::EPSILON {
+            return;
+        }
+        self.scale_factor = scale_factor;
+        self.rebuild_shaped_buffers();
+    }
+
+    /// Live-apply the config body metrics (D13): font size + line height in
+    /// logical px. Rebuilds shaped buffers exactly like a scale change so edits
+    /// from the settings page take effect immediately.
+    pub fn set_metrics(&mut self, font_size: f32, line_height: f32) {
+        if (self.base_font - font_size).abs() < f32::EPSILON
+            && (self.base_line - line_height).abs() < f32::EPSILON
+        {
+            return;
+        }
+        self.base_font = font_size;
+        self.base_line = line_height;
+        self.rebuild_shaped_buffers();
+    }
+
+    /// Enable/disable the line-number gutter (config `gutter`). Disabling
+    /// reclaims the gutter width for the document and forces a reshape at the
+    /// new text origin.
+    pub fn set_gutter_enabled(&mut self, on: bool) {
+        if self.gutter_enabled == on {
+            return;
+        }
+        self.gutter_enabled = on;
+        let (dw, dh) = self.doc_size();
+        self.doc_buffer.set_size(Some(dw), Some(dh));
+        // Force `set_document` to reshape even if the window text is unchanged.
+        self.doc_text.clear();
+    }
+
+    /// Show/hide the banner latency segment (config `latency_hud`).
+    pub fn set_latency_hud(&mut self, on: bool) {
+        if self.latency_hud == on {
+            return;
+        }
+        self.latency_hud = on;
+        // Force the banner to re-compose on the next frame.
+        self.banner_dirty = true;
     }
 
     /// Reconfigure the surface after a resize and reflow the text to it.
@@ -723,7 +1079,7 @@ impl Renderer {
         self.gutter_buffer
             .shape_until_scroll(&mut self.font_system, false);
         // Force the banner to re-shape at the new width on the next frame.
-        self.last_stats.clear();
+        self.banner_dirty = true;
     }
 
     /// Draw one frame. Returns `false` if the frame was skipped (surface
@@ -738,23 +1094,27 @@ impl Renderer {
             },
         );
 
-        // Compose the banner: file-info prefix + live latency percentiles. Only
-        // re-shape it when the string actually changes (idle frames skip it).
-        let lat = match self.latency.percentiles_cached() {
-            Some((p50, p99, _)) => format!(
-                "lat p50 {:.1}ms p99 {:.1}ms n={}",
-                p50,
-                p99,
-                self.latency.count()
-            ),
-            None => "lat p50 -ms p99 -ms n=0".to_string(),
-        };
-        let stats = if self.stats_prefix.is_empty() {
-            lat
-        } else {
-            format!("{}    {}", self.stats_prefix, lat)
-        };
-        if stats != self.last_stats {
+        // Compose the banner only when an input changed (prefix text, HUD
+        // toggle, geometry, or a new latency sample) — the scalar checks come
+        // first so unchanged frames allocate nothing.
+        let lat_n = self.latency.count();
+        if self.banner_dirty || (self.latency_hud && lat_n != self.last_lat_n) {
+            let stats = if !self.latency_hud {
+                // Latency HUD off (config `latency_hud`): prefix only.
+                self.stats_prefix.clone()
+            } else {
+                let lat = match self.latency.percentiles_cached() {
+                    Some((p50, p99, _)) => {
+                        format!("lat p50 {:.1}ms p99 {:.1}ms n={}", p50, p99, lat_n)
+                    }
+                    None => "lat p50 -ms p99 -ms n=0".to_string(),
+                };
+                if self.stats_prefix.is_empty() {
+                    lat
+                } else {
+                    format!("{}    {}", self.stats_prefix, lat)
+                }
+            };
             self.stats_buffer.set_text(
                 &stats,
                 &Attrs::new().family(Family::Monospace),
@@ -765,7 +1125,8 @@ impl Renderer {
             self.stats_buffer.set_size(Some(sw), Some(self.line_px()));
             self.stats_buffer
                 .shape_until_scroll(&mut self.font_system, false);
-            self.last_stats = stats;
+            self.last_lat_n = lat_n;
+            self.banner_dirty = false;
         }
 
         // Geometry snapshot (copies) so the TextArea borrows below only touch
@@ -793,20 +1154,22 @@ impl Renderer {
             default_color: Color::rgb(150, 150, 165),
             custom_glyphs: &[],
         });
-        areas.push(TextArea {
-            buffer: &self.gutter_buffer,
-            left: pad,
-            top: doc_top,
-            scale: 1.0,
-            bounds: TextBounds {
-                left: 0,
-                top: doc_top as i32,
-                right: text_left as i32,
-                bottom: h,
-            },
-            default_color: GUTTER_COLOR,
-            custom_glyphs: &[],
-        });
+        if self.gutter_enabled && self.gutter_digits > 0 {
+            areas.push(TextArea {
+                buffer: &self.gutter_buffer,
+                left: pad,
+                top: doc_top,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: 0,
+                    top: doc_top as i32,
+                    right: text_left as i32,
+                    bottom: h,
+                },
+                default_color: GUTTER_COLOR,
+                custom_glyphs: &[],
+            });
+        }
         areas.push(TextArea {
             buffer: &self.doc_buffer,
             left: text_left,
@@ -862,17 +1225,141 @@ impl Renderer {
             return false;
         }
 
-        // Build the overlay scrollbar quads into the reused staging buffer (no
-        // per-frame heap allocation) and upload them for the pass below.
+        // Modal overlay text prepared on its own renderer so its glyphs draw in
+        // a pass after the dim quad (glyphon renders a renderer's areas in one
+        // pass). Areas borrow the overlay buffers; geometry is snapshotted from
+        // the immutable accessors first.
+        if self.overlay_active {
+            let ov_left = self.overlay_content_left();
+            let ov_w = self.overlay_content_width();
+            let ov_top = self.overlay_top();
+            let ov_rows_top = self.overlay_rows_top();
+            let right_x = ov_left + ov_w * self.overlay_split_frac;
+            let hint_y = self.surface_config.height as f32 - self.pad_px() - line_px;
+            let full = TextBounds {
+                left: 0,
+                top: 0,
+                right: w,
+                bottom: h,
+            };
+            let mut ov_areas: Vec<TextArea> = Vec::with_capacity(5);
+            if self.overlay_has_title {
+                ov_areas.push(TextArea {
+                    buffer: &self.overlay_title,
+                    left: ov_left,
+                    top: ov_top,
+                    scale: 1.0,
+                    bounds: full,
+                    default_color: OVERLAY_TITLE_COLOR,
+                    custom_glyphs: &[],
+                });
+            }
+            if self.overlay_has_input {
+                ov_areas.push(TextArea {
+                    buffer: &self.overlay_input,
+                    left: ov_left,
+                    top: ov_top,
+                    scale: 1.0,
+                    bounds: full,
+                    default_color: OVERLAY_INPUT_COLOR,
+                    custom_glyphs: &[],
+                });
+            }
+            ov_areas.push(TextArea {
+                buffer: &self.overlay_left,
+                left: ov_left,
+                top: ov_rows_top,
+                scale: 1.0,
+                bounds: full,
+                default_color: self.overlay_left_color,
+                custom_glyphs: &[],
+            });
+            ov_areas.push(TextArea {
+                buffer: &self.overlay_right,
+                left: right_x,
+                top: ov_rows_top,
+                scale: 1.0,
+                bounds: full,
+                default_color: self.overlay_right_color,
+                custom_glyphs: &[],
+            });
+            if self.overlay_has_hint {
+                ov_areas.push(TextArea {
+                    buffer: &self.overlay_hint,
+                    left: ov_left,
+                    top: hint_y,
+                    scale: 1.0,
+                    bounds: full,
+                    default_color: OVERLAY_HINT_COLOR,
+                    custom_glyphs: &[],
+                });
+            }
+            if let Err(err) = self.overlay_text_renderer.prepare(
+                &self.device,
+                &self.queue,
+                &mut self.font_system,
+                &mut self.atlas,
+                &self.viewport,
+                ov_areas,
+                &mut self.swash_cache,
+            ) {
+                eprintln!("umber-ui: overlay prepare failed: {err:?}");
+                self.window.request_redraw();
+                return false;
+            }
+        }
+
+        // Build overlay quads into the reused staging buffer (no per-frame heap
+        // allocation): selection highlights first (vertices drawn BEHIND the
+        // text), then the scrollbar track + thumb (drawn OVER the text). Both
+        // ride the same vertex buffer and pipeline, split by vertex range.
         let fw = self.surface_config.width as f32;
         let fh = self.surface_config.height as f32;
-        let geom = self
-            .scrollbar
-            .and_then(|(first, total)| self.scrollbar_geom(first, total));
         self.quad_bytes.clear();
-        let mut quad_verts: u32 = 0;
+
+        // Selection: one quad per visible highlighted line, using the same
+        // `col * cell_w` arithmetic as the caret. Clamped to `QUAD_MAX - 2` so
+        // the scrollbar's two quads always fit the vertex buffer.
+        let sel_right_edge = fw - pad;
+        let mut sel_verts: u32 = 0;
+        if !self.overlay_active {
+            for span in self.selection.iter().take(QUAD_MAX - 2) {
+                let y = doc_top + span.line as f32 * line_px;
+                if y >= fh {
+                    continue;
+                }
+                let x = text_left + span.start_col as f32 * cell_w;
+                let right = match span.end_col {
+                    Some(c) => text_left + c as f32 * cell_w,
+                    None => sel_right_edge,
+                };
+                let width = (right - x).max(0.0);
+                if width > 0.0 {
+                    sel_verts += push_quad(
+                        &mut self.quad_bytes,
+                        fw,
+                        fh,
+                        x,
+                        y,
+                        width,
+                        line_px,
+                        SELECTION_COLOR,
+                    );
+                }
+            }
+        }
+
+        // Scrollbar track + thumb, appended after the selection vertices (also
+        // suppressed while a modal overlay is up).
+        let geom = if self.overlay_active {
+            None
+        } else {
+            self.scrollbar
+                .and_then(|(first, total)| self.scrollbar_geom(first, total))
+        };
+        let mut bar_verts: u32 = 0;
         if let Some(g) = geom {
-            quad_verts += push_quad(
+            bar_verts += push_quad(
                 &mut self.quad_bytes,
                 fw,
                 fh,
@@ -882,7 +1369,7 @@ impl Renderer {
                 g.track_h,
                 TRACK_COLOR,
             );
-            quad_verts += push_quad(
+            bar_verts += push_quad(
                 &mut self.quad_bytes,
                 fw,
                 fh,
@@ -893,7 +1380,58 @@ impl Renderer {
                 THUMB_COLOR,
             );
         }
-        if quad_verts > 0 {
+
+        // Modal overlay quads (dim + input box + selected-row highlight),
+        // appended after the scrollbar range; drawn over the editor and under
+        // the overlay text.
+        let mut ov_verts: u32 = 0;
+        if self.overlay_active {
+            let ov_left = self.overlay_content_left();
+            let ov_w = self.overlay_content_width();
+            let ov_top = self.overlay_top();
+            let ov_rows_top = self.overlay_rows_top();
+            ov_verts += push_quad(
+                &mut self.quad_bytes,
+                fw,
+                fh,
+                0.0,
+                0.0,
+                fw,
+                fh,
+                OVERLAY_DIM_COLOR,
+            );
+            if self.overlay_has_input {
+                ov_verts += push_quad(
+                    &mut self.quad_bytes,
+                    fw,
+                    fh,
+                    ov_left - pad,
+                    ov_top - line_px * 0.15,
+                    ov_w + pad * 2.0,
+                    line_px * 1.3,
+                    OVERLAY_BOX_COLOR,
+                );
+            }
+            if let Some(sel) = self.overlay_selected {
+                if sel < self.overlay_row_count {
+                    let hy = ov_rows_top + sel as f32 * line_px;
+                    if hy < fh {
+                        ov_verts += push_quad(
+                            &mut self.quad_bytes,
+                            fw,
+                            fh,
+                            ov_left - pad * 0.5,
+                            hy,
+                            ov_w + pad,
+                            line_px,
+                            OVERLAY_HL_COLOR,
+                        );
+                    }
+                }
+            }
+        }
+
+        if sel_verts + bar_verts + ov_verts > 0 {
             self.queue
                 .write_buffer(&self.quad_vbuf, 0, &self.quad_bytes);
         }
@@ -951,15 +1489,38 @@ impl Renderer {
                 multiview_mask: None,
             });
 
+            // Selection highlights composited BEHIND the text (drawn first so
+            // the glyphs render over them).
+            if sel_verts > 0 {
+                pass.set_pipeline(&self.quad_pipeline);
+                pass.set_vertex_buffer(0, self.quad_vbuf.slice(..));
+                pass.draw(0..sel_verts, 0..1);
+            }
+
             self.text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass)
                 .expect("render text");
 
-            // Overlay scrollbar (track + thumb) composited over the text.
-            if quad_verts > 0 {
+            // Overlay scrollbar (track + thumb) composited OVER the text, from
+            // the vertex range just past the selection quads.
+            if bar_verts > 0 {
                 pass.set_pipeline(&self.quad_pipeline);
                 pass.set_vertex_buffer(0, self.quad_vbuf.slice(..));
-                pass.draw(0..quad_verts, 0..1);
+                pass.draw(sel_verts..sel_verts + bar_verts, 0..1);
+            }
+
+            // Modal overlay: dim + box + highlight quads, then the overlay text
+            // in its own renderer so it sits above the dim.
+            if ov_verts > 0 {
+                let start = sel_verts + bar_verts;
+                pass.set_pipeline(&self.quad_pipeline);
+                pass.set_vertex_buffer(0, self.quad_vbuf.slice(..));
+                pass.draw(start..start + ov_verts, 0..1);
+            }
+            if self.overlay_active {
+                self.overlay_text_renderer
+                    .render(&self.atlas, &self.viewport, &mut pass)
+                    .expect("render overlay text");
             }
         }
 

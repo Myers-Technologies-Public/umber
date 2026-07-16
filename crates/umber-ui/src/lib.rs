@@ -10,4 +10,4 @@
 
 mod renderer;
 
-pub use renderer::{Renderer, ScrollbarGeom, ScrollbarInfo};
+pub use renderer::{OverlaySpec, Renderer, ScrollbarGeom, ScrollbarInfo, SelSpan};
