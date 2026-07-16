@@ -16,6 +16,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use umber::agents::{self, SessionSummary};
 use umber::terminal::{TermNotifier, TerminalSession};
 use umber_host::{HostCommand, Manifest, ModuleHost};
 use umber_kernel::{Command, CommandRegistry, Config, FeatureRegistry};
@@ -79,6 +80,8 @@ enum View {
     GotoLine,
     /// P3b: pick (or type) an SSH host; Enter opens `ssh <host>` in the panel.
     SshPicker,
+    /// P4 slice 1: read-only pi session dashboard (history from JSONL).
+    Agents,
 }
 
 /// What the pointer is hovering over in the document body, for hover
@@ -164,6 +167,7 @@ fn build_command_registry() -> CommandRegistry {
         ("terminal.ssh", "Terminal: SSH to Host\u{2026}", ""),
         ("goto.line", "Go: Line\u{2026}", "Ctrl+G"),
         ("help.keys", "Help: Keyboard Shortcuts", "F1"),
+        ("agents.dashboard", "Agents: pi Dashboard", "Ctrl+Shift+A"),
         ("view.toggle.terminal", "View: Toggle Terminal Feature", ""),
         ("app.quit", "Application: Quit", "Ctrl+Q"),
     ] {
@@ -306,6 +310,8 @@ fn main() -> ExitCode {
         drag_anchor_y: 0.0,
         drag_anchor_first: 0,
         scrollbar_drawn: false,
+        agents_sessions: Vec::new(),
+        agents_scroll: 0,
         help_scroll: 0,
         goto_input: String::new(),
         ssh_hosts: Vec::new(),
@@ -422,6 +428,12 @@ struct App {
     /// Whether the last presented frame drew the scrollbar, so a linger-out can
     /// schedule exactly one erase redraw.
     scrollbar_drawn: bool,
+
+    // --- P4: pi agent dashboard (read-only slice) ---
+    /// Parsed session summaries, newest first (refreshed on open / `r`).
+    agents_sessions: Vec<SessionSummary>,
+    /// Scroll offset into the sessions list.
+    agents_scroll: usize,
 
     // --- P3b/QoL: help, go-to-line, SSH picker ---
     /// Scroll offset of the help overlay.
@@ -1182,6 +1194,57 @@ impl App {
                     ),
                 })
             }
+            View::Agents => {
+                let cap = self
+                    .renderer
+                    .as_ref()
+                    .map(|r| r.overlay_row_capacity())
+                    .unwrap_or(1);
+                let n = self.agents_sessions.len();
+                let start = self.agents_scroll.min(n.saturating_sub(1));
+                let end = (start + cap).min(n);
+                let home = std::env::var("HOME").unwrap_or_default();
+                let rows = self.agents_sessions[start..end]
+                    .iter()
+                    .map(|s| {
+                        let cwd = if !home.is_empty() && s.cwd.starts_with(&home) {
+                            format!("~{}", &s.cwd[home.len()..])
+                        } else {
+                            s.cwd.clone()
+                        };
+                        // "2026-07-15T22:33:12.865Z" -> "07-15 22:33"
+                        let when: String = s
+                            .last_active
+                            .chars()
+                            .skip(5)
+                            .take(11)
+                            .map(|c| if c == 'T' { ' ' } else { c })
+                            .collect();
+                        (
+                            format!("{}  \u{2014}  {}", s.model, cwd),
+                            format!(
+                                "{} tok \u{2022} ctx {} \u{2022} {} msgs \u{2022} {}",
+                                agents::fmt_tokens(s.tokens_total),
+                                agents::fmt_tokens(s.context_tokens),
+                                s.messages,
+                                when
+                            ),
+                        )
+                    })
+                    .collect();
+                Some(OverlaySpec {
+                    title: Some("pi Agent Sessions \u{2014} history (live control: slice 2)".to_string()),
+                    input: None,
+                    rows,
+                    left_color: [225, 225, 230],
+                    right_color: [200, 170, 110],
+                    split_frac: 0.52,
+                    selected: None,
+                    hint: Some(format!(
+                        "{n} sessions \u{2014} \u{2191}\u{2193} scroll \u{2022} r refresh \u{2022} Esc close"
+                    )),
+                })
+            }
             View::Settings => {
                 let c = &self.config;
                 let rows = vec![
@@ -1297,6 +1360,39 @@ impl App {
     // ===================================================================
     //  P3b/QoL: help overlay, go-to-line, SSH picker.
     // ===================================================================
+
+    /// Open the pi agent dashboard, (re)scanning the session store.
+    fn open_agents(&mut self) {
+        self.agents_sessions = match agents::sessions_root() {
+            Some(root) => agents::discover_sessions(&root, 50),
+            None => Vec::new(),
+        };
+        self.agents_scroll = 0;
+        self.view = View::Agents;
+        self.refresh_overlay();
+    }
+
+    fn agents_key(&mut self, event: KeyEvent) {
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => self.close_overlay(),
+            Key::Named(NamedKey::ArrowDown) | Key::Named(NamedKey::PageDown) => {
+                let n = self.agents_sessions.len();
+                self.agents_scroll = (self.agents_scroll + 1).min(n.saturating_sub(1));
+                self.refresh_overlay();
+            }
+            Key::Named(NamedKey::ArrowUp) | Key::Named(NamedKey::PageUp) => {
+                self.agents_scroll = self.agents_scroll.saturating_sub(1);
+                self.refresh_overlay();
+            }
+            Key::Character(c) if c.as_str() == "r" => {
+                let scroll = self.agents_scroll;
+                self.open_agents();
+                self.agents_scroll = scroll.min(self.agents_sessions.len().saturating_sub(1));
+                self.refresh_overlay();
+            }
+            _ => {}
+        }
+    }
 
     fn open_help(&mut self) {
         self.view = View::Help;
@@ -2031,6 +2127,10 @@ impl App {
                 self.open_help();
                 return;
             }
+            "agents.dashboard" => {
+                self.open_agents();
+                return;
+            }
             // Not a built-in id: route to the module host (external command).
             other => self.invoke_module(other),
         }
@@ -2361,6 +2461,10 @@ impl ApplicationHandler<UserEvent> for App {
                         self.ssh_key(event);
                         return;
                     }
+                    View::Agents => {
+                        self.agents_key(event);
+                        return;
+                    }
                     View::Settings => {
                         self.settings_key(event, event_loop);
                         return;
@@ -2411,6 +2515,10 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             "q" => {
                                 event_loop.exit();
+                                return;
+                            }
+                            "a" if shift => {
+                                self.open_agents();
                                 return;
                             }
                             "a" => {

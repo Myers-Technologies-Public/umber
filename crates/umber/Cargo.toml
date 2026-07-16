@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 alacritty_terminal = { workspace = true }
+serde_json = { workspace = true }
 umber-ui.workspace = true
 umber-text.workspace = true
 umber-kernel.workspace = true

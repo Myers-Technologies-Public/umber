@@ -5,4 +5,5 @@
 //! Currently that is the embedded terminal session (P3): PTY + parser +
 //! grid, fully headless.
 
+pub mod agents;
 pub mod terminal;
