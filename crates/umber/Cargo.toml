@@ -1,0 +1,15 @@
+[package]
+name = "umber"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "umber"
+path = "src/main.rs"
+
+[dependencies]
+umber-ui.workspace = true
+umber-text.workspace = true
+winit.workspace = true

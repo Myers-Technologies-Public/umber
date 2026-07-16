@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/umber",
+    "crates/umber-ui",
+    "crates/umber-text",
+    "crates/umber-syntax",
+    "crates/umber-kernel",
+    "crates/umber-host",
+    "crates/umber-proto",
+    "crates/umberd",
+]
+
+# D3: OSS core is dual-licensed MIT OR Apache-2.0.
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Mason Myers <mason@myerscorp.net>"]
+
+[workspace.dependencies]
+# Internal crates (path deps, single-sourced here).
+umber-ui = { path = "crates/umber-ui" }
+umber-text = { path = "crates/umber-text" }
+umber-syntax = { path = "crates/umber-syntax" }
+umber-kernel = { path = "crates/umber-kernel" }
+umber-host = { path = "crates/umber-host" }
+umber-proto = { path = "crates/umber-proto" }
+
+# P0 render-spike stack. Versions resolved against crates.io on 2026-07-16;
+# glyphon 0.12 is the cosmic-text -> wgpu bridge and pins the compatible
+# wgpu (30) + cosmic-text (0.19). winit 0.30 supplies the raw-window-handle
+# 0.6 that wgpu 30 expects, so the whole set unifies to a single version each.
+glyphon = "0.12"
+wgpu = "30.0"
+winit = "0.30"
+cosmic-text = "0.19"
+ropey = "1.6"
+pollster = "1.0"
