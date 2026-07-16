@@ -8,7 +8,7 @@ members = [
     "crates/umber-kernel",
     "crates/umber-host",
     "crates/umber-proto",
-    "crates/umberd",
+    "crates/umberd", "target/scratch/termprobe",
 ]
 
 # D3: OSS core is dual-licensed MIT OR Apache-2.0.
@@ -19,6 +19,7 @@ license = "MIT OR Apache-2.0"
 authors = ["Mason Myers <mason@myerscorp.net>"]
 
 [workspace.dependencies]
+alacritty_terminal = "0.26.0"
 # Internal crates (path deps, single-sourced here).
 umber-ui = { path = "crates/umber-ui" }
 umber-text = { path = "crates/umber-text" }

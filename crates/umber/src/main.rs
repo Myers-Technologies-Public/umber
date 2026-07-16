@@ -16,6 +16,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use umber::terminal::{TermNotifier, TerminalSession};
 use umber_host::{HostCommand, Manifest, ModuleHost};
 use umber_kernel::{Command, CommandRegistry, Config, FeatureRegistry};
 use umber_text::TextBuffer;
@@ -24,7 +25,7 @@ use umber_ui::{OverlaySpec, Renderer, ScrollbarInfo, SelSpan};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
@@ -40,6 +41,27 @@ const BASE_LINE_PX: f64 = 20.0;
 
 /// Number of rows on the settings page (drives selection clamping).
 const SETTINGS_ROWS: usize = 6;
+
+/// Cross-thread wakeups from background machinery (P3: the terminal's PTY
+/// reader thread). Delivered through winit's user-event channel.
+#[derive(Debug, Clone, Copy)]
+enum UserEvent {
+    TerminalWakeup,
+    TerminalExited,
+}
+
+/// [`TermNotifier`] over the winit event-loop proxy.
+#[derive(Clone)]
+struct UmberNotifier(EventLoopProxy<UserEvent>);
+
+impl TermNotifier for UmberNotifier {
+    fn wake(&self) {
+        let _ = self.0.send_event(UserEvent::TerminalWakeup);
+    }
+    fn child_exited(&self) {
+        let _ = self.0.send_event(UserEvent::TerminalExited);
+    }
+}
 
 /// The current top-level input surface. A single keyboard dispatch point routes
 /// by this state (Slice 2): the editor path is unchanged from Slice 1; the
@@ -127,6 +149,9 @@ fn build_command_registry() -> CommandRegistry {
             "",
         ),
         ("view.toggle.latencyHud", "View: Toggle Latency HUD", ""),
+        ("terminal.toggle", "Terminal: Toggle Panel", "Ctrl+`"),
+        ("terminal.focus", "Terminal: Focus", ""),
+        ("view.toggle.terminal", "View: Toggle Terminal Feature", ""),
         ("app.quit", "Application: Quit", "Ctrl+Q"),
     ] {
         reg.register(Command {
@@ -166,13 +191,14 @@ fn main() -> ExitCode {
         None => TextBuffer::empty(),
     };
 
-    let event_loop = match EventLoop::new() {
+    let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
         Ok(ev) => ev,
         Err(err) => {
             eprintln!("umber: failed to create the event loop: {err}");
             return ExitCode::FAILURE;
         }
     };
+    let event_proxy = event_loop.create_proxy();
 
     // Wayland-first clipboard (arboard + wayland-data-control). A failure here
     // must not sink the editor \u{2014} degrade to no clipboard.
@@ -234,6 +260,9 @@ fn main() -> ExitCode {
         drag_anchor_y: 0.0,
         drag_anchor_first: 0,
         scrollbar_drawn: false,
+        terminal: None,
+        term_focused: false,
+        event_proxy,
         start,
         first_frame: false,
         first_frame_at: None,
@@ -341,6 +370,15 @@ struct App {
     /// Whether the last presented frame drew the scrollbar, so a linger-out can
     /// schedule exactly one erase redraw.
     scrollbar_drawn: bool,
+
+    // --- P3: embedded terminal ---
+    /// Live terminal session; spawned on first open, killed on feature
+    /// disable / child exit / quit (Drop reaps the shell).
+    terminal: Option<TerminalSession<UmberNotifier>>,
+    /// Keyboard focus owner: `true` = terminal panel, else the editor.
+    term_focused: bool,
+    /// Proxy for background threads to wake the event loop.
+    event_proxy: EventLoopProxy<UserEvent>,
 
     // --- measurement harness ---
     start: Instant,
@@ -613,6 +651,11 @@ impl App {
         if y < doc_top {
             return None; // banner, not the document
         }
+        if let Some(r) = self.renderer.as_ref() {
+            if y >= r.doc_bottom() {
+                return None; // terminal panel, not the document
+            }
+        }
         let rel_line = ((y - doc_top) / line_px).floor() as i64;
         let last = self.buffer.len_lines().saturating_sub(1) as i64;
         let line = (self.first_visible_line as i64 + rel_line).clamp(0, last) as usize;
@@ -636,6 +679,12 @@ impl App {
         let y = self.pointer.1 as f32;
         if y < doc_top || x < text_left {
             return HoverTarget::None; // banner or gutter, not the document body
+        }
+        if let Some(r) = self.renderer.as_ref() {
+            // P3: the terminal panel is not the document.
+            if y >= r.doc_bottom() {
+                return HoverTarget::None;
+            }
         }
         let cap = self
             .renderer
@@ -932,6 +981,11 @@ impl App {
     /// effect live (font/line rebuild renderer metrics like a scale change).
     fn apply_config(&mut self) {
         self.scrollbar_linger = Duration::from_millis(self.config.scrollbar_linger_ms);
+        // P3: disabling the terminal feature kills the live shell (both the
+        // modules page and palette toggles funnel through here).
+        if !self.config.terminal && self.terminal.is_some() {
+            self.kill_terminal();
+        }
         if !self.config.scrollbar {
             self.scrollbar_deadline = None;
             self.scrollbar_dragging = false;
@@ -1296,6 +1350,132 @@ impl App {
 
     /// Toggle a feature by id (from a palette command). Kernel entries no-op,
     /// leaving a hint for the modules page.
+    // ===================================================================
+    //  P3: embedded terminal panel.
+    // ===================================================================
+
+    /// Open (spawning the shell on first use) and focus the terminal panel.
+    fn open_terminal(&mut self) {
+        if !self.features.is_enabled("terminal") {
+            self.modules_hint = Some("terminal feature is disabled".to_string());
+            return;
+        }
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        renderer.set_terminal(true, true);
+        self.term_focused = true;
+        let (cols, lines) = renderer.term_grid_size();
+        let (cw, ch) = renderer.cell_px();
+        match &self.terminal {
+            None => {
+                match TerminalSession::spawn(
+                    UmberNotifier(self.event_proxy.clone()),
+                    cols,
+                    lines,
+                    cw,
+                    ch,
+                ) {
+                    Ok(session) => self.terminal = Some(session),
+                    Err(err) => {
+                        eprintln!("umber: terminal spawn failed: {err}");
+                        if let Some(r) = self.renderer.as_mut() {
+                            r.set_terminal(false, false);
+                        }
+                        self.term_focused = false;
+                        return;
+                    }
+                }
+            }
+            // Reopening after a hide: re-sync the PTY to the panel grid.
+            Some(session) => session.resize(cols, lines, cw, ch),
+        }
+        self.clear_hover();
+        self.apply_view(false);
+        if let Some(r) = self.renderer.as_ref() {
+            r.window().request_redraw();
+        }
+    }
+
+    /// Hide the panel (the shell stays alive) and refocus the editor.
+    fn hide_terminal(&mut self) {
+        self.term_focused = false;
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_terminal(false, false);
+        }
+        self.apply_view(false);
+        if let Some(r) = self.renderer.as_ref() {
+            r.window().request_redraw();
+        }
+    }
+
+    /// Kill the shell and reap it (feature disable, child exit, quit).
+    fn kill_terminal(&mut self) {
+        if let Some(mut session) = self.terminal.take() {
+            session.shutdown();
+        }
+        self.term_focused = false;
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_terminal(false, false);
+        }
+        self.apply_view(false);
+        if let Some(r) = self.renderer.as_ref() {
+            r.window().request_redraw();
+        }
+    }
+
+    /// Ctrl+` semantics: closed -> open+focus; open unfocused -> focus;
+    /// open focused -> hide.
+    fn terminal_toggle(&mut self) {
+        let open = self
+            .renderer
+            .as_ref()
+            .map(|r| r.terminal_open())
+            .unwrap_or(false);
+        if !open {
+            self.open_terminal();
+        } else if !self.term_focused {
+            self.term_focused = true;
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.set_terminal(true, true);
+                renderer.window().request_redraw();
+            }
+        } else {
+            self.hide_terminal();
+        }
+    }
+
+    /// Encode a terminal-focused keystroke as PTY bytes. Esc never reaches the
+    /// shell (it returns focus to the editor); Ctrl+letter becomes the C0
+    /// control byte, so Ctrl+C is SIGINT to the PTY, deliberately NOT the
+    /// editor copy command.
+    fn term_key_bytes(event: &KeyEvent, ctrl: bool) -> Option<Vec<u8>> {
+        match &event.logical_key {
+            Key::Named(NamedKey::Enter) => Some(b"\r".to_vec()),
+            Key::Named(NamedKey::Backspace) => Some(vec![0x7f]),
+            Key::Named(NamedKey::Tab) => Some(b"\t".to_vec()),
+            Key::Named(NamedKey::ArrowUp) => Some(b"\x1b[A".to_vec()),
+            Key::Named(NamedKey::ArrowDown) => Some(b"\x1b[B".to_vec()),
+            Key::Named(NamedKey::ArrowRight) => Some(b"\x1b[C".to_vec()),
+            Key::Named(NamedKey::ArrowLeft) => Some(b"\x1b[D".to_vec()),
+            Key::Named(NamedKey::Home) => Some(b"\x1b[H".to_vec()),
+            Key::Named(NamedKey::End) => Some(b"\x1b[F".to_vec()),
+            Key::Named(NamedKey::PageUp) => Some(b"\x1b[5~".to_vec()),
+            Key::Named(NamedKey::PageDown) => Some(b"\x1b[6~".to_vec()),
+            Key::Named(NamedKey::Delete) => Some(b"\x1b[3~".to_vec()),
+            Key::Character(c) if ctrl => {
+                let ch = c.chars().next()?;
+                let lower = ch.to_ascii_lowercase();
+                if lower.is_ascii_alphabetic() {
+                    Some(vec![(lower as u8) & 0x1f])
+                } else {
+                    None
+                }
+            }
+            _ => event.text.as_ref().map(|t| t.as_bytes().to_vec()),
+        }
+    }
+
     fn toggle_feature(&mut self, id: &str) {
         if let Some(idx) = self.features.index_of(id) {
             match self.features.toggle(idx) {
@@ -1525,6 +1705,17 @@ impl App {
             "view.toggle.gutter" => self.toggle_feature("gutter"),
             "view.toggle.scrollbar" => self.toggle_feature("scrollbar"),
             "view.toggle.latencyHud" => self.toggle_feature("latency-hud"),
+            "view.toggle.terminal" => self.toggle_feature("terminal"),
+            "terminal.toggle" => {
+                self.close_overlay();
+                self.terminal_toggle();
+                return;
+            }
+            "terminal.focus" => {
+                self.close_overlay();
+                self.open_terminal();
+                return;
+            }
             // Not a built-in id: route to the module host (external command).
             other => self.invoke_module(other),
         }
@@ -1536,7 +1727,7 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.renderer.is_some() {
             return;
@@ -1566,6 +1757,31 @@ impl ApplicationHandler for App {
         }
     }
 
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::TerminalWakeup => {
+                let Some(session) = self.terminal.as_ref() else {
+                    return;
+                };
+                // take_dirty BEFORE content(): the coalescing contract — any
+                // parser progress after the clear re-arms a fresh wakeup.
+                if session.take_dirty() {
+                    let (text, cursor) = session.content();
+                    if let Some(renderer) = self.renderer.as_mut() {
+                        renderer.set_terminal_text(&text, cursor);
+                        if renderer.terminal_open() {
+                            renderer.window().request_redraw();
+                        }
+                    }
+                }
+            }
+            UserEvent::TerminalExited => {
+                // Shell ended (exit / Ctrl+D): close the panel and reap.
+                self.kill_terminal();
+            }
+        }
+    }
+
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -1582,6 +1798,16 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size.width, size.height);
+                }
+                // P3: keep the PTY grid in step with the resized panel.
+                if let (Some(session), Some(renderer)) =
+                    (self.terminal.as_ref(), self.renderer.as_ref())
+                {
+                    if renderer.terminal_open() {
+                        let (cols, lines) = renderer.term_grid_size();
+                        let (cw, ch) = renderer.cell_px();
+                        session.resize(cols, lines, cw, ch);
+                    }
                 }
                 // Modal overlays are shaped to the surface width at set_overlay
                 // time; a resize while one is open must re-spec it or its text
@@ -1701,6 +1927,28 @@ impl ApplicationHandler for App {
                         // A press changes the caret/selection context under the
                         // pointer: drop any hover highlight (redraws once).
                         self.clear_hover();
+                        // P3: clicks in the terminal panel move focus there;
+                        // clicks in the document return it to the editor.
+                        if let Some(renderer) = self.renderer.as_ref() {
+                            if renderer.terminal_open()
+                                && self.pointer.1 as f32 >= renderer.term_top()
+                            {
+                                self.term_focused = true;
+                                if let Some(r) = self.renderer.as_mut() {
+                                    r.set_terminal(true, true);
+                                    r.window().request_redraw();
+                                }
+                                return;
+                            }
+                        }
+                        if self.term_focused {
+                            self.term_focused = false;
+                            if let Some(r) = self.renderer.as_mut() {
+                                if r.terminal_open() {
+                                    r.set_terminal(true, false);
+                                }
+                            }
+                        }
                         // Scrollbar interaction wins over text placement.
                         if self.try_scrollbar_press() {
                             self.poke_scrollbar();
@@ -1751,6 +1999,33 @@ impl ApplicationHandler for App {
                 if event.state != ElementState::Pressed {
                     return;
                 }
+                // P3: terminal focus owns the keyboard exclusively. Ctrl+`
+                // stays global (toggle/unfocus) and Esc returns to the editor;
+                // everything else becomes PTY bytes. These keys are NOT D4
+                // latency samples — the ring measures editor keystrokes only.
+                if self.view == View::Editor && self.term_focused {
+                    let ctrl = self.modifiers.control_key();
+                    if ctrl && matches!(&event.logical_key, Key::Character(c) if c.as_str() == "`")
+                    {
+                        self.terminal_toggle();
+                        return;
+                    }
+                    if matches!(&event.logical_key, Key::Named(NamedKey::Escape)) {
+                        self.term_focused = false;
+                        if let Some(renderer) = self.renderer.as_mut() {
+                            renderer.set_terminal(true, false);
+                            renderer.window().request_redraw();
+                        }
+                        return;
+                    }
+                    if let (Some(session), Some(bytes)) =
+                        (self.terminal.as_ref(), Self::term_key_bytes(&event, ctrl))
+                    {
+                        session.write(bytes);
+                    }
+                    return;
+                }
+
                 // Slice 2 dispatch: modals capture all input while open; the
                 // editor path below runs only in the editor view.
                 match self.view {
@@ -1791,6 +2066,10 @@ impl ApplicationHandler for App {
                             }
                             "," => {
                                 self.open_settings();
+                                return;
+                            }
+                            "`" => {
+                                self.terminal_toggle();
                                 return;
                             }
                             "q" => {

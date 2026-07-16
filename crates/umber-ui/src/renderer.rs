@@ -90,6 +90,14 @@ const THUMB_COLOR: [f32; 4] = [0.55, 0.55, 0.60, 0.55];
 /// cursor accent.
 const SELECTION_COLOR: [f32; 4] = [0.30, 0.40, 0.58, 0.35];
 
+/// Terminal panel (P3): height fraction of the window, border colors (the
+/// border doubles as the focus cue), cursor cell fill, and grid text color.
+const TERM_SPLIT_FRAC: f32 = 0.35;
+const TERM_BORDER_COLOR: [f32; 4] = [0.32, 0.32, 0.38, 0.8];
+const TERM_BORDER_FOCUS_COLOR: [f32; 4] = [0.902, 0.706, 0.471, 0.9];
+const TERM_CURSOR_COLOR: [f32; 4] = [0.902, 0.706, 0.471, 0.45];
+const TERM_TEXT_COLOR: Color = Color::rgb(210, 210, 215);
+
 /// Modal overlay palette (command palette / settings / modules). All
 /// straight-alpha RGBA. The dim quad darkens the still-visible editor behind
 /// the modal; the box sits behind the palette input; the highlight marks the
@@ -429,6 +437,14 @@ pub struct Renderer {
     /// the cursor is scrolled out of the visible window.
     cursor: Option<(usize, usize)>,
 
+    /// Terminal panel state (P3): open/focus flags, last grid snapshot, and
+    /// the cell cursor. The buffer reshapes only when the snapshot changes.
+    term_open: bool,
+    term_focused: bool,
+    term_text: String,
+    term_cursor: Option<(usize, usize)>,
+    term_buffer: Buffer,
+
     /// The last document window text, kept so a scale change can re-shape it
     /// without the caller re-supplying it.
     doc_text: String,
@@ -510,6 +526,8 @@ impl Renderer {
         // wrap when the column is narrow). Long lines clip at the right edge.
         // TODO(P1): horizontal scroll for long lines.
         let mut stats_buffer = Buffer::new(&mut font_system, metrics);
+        let mut term_buffer = Buffer::new(&mut font_system, metrics);
+        term_buffer.set_wrap(Wrap::None);
         stats_buffer.set_wrap(Wrap::None);
         let mut doc_buffer = Buffer::new(&mut font_system, metrics);
         doc_buffer.set_wrap(Wrap::None);
@@ -647,6 +665,11 @@ impl Renderer {
             gutter_enabled: true,
             latency_hud: true,
             cursor: None,
+            term_open: false,
+            term_focused: false,
+            term_text: String::new(),
+            term_cursor: None,
+            term_buffer,
             doc_text: String::new(),
             stats_prefix: String::new(),
             banner_dirty: true,
@@ -722,14 +745,61 @@ impl Renderer {
     /// Document shaping box in physical pixels (width and visible height).
     fn doc_size(&self) -> (f32, f32) {
         let w = (self.surface_config.width as f32 - self.text_left() - self.pad_px()).max(1.0);
-        let h = (self.surface_config.height as f32 - self.doc_top() - self.pad_px()).max(1.0);
+        let h = (self.doc_bottom() - self.doc_top() - self.pad_px()).max(1.0);
         (w, h)
+    }
+
+    /// Y of the document region's bottom edge: the terminal panel's top when
+    /// the panel is open, else the window bottom. Every consumer of the doc
+    /// region (shaping box, line capacity, scrollbar track, hover/click
+    /// mapping in the bin) derives from this so the panel shrink is uniform.
+    pub fn doc_bottom(&self) -> f32 {
+        if self.term_open {
+            self.term_top()
+        } else {
+            self.surface_config.height as f32
+        }
+    }
+
+    /// Terminal panel height in physical px (whole line-heights + padding),
+    /// or 0 when closed.
+    pub fn term_split_h(&self) -> f32 {
+        if !self.term_open {
+            return 0.0;
+        }
+        let h = self.surface_config.height as f32;
+        let lines = ((h * TERM_SPLIT_FRAC) / self.line_px()).floor().max(2.0);
+        lines * self.line_px() + self.pad_px() * 2.0
+    }
+
+    /// Y of the terminal panel top (== window bottom when closed).
+    pub fn term_top(&self) -> f32 {
+        self.surface_config.height as f32 - self.term_split_h()
+    }
+
+    /// Terminal grid size `(cols, lines)` for PTY sizing.
+    pub fn term_grid_size(&self) -> (usize, usize) {
+        let cols = ((self.surface_config.width as f32 - self.pad_px() * 2.0) / self.cell_w())
+            .floor()
+            .max(1.0) as usize;
+        let lines = ((self.term_split_h() - self.pad_px() * 2.0) / self.line_px())
+            .floor()
+            .max(1.0) as usize;
+        (cols, lines)
+    }
+
+    /// Cell size `(width, height)` in physical px for the PTY `WindowSize`.
+    pub fn cell_px(&self) -> (u16, u16) {
+        (
+            self.cell_w().round().max(1.0) as u16,
+            self.line_px().round().max(1.0) as u16,
+        )
     }
 
     /// How many whole document lines fit in the current window. The caller uses
     /// this to size the scroll window (docs/PLAN.md: shape only visible lines).
     pub fn visible_line_capacity(&self) -> usize {
-        let avail = self.surface_config.height as f32 - self.doc_top() - self.pad_px();
+        let avail = self.doc_bottom() - self.doc_top() - self.pad_px();
         if avail <= 0.0 {
             0
         } else {
@@ -753,7 +823,7 @@ impl Renderer {
         let track_w = SCROLLBAR_W * s;
         let track_x = self.surface_config.width as f32 - track_w - SCROLLBAR_MARGIN * s;
         let track_top = self.doc_top();
-        let track_h = (self.surface_config.height as f32 - track_top).max(1.0);
+        let track_h = (self.doc_bottom() - track_top).max(1.0);
         let min_thumb = (SCROLLBAR_MIN_THUMB * s).min(track_h);
         let thumb_h = (track_h * visible as f32 / total_lines as f32).max(min_thumb);
         let scroll_range = (total_lines - visible) as f32;
@@ -914,6 +984,59 @@ impl Renderer {
         self.hover_line = line;
     }
 
+    /// Show/hide the terminal panel and set its keyboard focus. An open/close
+    /// changes the document geometry, so the doc + gutter reflow here; the
+    /// caller must re-apply its view (line window) afterwards.
+    pub fn set_terminal(&mut self, open: bool, focused: bool) {
+        if self.term_open == open && self.term_focused == focused {
+            return;
+        }
+        let geometry_changed = self.term_open != open;
+        self.term_open = open;
+        self.term_focused = focused;
+        if geometry_changed {
+            let (w, h) = self.doc_size();
+            self.doc_buffer.set_size(Some(w), Some(h));
+            self.doc_buffer
+                .shape_until_scroll(&mut self.font_system, false);
+            let gw = self.gutter_text_w().max(1.0);
+            let gh = self.doc_size().1;
+            self.gutter_buffer.set_size(Some(gw), Some(gh));
+            self.gutter_buffer
+                .shape_until_scroll(&mut self.font_system, false);
+        }
+    }
+
+    /// Replace the terminal grid snapshot + cursor cell. Reshapes only when
+    /// the snapshot text actually changed (the coalesced-wakeup path).
+    pub fn set_terminal_text(&mut self, text: &str, cursor: Option<(usize, usize)>) {
+        self.term_cursor = cursor;
+        if self.term_text == text {
+            return;
+        }
+        self.term_text.clear();
+        self.term_text.push_str(text);
+        self.term_buffer.set_text(
+            text,
+            &Attrs::new().family(Family::Monospace),
+            Shaping::Advanced,
+            None,
+        );
+        let w = (self.surface_config.width as f32 - self.pad_px() * 2.0).max(1.0);
+        let h = (self.term_split_h() - self.pad_px()).max(1.0);
+        self.term_buffer.set_size(Some(w), Some(h));
+        self.term_buffer
+            .shape_until_scroll(&mut self.font_system, false);
+    }
+
+    pub fn terminal_open(&self) -> bool {
+        self.term_open
+    }
+
+    pub fn terminal_focused(&self) -> bool {
+        self.term_focused
+    }
+
     // --- modal overlay (command palette / settings / modules) --------------
 
     /// Left x of the overlay content box (physical px).
@@ -1051,6 +1174,11 @@ impl Renderer {
     fn rebuild_shaped_buffers(&mut self) {
         let metrics = self.metrics();
         self.stats_buffer = Buffer::new(&mut self.font_system, metrics);
+        self.term_buffer = Buffer::new(&mut self.font_system, metrics);
+        self.term_buffer.set_wrap(Wrap::None);
+        let term_text = std::mem::take(&mut self.term_text);
+        let term_cursor = self.term_cursor;
+        self.set_terminal_text(&term_text, term_cursor);
         self.stats_buffer.set_wrap(Wrap::None);
         self.doc_buffer = Buffer::new(&mut self.font_system, metrics);
         self.doc_buffer.set_wrap(Wrap::None);
@@ -1160,6 +1288,14 @@ impl Renderer {
         self.gutter_buffer.set_size(Some(gw), Some(gh));
         self.gutter_buffer
             .shape_until_scroll(&mut self.font_system, false);
+        // Reflow the terminal snapshot to the new panel box.
+        if self.term_open {
+            let tw = (self.surface_config.width as f32 - self.pad_px() * 2.0).max(1.0);
+            let th = (self.term_split_h() - self.pad_px()).max(1.0);
+            self.term_buffer.set_size(Some(tw), Some(th));
+            self.term_buffer
+                .shape_until_scroll(&mut self.font_system, false);
+        }
         // Force the banner to re-shape at the new width on the next frame.
         self.banner_dirty = true;
     }
@@ -1218,10 +1354,13 @@ impl Renderer {
         let line_px = self.line_px();
         let cell_w = self.cell_w();
         let text_left = self.text_left();
+        let term_open = self.term_open;
+        let term_top = self.term_top();
+        let doc_bottom = self.doc_bottom();
         let w = self.surface_config.width as i32;
         let h = self.surface_config.height as i32;
 
-        let mut areas: Vec<TextArea> = Vec::with_capacity(5);
+        let mut areas: Vec<TextArea> = Vec::with_capacity(6);
         areas.push(TextArea {
             buffer: &self.stats_buffer,
             left: pad,
@@ -1266,6 +1405,24 @@ impl Renderer {
             default_color: Color::rgb(220, 220, 220),
             custom_glyphs: &[],
         });
+        // Terminal panel grid (P3), clipped to the panel region below the
+        // document. Drawn like the doc: under the modal dim when one is up.
+        if term_open {
+            areas.push(TextArea {
+                buffer: &self.term_buffer,
+                left: pad,
+                top: term_top + pad,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: 0,
+                    top: term_top as i32,
+                    right: w,
+                    bottom: h,
+                },
+                default_color: TERM_TEXT_COLOR,
+                custom_glyphs: &[],
+            });
+        }
         // Hovered word recolored gold, drawn over the original glyphs at the
         // word's exact grid cell (monospace -> covers them precisely). Shaped
         // only when the word changes (set_hover_word); here it is just placed.
@@ -1425,13 +1582,15 @@ impl Renderer {
         self.quad_bytes.clear();
 
         // Selection: one quad per visible highlighted line, using the same
-        // `col * cell_w` arithmetic as the caret. Clamped to `QUAD_MAX - 4` so
+        // `col * cell_w` arithmetic as the caret. Clamped to `QUAD_MAX - 6` so
+        // the scrollbar (2), separator rule + hover segment (2), and terminal
+        // border + cursor (2) always fit the vertex buffer.
         // the scrollbar's two quads plus the gutter separator rule and its
         // hovered-line segment always fit the vertex buffer.
         let sel_right_edge = fw - pad;
         let mut sel_verts: u32 = 0;
         if !self.overlay_active {
-            for span in self.selection.iter().take(QUAD_MAX - 4) {
+            for span in self.selection.iter().take(QUAD_MAX - 6) {
                 let y = doc_top + span.line as f32 * line_px;
                 if y >= fh {
                     continue;
@@ -1499,7 +1658,7 @@ impl Renderer {
             let s = self.scale_factor as f32;
             let sep_w = (SEPARATOR_W * s).max(1.0);
             let sep_x = self.pad_px() + self.gutter_text_w() + GUTTER_GAP * s * 0.5 - sep_w * 0.5;
-            let sep_h = (fh - doc_top).max(0.0);
+            let sep_h = (doc_bottom - doc_top).max(0.0);
             if sep_h > 0.0 {
                 sep_verts += push_quad(
                     &mut self.quad_bytes,
@@ -1525,6 +1684,47 @@ impl Renderer {
                         line_px,
                         SEPARATOR_HOVER_COLOR,
                     );
+                }
+            }
+        }
+
+        // Terminal panel border + cursor cell, appended after the separator
+        // range. The border doubles as the focus cue: rust accent while the
+        // terminal owns the keyboard, muted grey otherwise.
+        let mut term_verts: u32 = 0;
+        if term_open {
+            let s = self.scale_factor as f32;
+            let border_h = (1.0 * s).max(1.0);
+            term_verts += push_quad(
+                &mut self.quad_bytes,
+                fw,
+                fh,
+                0.0,
+                term_top,
+                fw,
+                border_h,
+                if self.term_focused {
+                    TERM_BORDER_FOCUS_COLOR
+                } else {
+                    TERM_BORDER_COLOR
+                },
+            );
+            if !self.overlay_active {
+                if let Some((row, col)) = self.term_cursor {
+                    let x = pad + col as f32 * cell_w;
+                    let y = term_top + pad + row as f32 * line_px;
+                    if y + line_px <= fh {
+                        term_verts += push_quad(
+                            &mut self.quad_bytes,
+                            fw,
+                            fh,
+                            x,
+                            y,
+                            cell_w,
+                            line_px,
+                            TERM_CURSOR_COLOR,
+                        );
+                    }
                 }
             }
         }
@@ -1579,7 +1779,7 @@ impl Renderer {
             }
         }
 
-        if sel_verts + bar_verts + sep_verts + ov_verts > 0 {
+        if sel_verts + bar_verts + sep_verts + term_verts + ov_verts > 0 {
             self.queue
                 .write_buffer(&self.quad_vbuf, 0, &self.quad_bytes);
         }
@@ -1666,10 +1866,18 @@ impl Renderer {
                 pass.draw(start..start + sep_verts, 0..1);
             }
 
+            // Terminal border + cursor, from the range past the separator.
+            if term_verts > 0 {
+                let start = sel_verts + bar_verts + sep_verts;
+                pass.set_pipeline(&self.quad_pipeline);
+                pass.set_vertex_buffer(0, self.quad_vbuf.slice(..));
+                pass.draw(start..start + term_verts, 0..1);
+            }
+
             // Modal overlay: dim + box + highlight quads, then the overlay text
             // in its own renderer so it sits above the dim.
             if ov_verts > 0 {
-                let start = sel_verts + bar_verts + sep_verts;
+                let start = sel_verts + bar_verts + sep_verts + term_verts;
                 pass.set_pipeline(&self.quad_pipeline);
                 pass.set_vertex_buffer(0, self.quad_vbuf.slice(..));
                 pass.draw(start..start + ov_verts, 0..1);

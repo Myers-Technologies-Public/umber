@@ -167,6 +167,8 @@ pub struct Config {
     pub scrollbar: bool,
     /// Show the keystroke->present latency segment in the banner.
     pub latency_hud: bool,
+    /// Enable the embedded terminal panel (P3).
+    pub terminal: bool,
 }
 
 impl Default for Config {
@@ -178,6 +180,7 @@ impl Default for Config {
             gutter: true,
             scrollbar: true,
             latency_hud: true,
+            terminal: true,
         }
     }
 }
@@ -265,6 +268,11 @@ impl Config {
                         self.latency_hud = v;
                     }
                 }
+                "terminal" => {
+                    if let Some(v) = parse_bool(value) {
+                        self.terminal = v;
+                    }
+                }
                 _ => {}
             }
         }
@@ -280,13 +288,15 @@ impl Config {
              scrollbar_linger_ms = {}\n\
              gutter = {}\n\
              scrollbar = {}\n\
-             latency_hud = {}\n",
+             latency_hud = {}\n\
+             terminal = {}\n",
             self.font_size,
             self.line_height,
             self.scrollbar_linger_ms,
             self.gutter,
             self.scrollbar,
             self.latency_hud,
+            self.terminal,
         )
     }
 
@@ -375,6 +385,14 @@ impl FeatureRegistry {
                     removable: true,
                 },
                 Feature {
+                    id: "terminal",
+                    name: "Embedded terminal",
+                    description: "Bottom-split shell panel (Ctrl+`)",
+                    default_on: true,
+                    enabled: cfg.terminal,
+                    removable: true,
+                },
+                Feature {
                     id: "command-palette",
                     name: "Command palette",
                     description: "Ctrl+Shift+P fuzzy command launcher",
@@ -429,6 +447,7 @@ impl FeatureRegistry {
         cfg.gutter = self.is_enabled("gutter");
         cfg.scrollbar = self.is_enabled("scrollbar");
         cfg.latency_hud = self.is_enabled("latency-hud");
+        cfg.terminal = self.is_enabled("terminal");
     }
 }
 
