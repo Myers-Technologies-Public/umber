@@ -73,6 +73,12 @@ enum View {
     Palette,
     Settings,
     Modules,
+    /// QoL (P3b): all commands + chords, read-only.
+    Help,
+    /// QoL: numeric go-to-line prompt.
+    GotoLine,
+    /// P3b: pick (or type) an SSH host; Enter opens `ssh <host>` in the panel.
+    SshPicker,
 }
 
 /// What the pointer is hovering over in the document body, for hover
@@ -149,8 +155,15 @@ fn build_command_registry() -> CommandRegistry {
             "",
         ),
         ("view.toggle.latencyHud", "View: Toggle Latency HUD", ""),
-        ("terminal.toggle", "Terminal: Toggle Panel", "Ctrl+`"),
+        (
+            "terminal.toggle",
+            "Terminal: Toggle Panel",
+            "Ctrl+` / Ctrl+J",
+        ),
         ("terminal.focus", "Terminal: Focus", ""),
+        ("terminal.ssh", "Terminal: SSH to Host\u{2026}", ""),
+        ("goto.line", "Go: Line\u{2026}", "Ctrl+G"),
+        ("help.keys", "Help: Keyboard Shortcuts", "F1"),
         ("view.toggle.terminal", "View: Toggle Terminal Feature", ""),
         ("app.quit", "Application: Quit", "Ctrl+Q"),
     ] {
@@ -161,6 +174,39 @@ fn build_command_registry() -> CommandRegistry {
         });
     }
     reg
+}
+
+/// Host aliases from ssh_config text: every name after a `Host` keyword,
+/// minus wildcard (`*`/`?`) and negated (`!`) patterns.
+fn parse_ssh_hosts(text: &str) -> Vec<String> {
+    let mut hosts = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if !line.to_ascii_lowercase().starts_with("host ") {
+            continue;
+        }
+        for name in line.split_whitespace().skip(1) {
+            if !name.contains('*') && !name.contains('?') && !name.starts_with('!') {
+                hosts.push(name.to_string());
+            }
+        }
+    }
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
+/// Hosts from `~/.ssh/config` for the SSH picker. Missing file = empty (the
+/// picker still accepts a typed host).
+fn ssh_config_hosts() -> Vec<String> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Vec::new();
+    };
+    let path = PathBuf::from(home).join(".ssh").join("config");
+    match std::fs::read_to_string(path) {
+        Ok(text) => parse_ssh_hosts(&text),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// Human ON/OFF label for a boolean setting/feature.
@@ -260,6 +306,12 @@ fn main() -> ExitCode {
         drag_anchor_y: 0.0,
         drag_anchor_first: 0,
         scrollbar_drawn: false,
+        help_scroll: 0,
+        goto_input: String::new(),
+        ssh_hosts: Vec::new(),
+        ssh_input: String::new(),
+        ssh_filtered: Vec::new(),
+        ssh_sel: 0,
         terminal: None,
         term_focused: false,
         event_proxy,
@@ -370,6 +422,18 @@ struct App {
     /// Whether the last presented frame drew the scrollbar, so a linger-out can
     /// schedule exactly one erase redraw.
     scrollbar_drawn: bool,
+
+    // --- P3b/QoL: help, go-to-line, SSH picker ---
+    /// Scroll offset of the help overlay.
+    help_scroll: usize,
+    /// Digits typed into the go-to-line prompt.
+    goto_input: String,
+    /// SSH picker state: hosts from ~/.ssh/config, filter text, filtered
+    /// indices, selection.
+    ssh_hosts: Vec<String>,
+    ssh_input: String,
+    ssh_filtered: Vec<usize>,
+    ssh_sel: usize,
 
     // --- P3: embedded terminal ---
     /// Live terminal session; spawned on first open, killed on feature
@@ -1045,6 +1109,79 @@ impl App {
                     )),
                 })
             }
+            View::Help => {
+                let cap = self
+                    .renderer
+                    .as_ref()
+                    .map(|r| r.overlay_row_capacity())
+                    .unwrap_or(1);
+                let n = self.palette_items.len();
+                let start = self.help_scroll.min(n.saturating_sub(1));
+                let end = (start + cap).min(n);
+                let rows = self.palette_items[start..end]
+                    .iter()
+                    .map(|c| {
+                        let key = if c.keybinding.is_empty() {
+                            "\u{2014}".to_string()
+                        } else {
+                            c.keybinding.clone()
+                        };
+                        (c.title.clone(), key)
+                    })
+                    .collect();
+                Some(OverlaySpec {
+                    title: Some("Keyboard Shortcuts & Commands".to_string()),
+                    input: None,
+                    rows,
+                    left_color: [225, 225, 230],
+                    right_color: [200, 170, 110],
+                    split_frac: 0.62,
+                    selected: None,
+                    hint: Some(format!(
+                        "{n} commands \u{2014} \u{2191}\u{2193} scroll \u{2022} Esc close"
+                    )),
+                })
+            }
+            View::GotoLine => Some(OverlaySpec {
+                title: None,
+                input: Some(format!("Go to line: {}", self.goto_input)),
+                rows: Vec::new(),
+                left_color: [225, 225, 230],
+                right_color: [135, 135, 150],
+                split_frac: 0.62,
+                selected: None,
+                hint: Some(format!(
+                    "1\u{2013}{} \u{2014} Enter jump \u{2022} Esc cancel",
+                    self.buffer.len_lines()
+                )),
+            }),
+            View::SshPicker => {
+                let cap = self
+                    .renderer
+                    .as_ref()
+                    .map(|r| r.overlay_row_capacity())
+                    .unwrap_or(1);
+                let n = self.ssh_filtered.len();
+                let sel = if n == 0 { 0 } else { self.ssh_sel.min(n - 1) };
+                let start = if sel < cap { 0 } else { sel + 1 - cap };
+                let end = (start + cap).min(n);
+                let mut rows = Vec::with_capacity(end - start);
+                for &hi in &self.ssh_filtered[start..end] {
+                    rows.push((self.ssh_hosts[hi].clone(), "~/.ssh/config".to_string()));
+                }
+                Some(OverlaySpec {
+                    title: None,
+                    input: Some(format!("ssh> {}", self.ssh_input)),
+                    rows,
+                    left_color: [225, 225, 230],
+                    right_color: [135, 135, 150],
+                    split_frac: 0.70,
+                    selected: if n == 0 { None } else { Some(sel - start) },
+                    hint: Some(
+                        "Enter connect (selected or typed host) \u{2022} Esc cancel".to_string(),
+                    ),
+                })
+            }
             View::Settings => {
                 let c = &self.config;
                 let rows = vec![
@@ -1154,6 +1291,159 @@ impl App {
         if let Some(r) = self.renderer.as_mut() {
             r.set_overlay(None);
             r.window().request_redraw();
+        }
+    }
+
+    // ===================================================================
+    //  P3b/QoL: help overlay, go-to-line, SSH picker.
+    // ===================================================================
+
+    fn open_help(&mut self) {
+        self.view = View::Help;
+        self.help_scroll = 0;
+        self.refresh_overlay();
+    }
+
+    fn open_goto(&mut self) {
+        self.view = View::GotoLine;
+        self.goto_input.clear();
+        self.refresh_overlay();
+    }
+
+    fn open_ssh_picker(&mut self) {
+        self.ssh_hosts = ssh_config_hosts();
+        self.ssh_input.clear();
+        self.view = View::SshPicker;
+        self.ssh_refilter();
+    }
+
+    fn help_key(&mut self, event: KeyEvent) {
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => self.close_overlay(),
+            Key::Named(NamedKey::ArrowDown) | Key::Named(NamedKey::PageDown) => {
+                let n = self.palette_items.len();
+                self.help_scroll = (self.help_scroll + 1).min(n.saturating_sub(1));
+                self.refresh_overlay();
+            }
+            Key::Named(NamedKey::ArrowUp) | Key::Named(NamedKey::PageUp) => {
+                self.help_scroll = self.help_scroll.saturating_sub(1);
+                self.refresh_overlay();
+            }
+            _ => {}
+        }
+    }
+
+    fn goto_key(&mut self, event: KeyEvent) {
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => self.close_overlay(),
+            Key::Named(NamedKey::Enter) => {
+                let target: Option<usize> = self.goto_input.trim().parse().ok();
+                self.view = View::Editor;
+                if let Some(n) = target {
+                    let last = self.buffer.len_lines();
+                    let line = n.clamp(1, last.max(1)) - 1;
+                    self.buffer.break_coalescing();
+                    self.selection_anchor = None;
+                    self.cursor_char = self.buffer.line_to_char(line);
+                    self.update_goal_col();
+                }
+                self.close_overlay();
+                self.apply_view(true);
+                if let Some(r) = self.renderer.as_ref() {
+                    r.window().request_redraw();
+                }
+            }
+            Key::Named(NamedKey::Backspace) => {
+                self.goto_input.pop();
+                self.refresh_overlay();
+            }
+            _ => {
+                if let Some(text) = &event.text {
+                    let mut changed = false;
+                    for ch in text.chars() {
+                        if ch.is_ascii_digit() {
+                            self.goto_input.push(ch);
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        self.refresh_overlay();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Re-filter SSH hosts against the typed query (simple case-insensitive
+    /// substring — host lists are short).
+    fn ssh_refilter(&mut self) {
+        let q = self.ssh_input.to_lowercase();
+        self.ssh_filtered = self
+            .ssh_hosts
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| q.is_empty() || h.to_lowercase().contains(&q))
+            .map(|(i, _)| i)
+            .collect();
+        self.ssh_sel = 0;
+        self.refresh_overlay();
+    }
+
+    fn ssh_key(&mut self, event: KeyEvent) {
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => self.close_overlay(),
+            Key::Named(NamedKey::Enter) => {
+                // Selected host wins; otherwise connect to the typed text.
+                let host = self
+                    .ssh_filtered
+                    .get(self.ssh_sel)
+                    .map(|&i| self.ssh_hosts[i].clone())
+                    .or_else(|| {
+                        let t = self.ssh_input.trim().to_string();
+                        if t.is_empty() {
+                            None
+                        } else {
+                            Some(t)
+                        }
+                    });
+                self.view = View::Editor;
+                self.close_overlay();
+                if let Some(host) = host {
+                    self.open_terminal_session(Some(("ssh".to_string(), vec![host])));
+                }
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                let n = self.ssh_filtered.len();
+                if n > 0 {
+                    self.ssh_sel = (self.ssh_sel + 1) % n;
+                }
+                self.refresh_overlay();
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                let n = self.ssh_filtered.len();
+                if n > 0 {
+                    self.ssh_sel = (self.ssh_sel + n - 1) % n;
+                }
+                self.refresh_overlay();
+            }
+            Key::Named(NamedKey::Backspace) => {
+                self.ssh_input.pop();
+                self.ssh_refilter();
+            }
+            _ => {
+                if let Some(text) = &event.text {
+                    let mut changed = false;
+                    for ch in text.chars() {
+                        if !ch.is_control() && !ch.is_whitespace() {
+                            self.ssh_input.push(ch);
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        self.ssh_refilter();
+                    }
+                }
+            }
         }
     }
 
@@ -1356,9 +1646,21 @@ impl App {
 
     /// Open (spawning the shell on first use) and focus the terminal panel.
     fn open_terminal(&mut self) {
+        self.open_terminal_session(None);
+    }
+
+    /// Open + focus the panel running `shell` (None = `$SHELL`). An explicit
+    /// `shell` (e.g. the SSH picker's `ssh <host>`) replaces a live session;
+    /// plain opens reuse it.
+    fn open_terminal_session(&mut self, shell: Option<(String, Vec<String>)>) {
         if !self.features.is_enabled("terminal") {
             self.modules_hint = Some("terminal feature is disabled".to_string());
             return;
+        }
+        if shell.is_some() {
+            if let Some(mut old) = self.terminal.take() {
+                old.shutdown();
+            }
         }
         let Some(renderer) = self.renderer.as_mut() else {
             return;
@@ -1369,12 +1671,13 @@ impl App {
         let (cw, ch) = renderer.cell_px();
         match &self.terminal {
             None => {
-                match TerminalSession::spawn(
+                match TerminalSession::spawn_with_shell(
                     UmberNotifier(self.event_proxy.clone()),
                     cols,
                     lines,
                     cw,
                     ch,
+                    shell,
                 ) {
                     Ok(session) => self.terminal = Some(session),
                     Err(err) => {
@@ -1716,6 +2019,18 @@ impl App {
                 self.open_terminal();
                 return;
             }
+            "terminal.ssh" => {
+                self.open_ssh_picker();
+                return;
+            }
+            "goto.line" => {
+                self.open_goto();
+                return;
+            }
+            "help.keys" => {
+                self.open_help();
+                return;
+            }
             // Not a built-in id: route to the module host (external command).
             other => self.invoke_module(other),
         }
@@ -2034,6 +2349,18 @@ impl ApplicationHandler<UserEvent> for App {
                         self.palette_key(event, event_loop);
                         return;
                     }
+                    View::Help => {
+                        self.help_key(event);
+                        return;
+                    }
+                    View::GotoLine => {
+                        self.goto_key(event);
+                        return;
+                    }
+                    View::SshPicker => {
+                        self.ssh_key(event);
+                        return;
+                    }
                     View::Settings => {
                         self.settings_key(event, event_loop);
                         return;
@@ -2055,6 +2382,12 @@ impl ApplicationHandler<UserEvent> for App {
                 let mut changed = false;
                 let mut redraw_only = false;
 
+                // QoL: F1 opens the help overlay from the editor.
+                if matches!(&event.logical_key, Key::Named(NamedKey::F1)) {
+                    self.open_help();
+                    return;
+                }
+
                 // Ctrl chords: clipboard, undo/redo, save, select-all. These
                 // consume the key; the printable path below is already Ctrl-gated.
                 if ctrl {
@@ -2068,8 +2401,12 @@ impl ApplicationHandler<UserEvent> for App {
                                 self.open_settings();
                                 return;
                             }
-                            "`" => {
+                            "`" | "j" => {
                                 self.terminal_toggle();
+                                return;
+                            }
+                            "g" => {
+                                self.open_goto();
                                 return;
                             }
                             "q" => {
@@ -2469,5 +2806,22 @@ mod tests {
         assert_ne!(HoverTarget::Line(1), HoverTarget::Line(2));
         assert_eq!(HoverTarget::Line(5), HoverTarget::Line(5));
         assert_ne!(HoverTarget::None, HoverTarget::Line(0));
+    }
+}
+
+#[cfg(test)]
+mod ssh_config_tests {
+    use super::parse_ssh_hosts;
+
+    #[test]
+    fn parses_hosts_skipping_wildcards_and_negations() {
+        let cfg = "# comment\nHost moo\n  HostName 1.2.3.4\n\nhost dev staging\nHost *\n  Compression yes\nHost *.internal !bastion prod\n";
+        assert_eq!(parse_ssh_hosts(cfg), vec!["dev", "moo", "prod", "staging"]);
+    }
+
+    #[test]
+    fn empty_or_hostless_config_yields_nothing() {
+        assert!(parse_ssh_hosts("").is_empty());
+        assert!(parse_ssh_hosts("Port 22\nUser root\n").is_empty());
     }
 }
