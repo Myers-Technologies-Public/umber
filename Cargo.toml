@@ -42,3 +42,10 @@ pollster = "1.0"
 # off since a text editor never puts images on the clipboard. Resolved to
 # arboard 3.6.1 against crates.io on 2026-07-16.
 arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }
+
+# P2 module host (D9). Versions resolved against crates.io on 2026-07-16 via a
+# scratch `cargo add`. wasmtime carries the `wat` feature so the host compiles
+# `.wat` fixtures directly; mlua uses vendored Lua 5.4 (the instruction-count
+# hook + VmState API the Lua backend relies on). Both are single-sourced here.
+wasmtime = { version = "46.0", features = ["wat"] }
+mlua = { version = "0.12", features = ["lua54", "vendored"] }

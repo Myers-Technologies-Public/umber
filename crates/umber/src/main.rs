@@ -9,11 +9,14 @@
 //! scroll over a 100 MB file, HiDPI, and a cold-start + idle-RAM measurement
 //! harness that prints everything a human needs to record the D4 verdict.
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use umber_host::{HostCommand, Manifest, ModuleHost};
 use umber_kernel::{Command, CommandRegistry, Config, FeatureRegistry};
 use umber_text::TextBuffer;
 use umber_ui::{OverlaySpec, Renderer, ScrollbarInfo, SelSpan};
@@ -64,6 +67,32 @@ enum HoverTarget {
         start_col: usize,
         end_col: usize,
     },
+}
+
+/// A command palette row: a built-in command or a loaded external-module
+/// command, unified so the fuzzy filter and overlay treat both alike. Rebuilt
+/// from the kernel registry plus the module host's live commands each time the
+/// palette opens.
+struct PaletteItem {
+    id: String,
+    title: String,
+    keybinding: String,
+}
+
+/// A discovered external module (`~/.config/umber/modules/<name>/umber.toml`)
+/// and its live host state, listed on the modules page beneath the built-in
+/// features. A bad manifest is surfaced (`manifest: Err`), never fatal; a load
+/// failure is captured in `error` so the page can show it without crashing.
+struct ExternalModule {
+    /// Manifest `name` when it parsed, else the directory name.
+    name: String,
+    base_dir: PathBuf,
+    /// Parsed manifest, or the parse error text.
+    manifest: Result<Manifest, String>,
+    /// Currently loaded (instantiated) in the host.
+    loaded: bool,
+    /// Last load error, surfaced on the page; `None` when healthy.
+    error: Option<String>,
 }
 
 /// The full command set (D6). Registration order is the palette's default
@@ -160,6 +189,16 @@ fn main() -> ExitCode {
     let commands = build_command_registry();
     let scrollbar_linger = Duration::from_millis(config.scrollbar_linger_ms);
 
+    // Module host (D9). A wasmtime-engine failure must not sink the editor:
+    // degrade to no modules, exactly like the clipboard path above.
+    let module_host = match ModuleHost::new() {
+        Ok(h) => Some(h),
+        Err(err) => {
+            eprintln!("umber: module host unavailable ({err}); modules disabled");
+            None
+        }
+    };
+
     let mut app = App {
         buffer,
         renderer: None,
@@ -173,6 +212,12 @@ fn main() -> ExitCode {
         settings_sel: 0,
         modules_sel: 0,
         modules_hint: None,
+        module_host,
+        modules: Vec::new(),
+        module_commands: Vec::new(),
+        modules_enabled: BTreeSet::new(),
+        module_status: None,
+        palette_items: Vec::new(),
         scrollbar_linger,
         cursor_char: 0,
         goal_col: 0,
@@ -194,6 +239,10 @@ fn main() -> ExitCode {
         first_frame_at: None,
         rss_printed: false,
     };
+
+    // Discover + load enabled modules before the event loop so their commands
+    // are in the palette from the first frame.
+    app.init_modules();
 
     if let Err(err) = event_loop.run_app(&mut app) {
         eprintln!("umber: event loop error: {err}");
@@ -230,6 +279,21 @@ struct App {
     /// refusal per D10).
     modules_sel: usize,
     modules_hint: Option<String>,
+    /// Module host (D9): wasm + lua backends behind the deny-all broker. `None`
+    /// if the wasmtime engine failed to build (the editor still runs).
+    module_host: Option<ModuleHost>,
+    /// Discovered external modules, shown after the built-in features on the
+    /// modules page; index `modules_sel - features.len()` selects one.
+    modules: Vec<ExternalModule>,
+    /// Commands provided by currently-loaded modules (palette + dispatch).
+    module_commands: Vec<HostCommand>,
+    /// Names of modules the user has enabled; persisted to the host's sidecar
+    /// (`$CONFIG/umber/modules-enabled`) so the set survives restarts.
+    modules_enabled: BTreeSet<String>,
+    /// Last line of module output (or an error), shown in the status banner.
+    module_status: Option<String>,
+    /// Unified palette source (built-ins + module commands), rebuilt on open.
+    palette_items: Vec<PaletteItem>,
     /// Scrollbar auto-hide linger from config (replaces the old fixed const).
     scrollbar_linger: Duration,
 
@@ -357,13 +421,18 @@ impl App {
             .path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "*scratch*".to_string());
-        let prefix = format!(
+        let mut prefix = format!(
             "umber P0 \u{2014} {dirty}{name} \u{2014} {} lines, {} bytes \u{2014} Ln {}, Col {}",
             self.buffer.len_lines(),
             self.buffer.len_bytes(),
             cl + 1,
             col + 1,
         );
+        // Append the last module status line, if any (simplest honest surface
+        // for module text output \u{2014} the editor status banner).
+        if let Some(status) = &self.module_status {
+            let _ = write!(prefix, "  \u{2014}  {status}");
+        }
 
         // Line-number gutter for the shaped window. The string changes exactly
         // when `first_visible_line` or the line count changes \u{2014} the same
@@ -906,8 +975,8 @@ impl App {
                 let end = (start + cap).min(n);
                 let mut rows = Vec::with_capacity(end - start);
                 for &ci in &self.palette_filtered[start..end] {
-                    let c = self.commands.commands()[ci];
-                    rows.push((c.title.to_string(), c.keybinding.to_string()));
+                    let c = &self.palette_items[ci];
+                    rows.push((c.title.clone(), c.keybinding.clone()));
                 }
                 Some(OverlaySpec {
                     title: None,
@@ -959,6 +1028,24 @@ impl App {
                         format!("{state}  \u{2022}  {}{tag}", f.description),
                     ));
                 }
+                // External modules, tagged with kind + requested permissions.
+                for m in &self.modules {
+                    let state = if m.loaded { "ON " } else { "OFF" };
+                    let detail = match (&m.manifest, &m.error) {
+                        (Err(e), _) => format!("{state}  \u{2022}  [module] parse error: {e}"),
+                        (Ok(man), Some(err)) => format!(
+                            "{state}  \u{2022}  [module {}] {} \u{2014} error: {err}",
+                            man.kind.as_str(),
+                            man.permissions.summary()
+                        ),
+                        (Ok(man), None) => format!(
+                            "{state}  \u{2022}  [module {}] {}",
+                            man.kind.as_str(),
+                            man.permissions.summary()
+                        ),
+                    };
+                    rows.push((m.name.clone(), detail));
+                }
                 let hint = self.modules_hint.clone().unwrap_or_else(|| {
                     "\u{2191}\u{2193} select \u{2022} Enter toggle \u{2022} Esc save & close"
                         .to_string()
@@ -984,7 +1071,8 @@ impl App {
         self.view = View::Palette;
         self.palette_query.clear();
         self.palette_sel = 0;
-        self.palette_filtered = self.commands.filter("");
+        self.rebuild_palette_items();
+        self.palette_filtered = self.filter_palette("");
         self.refresh_overlay();
     }
 
@@ -1017,7 +1105,7 @@ impl App {
 
     /// Recompute the palette filter after the query changed.
     fn repalette(&mut self) {
-        self.palette_filtered = self.commands.filter(&self.palette_query);
+        self.palette_filtered = self.filter_palette(&self.palette_query);
         self.palette_sel = 0;
         self.refresh_overlay();
     }
@@ -1033,10 +1121,10 @@ impl App {
                 let id = self
                     .palette_filtered
                     .get(self.palette_sel)
-                    .map(|&i| self.commands.commands()[i].id);
+                    .map(|&i| self.palette_items[i].id.clone());
                 self.view = View::Editor;
                 match id {
-                    Some(id) => self.execute_command(id, event_loop),
+                    Some(id) => self.execute_command(&id, event_loop),
                     None => self.close_overlay(),
                 }
                 return;
@@ -1156,7 +1244,7 @@ impl App {
                 self.refresh_overlay();
             }
             Key::Named(NamedKey::ArrowDown) => {
-                let n = self.features.features().len();
+                let n = self.features.features().len() + self.modules.len();
                 self.modules_sel = (self.modules_sel + 1).min(n.saturating_sub(1));
                 self.modules_hint = None;
                 self.refresh_overlay();
@@ -1168,15 +1256,41 @@ impl App {
 
     /// Toggle the selected feature (D10). Kernel entries refuse with a hint.
     fn modules_toggle_current(&mut self) {
-        match self.features.toggle(self.modules_sel) {
-            Ok(_) => {
-                self.modules_hint = None;
-                self.features.apply_to_config(&mut self.config);
-                let _ = self.config.save();
-                self.apply_config();
+        let feature_count = self.features.features().len();
+        if self.modules_sel < feature_count {
+            // Built-in feature (D10): the toggle mirrors the config booleans.
+            match self.features.toggle(self.modules_sel) {
+                Ok(_) => {
+                    self.modules_hint = None;
+                    self.features.apply_to_config(&mut self.config);
+                    let _ = self.config.save();
+                    self.apply_config();
+                }
+                Err(hint) => self.modules_hint = Some(hint.to_string()),
             }
-            Err(hint) => self.modules_hint = Some(hint.to_string()),
+            self.refresh_overlay();
+            return;
         }
+        // External module: toggle load/unload live and persist the enabled set.
+        let idx = self.modules_sel - feature_count;
+        if idx >= self.modules.len() {
+            return;
+        }
+        if self.modules[idx].loaded {
+            self.unload_module(idx);
+            self.modules_enabled.remove(&self.modules[idx].name);
+            self.modules_hint = None;
+        } else {
+            self.load_module(idx);
+            if self.modules[idx].loaded {
+                self.modules_enabled.insert(self.modules[idx].name.clone());
+                self.modules_hint = None;
+            } else {
+                // Surface the load failure; the app stays alive.
+                self.modules_hint = self.modules[idx].error.clone();
+            }
+        }
+        self.save_modules_enabled();
         self.refresh_overlay();
     }
 
@@ -1193,6 +1307,162 @@ impl App {
                 Err(hint) => self.modules_hint = Some(hint.to_string()),
             }
         }
+    }
+
+    // ===================================================================
+    //  P2: external module host wiring (D9).
+    // ===================================================================
+
+    /// Discover `~/.config/umber/modules/*/umber.toml` and load the enabled
+    /// ones. The enabled set persists in the host's sidecar; on first run (no
+    /// sidecar yet) it is seeded from each manifest's `default_on`. Called once
+    /// at startup, before the event loop. Never fatal: a missing dir, a bad
+    /// manifest, or a load failure is recorded, not raised.
+    fn init_modules(&mut self) {
+        let Some(dir) = umber_host::modules_dir() else {
+            return;
+        };
+        let enabled_path = umber_host::enabled_path();
+        let had_sidecar = enabled_path.as_ref().map(|p| p.exists()).unwrap_or(false);
+        self.modules_enabled = enabled_path
+            .as_ref()
+            .map(|p| umber_host::load_enabled(p))
+            .unwrap_or_default();
+
+        for d in umber_host::discover(&dir) {
+            let name = d.name().to_string();
+            let manifest = d.manifest.map_err(|e| e.to_string());
+            // First run: seed the enabled set from `default_on` so a freshly
+            // dropped-in module appears on without the user toggling it.
+            if !had_sidecar {
+                if let Ok(m) = &manifest {
+                    if m.default_on {
+                        self.modules_enabled.insert(name.clone());
+                    }
+                }
+            }
+            self.modules.push(ExternalModule {
+                name,
+                base_dir: d.base_dir,
+                manifest,
+                loaded: false,
+                error: None,
+            });
+        }
+
+        for idx in 0..self.modules.len() {
+            if self.modules_enabled.contains(&self.modules[idx].name) {
+                self.load_module(idx);
+            }
+        }
+        if !had_sidecar {
+            self.save_modules_enabled();
+        }
+    }
+
+    /// Load module `idx` into the host, appending its commands. Records a load
+    /// error on the entry instead of raising. A module whose manifest failed to
+    /// parse cannot be loaded.
+    fn load_module(&mut self, idx: usize) {
+        let (manifest, base_dir) = match &self.modules[idx].manifest {
+            Ok(m) => (m.clone(), self.modules[idx].base_dir.clone()),
+            Err(_) => {
+                self.modules[idx].error = Some("manifest failed to parse".to_string());
+                return;
+            }
+        };
+        let Some(host) = self.module_host.as_mut() else {
+            self.modules[idx].error = Some("module host unavailable".to_string());
+            return;
+        };
+        match host.load(manifest, &base_dir) {
+            Ok(cmds) => {
+                self.module_commands.extend(cmds);
+                self.modules[idx].loaded = true;
+                self.modules[idx].error = None;
+            }
+            Err(e) => {
+                self.modules[idx].loaded = false;
+                self.modules[idx].error = Some(e.to_string());
+            }
+        }
+    }
+
+    /// Unload module `idx`, dropping its commands from the palette source.
+    fn unload_module(&mut self, idx: usize) {
+        let name = self.modules[idx].name.clone();
+        if let Some(host) = self.module_host.as_mut() {
+            let removed = host.unload(&name);
+            self.module_commands
+                .retain(|c| !removed.iter().any(|r| r == &c.id));
+        }
+        self.modules[idx].loaded = false;
+        self.modules[idx].error = None;
+    }
+
+    /// Persist the enabled-module set to the host's sidecar file.
+    fn save_modules_enabled(&self) {
+        if let Some(path) = umber_host::enabled_path() {
+            let _ = umber_host::save_enabled(&path, &self.modules_enabled);
+        }
+    }
+
+    /// Invoke an external-module command by id, capturing its first output line
+    /// (or the error) into the status banner. Never panics on a bad module.
+    fn invoke_module(&mut self, id: &str) {
+        let status = match self.module_host.as_mut() {
+            Some(host) => match host.invoke(id) {
+                Ok(text) => {
+                    let line = text.lines().next().unwrap_or("").trim();
+                    if line.is_empty() {
+                        format!("{id}: ran (no output)")
+                    } else {
+                        format!("{id}: {line}")
+                    }
+                }
+                Err(e) => format!("{id} failed: {e}"),
+            },
+            None => format!("{id}: module host unavailable"),
+        };
+        self.module_status = Some(status);
+    }
+
+    /// Rebuild the unified palette source: built-in commands followed by the
+    /// currently-loaded module commands.
+    fn rebuild_palette_items(&mut self) {
+        let mut items =
+            Vec::with_capacity(self.commands.commands().len() + self.module_commands.len());
+        for c in self.commands.commands() {
+            items.push(PaletteItem {
+                id: c.id.to_string(),
+                title: c.title.to_string(),
+                keybinding: c.keybinding.to_string(),
+            });
+        }
+        for c in &self.module_commands {
+            items.push(PaletteItem {
+                id: c.id.clone(),
+                title: c.title.clone(),
+                keybinding: "module".to_string(),
+            });
+        }
+        self.palette_items = items;
+    }
+
+    /// Filter+rank the unified palette items against `query`, reusing the
+    /// kernel's fuzzy scorer so built-ins and module commands rank alike.
+    fn filter_palette(&self, query: &str) -> Vec<usize> {
+        if query.trim().is_empty() {
+            return (0..self.palette_items.len()).collect();
+        }
+        let mut scored: Vec<(usize, i32)> = self
+            .palette_items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, it)| umber_kernel::fuzzy_score(&it.title, query).map(|s| (i, s)))
+            .collect();
+        scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        scored.into_iter().map(|(i, _)| i).collect()
     }
 
     /// Run a registered command by id. Commands that open a modal switch the
@@ -1255,7 +1525,8 @@ impl App {
             "view.toggle.gutter" => self.toggle_feature("gutter"),
             "view.toggle.scrollbar" => self.toggle_feature("scrollbar"),
             "view.toggle.latencyHud" => self.toggle_feature("latency-hud"),
-            _ => {}
+            // Not a built-in id: route to the module host (external command).
+            other => self.invoke_module(other),
         }
         // In-place command finished: return to the editor and repaint.
         self.close_overlay();

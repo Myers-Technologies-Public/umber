@@ -1,0 +1,19 @@
+[module]
+name = "sample"
+version = "0.2.0"
+kind = "wasm"
+entry = "hello.wat"
+default_on = true
+
+[permissions]
+fs = ["read:workspace", "write:tmp"]
+net = ["localhost"]
+exec = ["pi"]
+
+[ui]
+panels = ["sample"]
+commands = ["hello.greet"]
+surfaces = ["tui", "plain"]
+
+[config]
+greeting = "howdy"

@@ -13,5 +13,6 @@ path = "src/main.rs"
 umber-ui.workspace = true
 umber-text.workspace = true
 umber-kernel.workspace = true
+umber-host.workspace = true
 winit.workspace = true
 arboard.workspace = true
