@@ -8,7 +8,7 @@ members = [
     "crates/umber-kernel",
     "crates/umber-host",
     "crates/umber-proto",
-    "crates/umberd", "target/scratch/termprobe",
+    "crates/umberd",
 ]
 
 # D3: OSS core is dual-licensed MIT OR Apache-2.0.
