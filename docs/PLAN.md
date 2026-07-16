@@ -145,3 +145,15 @@ premium licensing + entitlements.
 2. Theme format + default theme design language. (P1/P2)
 3. Marketplace branding/domain; payment rails. (P6)
 4. Windows timeline. (post-v0.1, D8)
+
+## Status ledger (updated 2026-07-16)
+
+- P0 render spike: DONE (user-verified on Wayland; formal D4 numbers still unreported)
+- P1 editor core: DONE (selection/clipboard/undo/save/palette/settings/modules)
+- P2 module host: DONE slice 1 (wasm+lua sandboxed, runtime load/unload; editor-pane-as-module + ABI v2 I/O still open)
+- P3 terminal: DONE (embedded panel + headless PTY e2e)
+- P3b SSH: DONE slice 1 (ssh-in-terminal via host picker; umberd remote *workspace* still open)
+- P4 agents: DONE slice 1 (read-only session dashboard from JSONL); slice 2 = live RPC control (pi --mode rpc)
+- P5 LSP/git/search: NOT STARTED
+- P6 marketplace: NOT STARTED
+- QoL: F1 help, Ctrl+G goto-line, Ctrl+J panel toggle, hover/separator, Ghostty scrollbar
