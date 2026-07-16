@@ -58,6 +58,22 @@ const GUTTER_GAP: f32 = 12.0;
 /// Dim gutter line-number color vs. the 220-grey body text (task spec).
 const GUTTER_COLOR: Color = Color::rgb(105, 105, 120);
 
+/// Gutter/document separator rule (straight-alpha RGBA). A subtle grey, dimmer
+/// than the gutter digits, sitting in the gap between the line numbers and the
+/// text. Thickness is `SEPARATOR_W` logical px scaled for HiDPI.
+const SEPARATOR_COLOR: [f32; 4] = [0.32, 0.32, 0.38, 0.55];
+const SEPARATOR_W: f32 = 1.0;
+
+/// Hovered-line segment painted over the separator rule at the pointer's line:
+/// warm gold (~rgb(212,175,55)) so the rule always shows which line the pointer
+/// is on. Straight-alpha RGBA; stands out from the grey rule and the rust caret.
+const SEPARATOR_HOVER_COLOR: [f32; 4] = [0.831, 0.686, 0.216, 0.9];
+
+/// Hovered-word recolor: warm gold (rgb(212,175,55)) drawn over the original
+/// glyphs at the word's grid cells. Reads on the dark bg, stands out from the
+/// 220-grey body, and differs from the rust caret (230,180,120).
+const HOVER_WORD_COLOR: Color = Color::rgb(212, 175, 55);
+
 /// Ghostty-style overlay scrollbar visuals, logical px (scaled for HiDPI).
 const SCROLLBAR_W: f32 = 10.0; // track/thumb width
 const SCROLLBAR_EDGE: f32 = 16.0; // right-edge hover-activation zone
@@ -90,10 +106,11 @@ const OVERLAY_INPUT_COLOR: Color = Color::rgb(232, 232, 238);
 const OVERLAY_HINT_COLOR: Color = Color::rgb(140, 140, 155);
 
 /// Max solid quads the overlay pipeline draws per frame: one per visible
-/// selected line plus the scrollbar track + thumb; six vertices each. Sizes the
-/// reused vertex staging buffer, so it must cover the tallest realistic visible
-/// line count (a 4K window is ~110 lines). The selection loop clamps to
-/// `QUAD_MAX - 2` so the scrollbar always has room.
+/// selected line plus the scrollbar track + thumb, the gutter separator rule,
+/// and its hovered-line segment; six vertices each. Sizes the reused vertex
+/// staging buffer, so it must cover the tallest realistic visible line count (a
+/// 4K window is ~110 lines). The selection loop clamps to `QUAD_MAX - 4` so the
+/// scrollbar (2) + separator (1) + hover segment (1) always have room.
 const QUAD_MAX: usize = 256;
 const QUAD_VERTS: usize = QUAD_MAX * 6;
 const QUAD_FLOATS_PER_VERT: usize = 6; // vec2 position + vec4 color
@@ -384,6 +401,17 @@ pub struct Renderer {
     /// Reused across frames; rebuilt by the bin only when the selection changes.
     selection: Vec<SelSpan>,
 
+    /// Hovered-word overlay: a small dedicated buffer (like `cursor_buffer`)
+    /// holding just the hovered word, re-shaped only when the word text changes
+    /// so a mouse move never reshapes the document. `hover_word` is its
+    /// `(line_in_window, start_col)` grid position, `None` when no word is
+    /// hovered. `hover_line` is the window-relative line whose separator segment
+    /// is highlighted (set for both word and empty-space hover).
+    hover_word_buffer: Buffer,
+    hover_word_text: String,
+    hover_word: Option<(usize, usize)>,
+    hover_line: Option<usize>,
+
     /// Physical-pixel HiDPI scale (window.scale_factor()); folded into metrics,
     /// padding, bounds, and the cursor position.
     scale_factor: f64,
@@ -500,6 +528,11 @@ impl Renderer {
         let mut overlay_hint = Buffer::new(&mut font_system, metrics);
         overlay_hint.set_wrap(Wrap::None);
 
+        // The hovered-word overlay buffer: like the cursor glyph, shaped only
+        // when the hovered word changes (never per mouse move).
+        let mut hover_word_buffer = Buffer::new(&mut font_system, metrics);
+        hover_word_buffer.set_wrap(Wrap::None);
+
         // The cursor is a single glyph, shaped once here and re-shaped only on a
         // scale change.
         let mut cursor_buffer = Buffer::new(&mut font_system, metrics);
@@ -604,6 +637,10 @@ impl Renderer {
             quad_bytes: Vec::with_capacity(QUAD_VERTS * QUAD_FLOATS_PER_VERT * 4),
             scrollbar: None,
             selection: Vec::new(),
+            hover_word_buffer,
+            hover_word_text: String::new(),
+            hover_word: None,
+            hover_line: None,
             scale_factor,
             base_font: BASE_FONT,
             base_line: BASE_LINE,
@@ -836,6 +873,47 @@ impl Renderer {
         self.selection.extend_from_slice(spans);
     }
 
+    /// Set (or clear) the hovered word: `(line_in_window, start_col, text)`.
+    /// The dedicated word buffer is re-shaped ONLY when `text` differs from the
+    /// last hovered word, so moving between two same-text words (or repeated
+    /// calls with an unchanged word) never reshapes. `None` hides the recolor.
+    /// The bin calls this only when the hover target actually changes.
+    pub fn set_hover_word(&mut self, word: Option<(usize, usize, &str)>) {
+        match word {
+            Some((line, start_col, text)) => {
+                self.hover_word = Some((line, start_col));
+                if self.hover_word_text != text {
+                    self.hover_word_text.clear();
+                    self.hover_word_text.push_str(text);
+                    self.hover_word_buffer.set_text(
+                        text,
+                        &Attrs::new().family(Family::Monospace),
+                        Shaping::Advanced,
+                        None,
+                    );
+                    // One extra cell of width headroom so the last glyph never
+                    // clips; height is one line.
+                    let w = self.cell_w() * (text.chars().count() as f32 + 1.0);
+                    self.hover_word_buffer
+                        .set_size(Some(w.max(1.0)), Some(self.line_px()));
+                    self.hover_word_buffer
+                        .shape_until_scroll(&mut self.font_system, false);
+                }
+            }
+            // Intentionally leaves `hover_word_text` + the shaped buffer
+            // intact: an invisible surface costs nothing, and re-hovering the
+            // same word (the common flicker case) skips the reshape entirely.
+            // `rebuild_shaped_buffers` clears the cache on metrics changes.
+            None => self.hover_word = None,
+        }
+    }
+
+    /// Set (or clear) the window-relative line whose separator segment is
+    /// highlighted. Cheap: just stored, drawn as a quad in [`Renderer::render`].
+    pub fn set_hover_line(&mut self, line: Option<usize>) {
+        self.hover_line = line;
+    }
+
     // --- modal overlay (command palette / settings / modules) --------------
 
     /// Left x of the overlay content box (physical px).
@@ -979,6 +1057,10 @@ impl Renderer {
         self.gutter_buffer = Buffer::new(&mut self.font_system, metrics);
         self.gutter_buffer.set_wrap(Wrap::None);
         self.cursor_buffer = Buffer::new(&mut self.font_system, metrics);
+        self.hover_word_buffer = Buffer::new(&mut self.font_system, metrics);
+        self.hover_word_buffer.set_wrap(Wrap::None);
+        // Force the hovered word to re-shape at the new metrics on its next set.
+        self.hover_word_text.clear();
         // Overlay surfaces carry the metrics too; recreate them empty and let
         // the next `set_overlay` repopulate (the bin refreshes the overlay
         // right after a live metrics change).
@@ -1139,7 +1221,7 @@ impl Renderer {
         let w = self.surface_config.width as i32;
         let h = self.surface_config.height as i32;
 
-        let mut areas: Vec<TextArea> = Vec::with_capacity(4);
+        let mut areas: Vec<TextArea> = Vec::with_capacity(5);
         areas.push(TextArea {
             buffer: &self.stats_buffer,
             left: pad,
@@ -1184,6 +1266,31 @@ impl Renderer {
             default_color: Color::rgb(220, 220, 220),
             custom_glyphs: &[],
         });
+        // Hovered word recolored gold, drawn over the original glyphs at the
+        // word's exact grid cell (monospace -> covers them precisely). Shaped
+        // only when the word changes (set_hover_word); here it is just placed.
+        if let Some((line, start_col)) = self.hover_word {
+            if !self.overlay_active {
+                let x = text_left + start_col as f32 * cell_w;
+                let y = doc_top + line as f32 * line_px;
+                if y < h as f32 {
+                    areas.push(TextArea {
+                        buffer: &self.hover_word_buffer,
+                        left: x,
+                        top: y,
+                        scale: 1.0,
+                        bounds: TextBounds {
+                            left: text_left as i32,
+                            top: doc_top as i32,
+                            right: w,
+                            bottom: h,
+                        },
+                        default_color: HOVER_WORD_COLOR,
+                        custom_glyphs: &[],
+                    });
+                }
+            }
+        }
         if let Some((line, col)) = self.cursor {
             let x = text_left + col as f32 * cell_w;
             let y = doc_top + line as f32 * line_px;
@@ -1318,12 +1425,13 @@ impl Renderer {
         self.quad_bytes.clear();
 
         // Selection: one quad per visible highlighted line, using the same
-        // `col * cell_w` arithmetic as the caret. Clamped to `QUAD_MAX - 2` so
-        // the scrollbar's two quads always fit the vertex buffer.
+        // `col * cell_w` arithmetic as the caret. Clamped to `QUAD_MAX - 4` so
+        // the scrollbar's two quads plus the gutter separator rule and its
+        // hovered-line segment always fit the vertex buffer.
         let sel_right_edge = fw - pad;
         let mut sel_verts: u32 = 0;
         if !self.overlay_active {
-            for span in self.selection.iter().take(QUAD_MAX - 2) {
+            for span in self.selection.iter().take(QUAD_MAX - 4) {
                 let y = doc_top + span.line as f32 * line_px;
                 if y >= fh {
                     continue;
@@ -1381,6 +1489,46 @@ impl Renderer {
             );
         }
 
+        // Gutter separator rule + hovered-line segment (editor only -- the modal
+        // dim would cover them). Thin vertical quad centered in the gutter gap,
+        // full document height; the hover segment repaints one line of it in
+        // gold so the rule always shows the pointer's line. Both count toward
+        // QUAD_MAX (selection is capped at QUAD_MAX-4 to reserve these).
+        let mut sep_verts: u32 = 0;
+        if !self.overlay_active && self.gutter_enabled && self.gutter_digits > 0 {
+            let s = self.scale_factor as f32;
+            let sep_w = (SEPARATOR_W * s).max(1.0);
+            let sep_x = self.pad_px() + self.gutter_text_w() + GUTTER_GAP * s * 0.5 - sep_w * 0.5;
+            let sep_h = (fh - doc_top).max(0.0);
+            if sep_h > 0.0 {
+                sep_verts += push_quad(
+                    &mut self.quad_bytes,
+                    fw,
+                    fh,
+                    sep_x,
+                    doc_top,
+                    sep_w,
+                    sep_h,
+                    SEPARATOR_COLOR,
+                );
+            }
+            if let Some(line) = self.hover_line {
+                let y = doc_top + line as f32 * line_px;
+                if y < fh {
+                    sep_verts += push_quad(
+                        &mut self.quad_bytes,
+                        fw,
+                        fh,
+                        sep_x,
+                        y,
+                        sep_w,
+                        line_px,
+                        SEPARATOR_HOVER_COLOR,
+                    );
+                }
+            }
+        }
+
         // Modal overlay quads (dim + input box + selected-row highlight),
         // appended after the scrollbar range; drawn over the editor and under
         // the overlay text.
@@ -1431,7 +1579,7 @@ impl Renderer {
             }
         }
 
-        if sel_verts + bar_verts + ov_verts > 0 {
+        if sel_verts + bar_verts + sep_verts + ov_verts > 0 {
             self.queue
                 .write_buffer(&self.quad_vbuf, 0, &self.quad_bytes);
         }
@@ -1509,10 +1657,19 @@ impl Renderer {
                 pass.draw(sel_verts..sel_verts + bar_verts, 0..1);
             }
 
+            // Gutter separator rule + hovered-line segment, composited OVER the
+            // text from the range just past the scrollbar quads.
+            if sep_verts > 0 {
+                let start = sel_verts + bar_verts;
+                pass.set_pipeline(&self.quad_pipeline);
+                pass.set_vertex_buffer(0, self.quad_vbuf.slice(..));
+                pass.draw(start..start + sep_verts, 0..1);
+            }
+
             // Modal overlay: dim + box + highlight quads, then the overlay text
             // in its own renderer so it sits above the dim.
             if ov_verts > 0 {
-                let start = sel_verts + bar_verts;
+                let start = sel_verts + bar_verts + sep_verts;
                 pass.set_pipeline(&self.quad_pipeline);
                 pass.set_vertex_buffer(0, self.quad_vbuf.slice(..));
                 pass.draw(start..start + ov_verts, 0..1);

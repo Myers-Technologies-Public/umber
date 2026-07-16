@@ -50,6 +50,22 @@ enum View {
     Modules,
 }
 
+/// What the pointer is hovering over in the document body, for hover
+/// highlighting. `Line` = whitespace / past line end / empty line (separator
+/// segment only); `Word` = a run of word chars or a single punctuation char
+/// (gold recolor + segment). `end_col` is exclusive. Compared against the
+/// previous target so a redraw fires only when the target actually changes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HoverTarget {
+    None,
+    Line(usize),
+    Word {
+        line: usize,
+        start_col: usize,
+        end_col: usize,
+    },
+}
+
 /// The full command set (D6). Registration order is the palette's default
 /// listing order and the tie-break for equal fuzzy scores.
 fn build_command_registry() -> CommandRegistry {
@@ -164,6 +180,7 @@ fn main() -> ExitCode {
         selecting: false,
         clipboard,
         sel_spans: Vec::new(),
+        hover: HoverTarget::None,
         first_visible_line: 0,
         modifiers: ModifiersState::empty(),
         pointer: (0.0, 0.0),
@@ -233,6 +250,12 @@ struct App {
     /// Reused buffer for the per-view selection highlight spans, rebuilt in
     /// `apply_view` and handed to the renderer.
     sel_spans: Vec<SelSpan>,
+
+    /// Current hover-highlight target under the pointer. A new target is pushed
+    /// to the renderer and redrawn only when this CHANGES (never on raw
+    /// `CursorMoved`); cleared when the pointer leaves the doc, a modal opens,
+    /// or the text under the pointer moves (scroll/edit).
+    hover: HoverTarget,
 
     /// First document line drawn; the scroll window is `[first_visible_line ..
     /// first_visible_line + capacity + MARGIN)`.
@@ -528,6 +551,125 @@ impl App {
         let col = if col_f < 0.0 { 0 } else { col_f as usize };
         let col = col.min(self.buffer.visual_line_len_chars(line));
         Some(self.buffer.line_to_char(line) + col)
+    }
+
+    /// Map the current pointer to a hover target over the document body, using
+    /// the same doc/cell arithmetic as click placement. Returns `None` for the
+    /// banner, the gutter, or past the last line. On a non-whitespace char the
+    /// target is the WORD under it; on whitespace / past line end / empty line
+    /// it is the LINE.
+    fn pointer_to_hover(&self) -> HoverTarget {
+        let (doc_top, line_px, text_left, cell_w) = match self.renderer.as_ref() {
+            Some(r) => (r.doc_top(), r.line_px(), r.text_left(), r.cell_w()),
+            None => return HoverTarget::None,
+        };
+        let x = self.pointer.0 as f32;
+        let y = self.pointer.1 as f32;
+        if y < doc_top || x < text_left {
+            return HoverTarget::None; // banner or gutter, not the document body
+        }
+        let cap = self
+            .renderer
+            .as_ref()
+            .map(|r| r.visible_line_capacity())
+            .unwrap_or(0);
+        let rel_line = ((y - doc_top) / line_px).floor() as i64;
+        if rel_line < 0 || rel_line as usize >= cap {
+            return HoverTarget::None;
+        }
+        let last = self.buffer.len_lines().saturating_sub(1) as i64;
+        let abs_line = self.first_visible_line as i64 + rel_line;
+        if abs_line > last {
+            return HoverTarget::None;
+        }
+        let line = abs_line as usize;
+        // The document-area guard above ensures `x >= text_left`, so the
+        // division cannot go negative.
+        let col_f = ((x - text_left) / cell_w).floor();
+        debug_assert!(col_f >= 0.0);
+        let col = col_f as usize;
+        let line_len = self.buffer.visual_line_len_chars(line);
+        if col >= line_len {
+            return HoverTarget::Line(line);
+        }
+        let line_start = self.buffer.line_to_char(line);
+        let line_str = self.buffer.slice_chars(line_start, line_start + line_len);
+        match word_span_at(&line_str, col) {
+            Some((start_col, end_col)) => HoverTarget::Word {
+                line,
+                start_col,
+                end_col,
+            },
+            None => HoverTarget::Line(line),
+        }
+    }
+
+    /// Window-relative line for an absolute document line, or `None` if it is
+    /// scrolled out of the visible window.
+    fn hover_rel_line(&self, line: usize) -> Option<usize> {
+        let cap = self.renderer.as_ref()?.visible_line_capacity();
+        if line >= self.first_visible_line && line < self.first_visible_line + cap {
+            Some(line - self.first_visible_line)
+        } else {
+            None
+        }
+    }
+
+    /// Push the current `hover` target into the renderer as word + segment
+    /// state. Reshapes the word buffer inside the renderer only when the word
+    /// text changes; never touches the document/gutter buffers.
+    fn push_hover_to_renderer(&mut self) {
+        let (word, line): (Option<(usize, usize, String)>, Option<usize>) = match self.hover {
+            HoverTarget::None => (None, None),
+            HoverTarget::Line(line) => (None, self.hover_rel_line(line)),
+            HoverTarget::Word {
+                line,
+                start_col,
+                end_col,
+            } => {
+                let rel = self.hover_rel_line(line);
+                let ls = self.buffer.line_to_char(line);
+                let text = self.buffer.slice_chars(ls + start_col, ls + end_col);
+                (rel.map(|r| (r, start_col, text)), rel)
+            }
+        };
+        if let Some(r) = self.renderer.as_mut() {
+            match &word {
+                Some((rel, sc, t)) => r.set_hover_word(Some((*rel, *sc, t.as_str()))),
+                None => r.set_hover_word(None),
+            }
+            r.set_hover_line(line);
+        }
+    }
+
+    /// Recompute the hover target from the pointer; if it CHANGED, push it to
+    /// the renderer and request exactly one redraw. No-op (no redraw) when the
+    /// target is unchanged -- this is the guard that keeps raw `CursorMoved`
+    /// from triggering a frame storm.
+    fn update_hover(&mut self) {
+        let target = self.pointer_to_hover();
+        if target == self.hover {
+            return;
+        }
+        self.hover = target;
+        self.push_hover_to_renderer();
+        if let Some(r) = self.renderer.as_ref() {
+            r.window().request_redraw();
+        }
+    }
+
+    /// Clear the hover target, redrawing once only if something was showing.
+    /// Called when the pointer leaves the doc, a modal opens, or the text under
+    /// the pointer moves (scroll/edit).
+    fn clear_hover(&mut self) {
+        if self.hover == HoverTarget::None {
+            return;
+        }
+        self.hover = HoverTarget::None;
+        self.push_hover_to_renderer();
+        if let Some(r) = self.renderer.as_ref() {
+            r.window().request_redraw();
+        }
     }
 
     /// Ordered non-empty selection range `(start, end)` in char indices, or
@@ -837,6 +979,8 @@ impl App {
 
     /// Open the command palette (Ctrl+Shift+P, D6).
     fn open_palette(&mut self) {
+        // A modal is opening: drop any editor hover highlight.
+        self.clear_hover();
         self.view = View::Palette;
         self.palette_query.clear();
         self.palette_sel = 0;
@@ -846,6 +990,7 @@ impl App {
 
     /// Open the settings page (Ctrl+, / "Preferences: Open Settings").
     fn open_settings(&mut self) {
+        self.clear_hover();
         self.view = View::Settings;
         self.settings_sel = 0;
         self.refresh_overlay();
@@ -853,6 +998,7 @@ impl App {
 
     /// Open the modules page ("Modules: Manage").
     fn open_modules(&mut self) {
+        self.clear_hover();
         self.view = View::Modules;
         self.modules_sel = 0;
         self.modules_hint = None;
@@ -1173,6 +1319,9 @@ impl ApplicationHandler for App {
                     self.refresh_overlay();
                 }
                 self.apply_view(false);
+                // The window geometry changed, so the pointer now maps to a
+                // different cell: drop the (possibly stale) hover highlight.
+                self.clear_hover();
                 if let Some(renderer) = self.renderer.as_ref() {
                     renderer.window().request_redraw();
                 }
@@ -1185,6 +1334,7 @@ impl ApplicationHandler for App {
                 // A `Resized` normally follows; re-window now so the frame in
                 // between is correct.
                 self.apply_view(false);
+                self.clear_hover();
                 if let Some(renderer) = self.renderer.as_ref() {
                     renderer.window().request_redraw();
                 }
@@ -1213,10 +1363,19 @@ impl ApplicationHandler for App {
                     if let Some(renderer) = self.renderer.as_mut() {
                         renderer.mark_keystroke(t);
                     }
+                    // The document scrolled under the pointer: the text the
+                    // hover pointed at moved, so drop it (redraws once).
+                    self.clear_hover();
                 }
                 if let Some(renderer) = self.renderer.as_ref() {
                     renderer.window().request_redraw();
                 }
+            }
+
+            WindowEvent::CursorLeft { .. } => {
+                // Pointer left the window: drop the hover highlight, or the
+                // last gold word would linger until an edit or re-entry.
+                self.clear_hover();
             }
 
             WindowEvent::CursorMoved { position, .. } => {
@@ -1248,6 +1407,13 @@ impl ApplicationHandler for App {
                             renderer.window().request_redraw();
                         }
                     }
+                    // Pointer is over the scrollbar chrome, not text: drop any
+                    // word/segment hover (redraws once only if one was showing).
+                    self.clear_hover();
+                } else if self.view == View::Editor {
+                    // Document hover: map pointer -> target; redraw ONLY when the
+                    // target changes, never on raw motion.
+                    self.update_hover();
                 }
             }
 
@@ -1261,6 +1427,9 @@ impl ApplicationHandler for App {
                 match state {
                     ElementState::Pressed => {
                         let t = Instant::now();
+                        // A press changes the caret/selection context under the
+                        // pointer: drop any hover highlight (redraws once).
+                        self.clear_hover();
                         // Scrollbar interaction wins over text placement.
                         if self.try_scrollbar_press() {
                             self.poke_scrollbar();
@@ -1517,12 +1686,19 @@ impl ApplicationHandler for App {
                 }
 
                 if changed || redraw_only {
+                    let prev_first = self.first_visible_line;
                     self.apply_view(true);
                     if let Some(renderer) = self.renderer.as_mut() {
                         if changed {
                             renderer.mark_keystroke(t);
                         }
                         renderer.window().request_redraw();
+                    }
+                    // Edit changed the text, or the caret move scrolled the
+                    // view: either way the text under the pointer moved, so drop
+                    // the hover highlight (redraws once, coalesced above).
+                    if changed || self.first_visible_line != prev_first {
+                        self.clear_hover();
                     }
                 }
             }
@@ -1594,6 +1770,39 @@ impl ApplicationHandler for App {
     }
 }
 
+/// True for a "word" char: alphanumeric (Unicode) or underscore. Punctuation
+/// and whitespace are not word chars.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Column span (char indices, `end` exclusive) of the hover target at `col` in
+/// `line`. `None` when `col` is past the last char or on whitespace (the caller
+/// treats that as a line-only hover). A word char expands left/right over the
+/// maximal run of word chars; a punctuation char is a single-char span. `col`
+/// and the returned bounds are char indices, not bytes.
+fn word_span_at(line: &str, col: usize) -> Option<(usize, usize)> {
+    let chars: Vec<char> = line.chars().collect();
+    let c = *chars.get(col)?;
+    if c.is_whitespace() {
+        return None;
+    }
+    if is_word_char(c) {
+        let mut start = col;
+        while start > 0 && is_word_char(chars[start - 1]) {
+            start -= 1;
+        }
+        let mut end = col + 1;
+        while end < chars.len() && is_word_char(chars[end]) {
+            end += 1;
+        }
+        Some((start, end))
+    } else {
+        // Punctuation: a single-char word.
+        Some((col, col + 1))
+    }
+}
+
 /// Number of decimal digits in `n` (min 1, so 0 -> 1). Sizes the gutter column
 /// from the whole file's last line number.
 fn digit_count(n: usize) -> usize {
@@ -1625,4 +1834,90 @@ fn read_vmrss() -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn word_span_expands_over_word_chars() {
+        // Hovering anywhere inside an identifier selects the whole run;
+        // underscores and digits are word chars.
+        let line = "foo_bar baz";
+        assert_eq!(word_span_at(line, 0), Some((0, 7)));
+        assert_eq!(word_span_at(line, 3), Some((0, 7)));
+        assert_eq!(word_span_at(line, 6), Some((0, 7)));
+        assert_eq!(word_span_at(line, 8), Some((8, 11)));
+    }
+
+    #[test]
+    fn word_span_whitespace_is_none() {
+        // A space is not a word char -> line-only hover.
+        assert_eq!(word_span_at("foo bar", 3), None);
+    }
+
+    #[test]
+    fn word_span_past_end_is_none() {
+        assert_eq!(word_span_at("hi", 2), None);
+        assert_eq!(word_span_at("hi", 5), None);
+        assert_eq!(word_span_at("", 0), None);
+    }
+
+    #[test]
+    fn word_span_punctuation_is_single_char() {
+        // Punctuation counts as a single-char word, even when adjacent.
+        let line = "a::b";
+        assert_eq!(word_span_at(line, 0), Some((0, 1)));
+        assert_eq!(word_span_at(line, 1), Some((1, 2)));
+        assert_eq!(word_span_at(line, 2), Some((2, 3)));
+        assert_eq!(word_span_at(line, 3), Some((3, 4)));
+    }
+
+    #[test]
+    fn word_span_unicode_word_by_char_index() {
+        // is_alphanumeric() is Unicode-aware; col is a char index, not a byte.
+        assert_eq!(word_span_at("h\u{e9}llo", 1), Some((0, 5)));
+    }
+
+    #[test]
+    fn hover_target_change_detection() {
+        let w = HoverTarget::Word {
+            line: 2,
+            start_col: 0,
+            end_col: 3,
+        };
+        // Identical targets are equal (no redraw).
+        assert_eq!(
+            w,
+            HoverTarget::Word {
+                line: 2,
+                start_col: 0,
+                end_col: 3
+            }
+        );
+        // Any field differing is a change (redraw).
+        assert_ne!(
+            w,
+            HoverTarget::Word {
+                line: 2,
+                start_col: 0,
+                end_col: 4
+            }
+        );
+        assert_ne!(
+            w,
+            HoverTarget::Word {
+                line: 3,
+                start_col: 0,
+                end_col: 3
+            }
+        );
+        // Word vs line on the same line is a change (word recolor vs segment).
+        assert_ne!(w, HoverTarget::Line(2));
+        // Line vs line, and None vs anything.
+        assert_ne!(HoverTarget::Line(1), HoverTarget::Line(2));
+        assert_eq!(HoverTarget::Line(5), HoverTarget::Line(5));
+        assert_ne!(HoverTarget::None, HoverTarget::Line(0));
+    }
 }
