@@ -51,6 +51,109 @@ const MONO_ADVANCE_RATIO: f32 = 0.6;
 /// (unlike a full block) does not hide the character under it.
 const CURSOR_GLYPH: &str = "\u{258f}";
 
+/// Logical-px gap between the gutter's last digit and the document text. The
+/// gutter's reserved width is `digits * cell_w + GUTTER_GAP` (scaled).
+const GUTTER_GAP: f32 = 12.0;
+
+/// Dim gutter line-number color vs. the 220-grey body text (task spec).
+const GUTTER_COLOR: Color = Color::rgb(105, 105, 120);
+
+/// Ghostty-style overlay scrollbar visuals, logical px (scaled for HiDPI).
+const SCROLLBAR_W: f32 = 10.0; // track/thumb width
+const SCROLLBAR_EDGE: f32 = 16.0; // right-edge hover-activation zone
+const SCROLLBAR_MARGIN: f32 = 2.0; // gap from the window's right edge
+const SCROLLBAR_MIN_THUMB: f32 = 24.0; // floor so the thumb stays grabbable
+
+/// Overlay quad colors (straight-alpha RGBA). Muted grey palette already used
+/// by the banner \u{2014} deliberately NOT the rust cursor accent.
+const TRACK_COLOR: [f32; 4] = [0.55, 0.55, 0.60, 0.10];
+const THUMB_COLOR: [f32; 4] = [0.55, 0.55, 0.60, 0.55];
+
+/// Max solid quads the overlay pipeline draws per frame (track + thumb, with
+/// headroom); six vertices each. Sizes the reused vertex staging buffer.
+const QUAD_MAX: usize = 4;
+const QUAD_VERTS: usize = QUAD_MAX * 6;
+const QUAD_FLOATS_PER_VERT: usize = 6; // vec2 position + vec4 color
+
+/// Minimal solid-quad shader: clip-space position + per-vertex color, alpha
+/// blended over the text pass. glyphon cannot draw rectangles, so the overlay
+/// scrollbar rides this tiny pipeline.
+const QUAD_SHADER: &str = r#"
+struct VsIn {
+    @location(0) pos: vec2<f32>,
+    @location(1) color: vec4<f32>,
+};
+struct VsOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) color: vec4<f32>,
+};
+@vertex
+fn vs_main(in: VsIn) -> VsOut {
+    var out: VsOut;
+    out.clip = vec4<f32>(in.pos, 0.0, 1.0);
+    out.color = in.color;
+    return out;
+}
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    return in.color;
+}
+"#;
+
+/// Scroll position the caller hands the renderer so it can size/place the
+/// overlay scrollbar thumb. Absent = scrollbar hidden this frame.
+#[derive(Clone, Copy)]
+pub struct ScrollbarInfo {
+    pub first_line: usize,
+    pub total_lines: usize,
+}
+
+/// Physical-pixel scrollbar rectangles, shared by the renderer's draw path and
+/// the bin's pointer hit-testing so click and paint agree.
+#[derive(Clone, Copy)]
+pub struct ScrollbarGeom {
+    pub track_x: f32,
+    pub track_w: f32,
+    pub track_top: f32,
+    pub track_h: f32,
+    pub thumb_top: f32,
+    pub thumb_h: f32,
+}
+
+/// Append one axis-aligned rectangle (two triangles, six vertices) to `out` as
+/// raw `f32` bytes in the `[pos.x, pos.y, r, g, b, a]` layout the quad pipeline
+/// expects. Pixel coords are converted to clip space here. Returns the vertex
+/// count added. `out` is a reused buffer \u{2014} no per-frame heap allocation.
+fn push_quad(
+    out: &mut Vec<u8>,
+    fw: f32,
+    fh: f32,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    c: [f32; 4],
+) -> u32 {
+    let x0 = x / fw * 2.0 - 1.0;
+    let x1 = (x + w) / fw * 2.0 - 1.0;
+    let y0 = 1.0 - y / fh * 2.0;
+    let y1 = 1.0 - (y + h) / fh * 2.0;
+    let mut vert = |px: f32, py: f32| {
+        out.extend_from_slice(&px.to_ne_bytes());
+        out.extend_from_slice(&py.to_ne_bytes());
+        for ch in c {
+            out.extend_from_slice(&ch.to_ne_bytes());
+        }
+    };
+    vert(x0, y0);
+    vert(x1, y0);
+    vert(x0, y1);
+    vert(x1, y0);
+    vert(x1, y1);
+    vert(x0, y1);
+    6
+}
+
 /// Capacity of the keystroke->present latency ring (samples retained for the
 /// p50/p99 window). Older samples roll off; the lifetime count is kept whole.
 const LAT_RING_CAP: usize = 4096;
@@ -175,6 +278,19 @@ pub struct Renderer {
     doc_buffer: Buffer,
     cursor_buffer: Buffer,
 
+    // Line-number gutter, shaped like the document with its own change guard.
+    gutter_buffer: Buffer,
+    gutter_text: String,
+    gutter_digits: usize,
+
+    // Solid-quad overlay pipeline (scrollbar). `quad_bytes` is reused each
+    // frame so render() performs no per-frame heap allocation.
+    quad_pipeline: wgpu::RenderPipeline,
+    quad_vbuf: wgpu::Buffer,
+    quad_bytes: Vec<u8>,
+    /// `Some((first_line, total_lines))` when the scrollbar is visible.
+    scrollbar: Option<(usize, usize)>,
+
     /// Physical-pixel HiDPI scale (window.scale_factor()); folded into metrics,
     /// padding, bounds, and the cursor position.
     scale_factor: f64,
@@ -256,6 +372,7 @@ impl Renderer {
         );
         let stats_buffer = Buffer::new(&mut font_system, metrics);
         let doc_buffer = Buffer::new(&mut font_system, metrics);
+        let gutter_buffer = Buffer::new(&mut font_system, metrics);
 
         // The cursor is a single glyph, shaped once here and re-shaped only on a
         // scale change.
@@ -269,6 +386,59 @@ impl Renderer {
         let cell_w = BASE_FONT * scale_factor as f32 * MONO_ADVANCE_RATIO;
         cursor_buffer.set_size(Some(cell_w * 2.0), Some(BASE_LINE * scale_factor as f32));
         cursor_buffer.shape_until_scroll(&mut font_system, false);
+
+        // Minimal solid-quad pipeline for the overlay scrollbar (glyphon draws
+        // only glyphs). Color is a vertex attribute, so no bind groups/layout.
+        let quad_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("umber-ui quad shader"),
+            source: wgpu::ShaderSource::Wgsl(QUAD_SHADER.into()),
+        });
+        let quad_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("umber-ui quad pipeline"),
+            layout: None,
+            vertex: wgpu::VertexState {
+                module: &quad_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: (QUAD_FLOATS_PER_VERT * 4) as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x2,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 8,
+                            shader_location: 1,
+                        },
+                    ],
+                })],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &quad_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: swapchain_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let quad_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("umber-ui quad vertices"),
+            size: (QUAD_VERTS * QUAD_FLOATS_PER_VERT * 4) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         Self {
             device,
@@ -284,6 +454,13 @@ impl Renderer {
             stats_buffer,
             doc_buffer,
             cursor_buffer,
+            gutter_buffer,
+            gutter_text: String::new(),
+            gutter_digits: 0,
+            quad_pipeline,
+            quad_vbuf,
+            quad_bytes: Vec::with_capacity(QUAD_VERTS * QUAD_FLOATS_PER_VERT * 4),
+            scrollbar: None,
             scale_factor,
             cursor: None,
             doc_text: String::new(),
@@ -311,7 +488,7 @@ impl Renderer {
         BASE_FONT * self.scale_factor as f32
     }
 
-    fn line_px(&self) -> f32 {
+    pub fn line_px(&self) -> f32 {
         BASE_LINE * self.scale_factor as f32
     }
 
@@ -319,12 +496,33 @@ impl Renderer {
         PAD * self.scale_factor as f32
     }
 
-    fn cell_w(&self) -> f32 {
+    pub fn cell_w(&self) -> f32 {
         self.font_px() * MONO_ADVANCE_RATIO
     }
 
+    /// Width in px of just the right-aligned digits (no padding).
+    fn gutter_text_w(&self) -> f32 {
+        self.gutter_digits as f32 * self.cell_w()
+    }
+
+    /// Total px reserved for the gutter column (digits + trailing gap), or 0
+    /// when no line count has been supplied yet.
+    fn gutter_width(&self) -> f32 {
+        if self.gutter_digits == 0 {
+            0.0
+        } else {
+            self.gutter_text_w() + GUTTER_GAP * self.scale_factor as f32
+        }
+    }
+
+    /// X of the document text origin: window pad + gutter column. The bin maps
+    /// clicks against this; the renderer places glyphs and the cursor from it.
+    pub fn text_left(&self) -> f32 {
+        self.pad_px() + self.gutter_width()
+    }
+
     /// Y of the document top: below the stats banner.
-    fn doc_top(&self) -> f32 {
+    pub fn doc_top(&self) -> f32 {
         self.pad_px() + self.line_px() * STATS_GAP
     }
 
@@ -334,7 +532,7 @@ impl Renderer {
 
     /// Document shaping box in physical pixels (width and visible height).
     fn doc_size(&self) -> (f32, f32) {
-        let w = (self.surface_config.width as f32 - self.pad_px() * 2.0).max(1.0);
+        let w = (self.surface_config.width as f32 - self.text_left() - self.pad_px()).max(1.0);
         let h = (self.surface_config.height as f32 - self.doc_top() - self.pad_px()).max(1.0);
         (w, h)
     }
@@ -348,6 +546,42 @@ impl Renderer {
         } else {
             (avail / self.line_px()).floor() as usize
         }
+    }
+
+    /// Width in px of the right-edge zone whose hover reveals the scrollbar.
+    pub fn scrollbar_edge_zone(&self) -> f32 {
+        SCROLLBAR_EDGE * self.scale_factor as f32
+    }
+
+    /// Physical-px scrollbar rectangles for `(first_line, total_lines)`, or
+    /// `None` when the document fits (no scrollbar). Shared by draw + hit-test.
+    pub fn scrollbar_geom(&self, first_line: usize, total_lines: usize) -> Option<ScrollbarGeom> {
+        let visible = self.visible_line_capacity();
+        if visible == 0 || total_lines <= visible {
+            return None;
+        }
+        let s = self.scale_factor as f32;
+        let track_w = SCROLLBAR_W * s;
+        let track_x = self.surface_config.width as f32 - track_w - SCROLLBAR_MARGIN * s;
+        let track_top = self.doc_top();
+        let track_h = (self.surface_config.height as f32 - track_top).max(1.0);
+        let min_thumb = (SCROLLBAR_MIN_THUMB * s).min(track_h);
+        let thumb_h = (track_h * visible as f32 / total_lines as f32).max(min_thumb);
+        let scroll_range = (total_lines - visible) as f32;
+        let frac = if scroll_range > 0.0 {
+            (first_line as f32 / scroll_range).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let thumb_top = track_top + frac * (track_h - thumb_h);
+        Some(ScrollbarGeom {
+            track_x,
+            track_w,
+            track_top,
+            track_h,
+            thumb_top,
+            thumb_h,
+        })
     }
 
     /// Replace the shaped document window (the scroll-visible lines).
@@ -371,6 +605,46 @@ impl Renderer {
             .shape_until_scroll(&mut self.font_system, false);
     }
 
+    /// Replace the shaped line-number gutter for the visible window. `numbers`
+    /// is one right-aligned number per shaped line; `digits` is the digit count
+    /// of the whole file's last line, which fixes the column width so it never
+    /// jitters while scrolling. Mirrors [`Renderer::set_document`]'s
+    /// only-on-change guard: the string changes exactly when the first visible
+    /// line or the line count changes.
+    pub fn set_gutter(&mut self, numbers: &str, digits: usize) {
+        let digits_changed = digits != self.gutter_digits;
+        if !digits_changed && self.gutter_text == numbers {
+            return;
+        }
+        self.gutter_digits = digits;
+        self.gutter_text.clear();
+        self.gutter_text.push_str(numbers);
+
+        let gw = self.gutter_text_w().max(1.0);
+        let gh = self.doc_size().1;
+        self.gutter_buffer.set_text(
+            numbers,
+            &Attrs::new().family(Family::Monospace),
+            Shaping::Advanced,
+            None,
+        );
+        self.gutter_buffer.set_size(Some(gw), Some(gh));
+        self.gutter_buffer
+            .shape_until_scroll(&mut self.font_system, false);
+
+        // A digit-count change moves the document origin: adopt the new box
+        // size but leave the (single) reshape to the `set_document` call that
+        // follows in the same `apply_view` — reshaping here too would layout
+        // the OLD text once and the new text again. Clearing the text cache
+        // guarantees `set_document` cannot early-return with a stale-width
+        // layout even if the window text happens to be unchanged.
+        if digits_changed {
+            let (dw, dh) = self.doc_size();
+            self.doc_buffer.set_size(Some(dw), Some(dh));
+            self.doc_text.clear();
+        }
+    }
+
     /// Set the file-info half of the stats banner; the latency half is appended
     /// live in [`Renderer::render`].
     pub fn set_stats_prefix(&mut self, prefix: String) {
@@ -381,6 +655,13 @@ impl Renderer {
     /// `None` to hide it (scrolled off-screen).
     pub fn set_cursor(&mut self, pos: Option<(usize, usize)>) {
         self.cursor = pos;
+    }
+
+    /// Supply the scrollbar's scroll position for this frame, or `None` to hide
+    /// it. Visibility timing (show-on-scroll/hover/drag, ~800 ms linger) lives
+    /// in the bin's event loop; this just carries the paint state.
+    pub fn set_scrollbar(&mut self, info: Option<ScrollbarInfo>) {
+        self.scrollbar = info.map(|i| (i.first_line, i.total_lines));
     }
 
     /// Record the receipt time of a keystroke; the next present that includes
@@ -405,6 +686,9 @@ impl Renderer {
         self.stats_buffer = Buffer::new(&mut self.font_system, metrics);
         self.doc_buffer = Buffer::new(&mut self.font_system, metrics);
         self.cursor_buffer = Buffer::new(&mut self.font_system, metrics);
+        self.gutter_buffer = Buffer::new(&mut self.font_system, metrics);
+        // Force the gutter to re-shape at the new metrics on the next view push.
+        self.gutter_text.clear();
 
         self.cursor_buffer.set_text(
             CURSOR_GLYPH,
@@ -431,6 +715,12 @@ impl Renderer {
         let (w, h) = self.doc_size();
         self.doc_buffer.set_size(Some(w), Some(h));
         self.doc_buffer
+            .shape_until_scroll(&mut self.font_system, false);
+        // Reflow the gutter to the new viewport height (its width is unchanged).
+        let gw = self.gutter_text_w().max(1.0);
+        let gh = self.doc_size().1;
+        self.gutter_buffer.set_size(Some(gw), Some(gh));
+        self.gutter_buffer
             .shape_until_scroll(&mut self.font_system, false);
         // Force the banner to re-shape at the new width on the next frame.
         self.last_stats.clear();
@@ -484,10 +774,11 @@ impl Renderer {
         let doc_top = self.doc_top();
         let line_px = self.line_px();
         let cell_w = self.cell_w();
+        let text_left = self.text_left();
         let w = self.surface_config.width as i32;
         let h = self.surface_config.height as i32;
 
-        let mut areas: Vec<TextArea> = Vec::with_capacity(3);
+        let mut areas: Vec<TextArea> = Vec::with_capacity(4);
         areas.push(TextArea {
             buffer: &self.stats_buffer,
             left: pad,
@@ -503,12 +794,26 @@ impl Renderer {
             custom_glyphs: &[],
         });
         areas.push(TextArea {
-            buffer: &self.doc_buffer,
+            buffer: &self.gutter_buffer,
             left: pad,
             top: doc_top,
             scale: 1.0,
             bounds: TextBounds {
                 left: 0,
+                top: doc_top as i32,
+                right: text_left as i32,
+                bottom: h,
+            },
+            default_color: GUTTER_COLOR,
+            custom_glyphs: &[],
+        });
+        areas.push(TextArea {
+            buffer: &self.doc_buffer,
+            left: text_left,
+            top: doc_top,
+            scale: 1.0,
+            bounds: TextBounds {
+                left: text_left as i32,
                 top: doc_top as i32,
                 right: w,
                 bottom: h,
@@ -517,7 +822,7 @@ impl Renderer {
             custom_glyphs: &[],
         });
         if let Some((line, col)) = self.cursor {
-            let x = pad + col as f32 * cell_w;
+            let x = text_left + col as f32 * cell_w;
             let y = doc_top + line as f32 * line_px;
             if y < h as f32 {
                 areas.push(TextArea {
@@ -526,7 +831,7 @@ impl Renderer {
                     top: y,
                     scale: 1.0,
                     bounds: TextBounds {
-                        left: 0,
+                        left: text_left as i32,
                         top: doc_top as i32,
                         right: w,
                         bottom: h,
@@ -555,6 +860,42 @@ impl Renderer {
             self.pending.clear();
             self.window.request_redraw();
             return false;
+        }
+
+        // Build the overlay scrollbar quads into the reused staging buffer (no
+        // per-frame heap allocation) and upload them for the pass below.
+        let fw = self.surface_config.width as f32;
+        let fh = self.surface_config.height as f32;
+        let geom = self
+            .scrollbar
+            .and_then(|(first, total)| self.scrollbar_geom(first, total));
+        self.quad_bytes.clear();
+        let mut quad_verts: u32 = 0;
+        if let Some(g) = geom {
+            quad_verts += push_quad(
+                &mut self.quad_bytes,
+                fw,
+                fh,
+                g.track_x,
+                g.track_top,
+                g.track_w,
+                g.track_h,
+                TRACK_COLOR,
+            );
+            quad_verts += push_quad(
+                &mut self.quad_bytes,
+                fw,
+                fh,
+                g.track_x,
+                g.thumb_top,
+                g.track_w,
+                g.thumb_h,
+                THUMB_COLOR,
+            );
+        }
+        if quad_verts > 0 {
+            self.queue
+                .write_buffer(&self.quad_vbuf, 0, &self.quad_bytes);
         }
 
         let frame = match self.surface.get_current_texture() {
@@ -613,6 +954,13 @@ impl Renderer {
             self.text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass)
                 .expect("render text");
+
+            // Overlay scrollbar (track + thumb) composited over the text.
+            if quad_verts > 0 {
+                pass.set_pipeline(&self.quad_pipeline);
+                pass.set_vertex_buffer(0, self.quad_vbuf.slice(..));
+                pass.draw(0..quad_verts, 0..1);
+            }
         }
 
         self.queue.submit(Some(encoder.finish()));
