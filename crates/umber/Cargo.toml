@@ -16,5 +16,6 @@ umber-ui.workspace = true
 umber-text.workspace = true
 umber-kernel.workspace = true
 umber-host.workspace = true
+umber-proto = { workspace = true }
 winit.workspace = true
 arboard.workspace = true

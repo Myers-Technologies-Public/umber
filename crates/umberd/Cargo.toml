@@ -10,3 +10,4 @@ name = "umberd"
 path = "src/main.rs"
 
 [dependencies]
+umber-proto = { workspace = true }

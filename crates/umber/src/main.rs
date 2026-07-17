@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use umber::agent_rpc::{AgentNotifier, AgentProcess, AgentRunState};
 use umber::agents::{self, SessionSummary};
+use umber::remote::RemoteWorkspace;
 use umber::terminal::{TermNotifier, TerminalSession};
 use umber_host::{HostCommand, Manifest, ModuleHost};
 use umber_kernel::{Command, CommandRegistry, Config, FeatureRegistry};
@@ -93,6 +94,10 @@ enum View {
     Agents,
     /// P4 slice 2: type a prompt to send to the live attached agent.
     AgentPrompt,
+    /// P3b-deep: enter an SSH host for a remote workspace.
+    RemoteHost,
+    /// P3b-deep: enter a remote file path to open over the workspace.
+    RemotePath,
 }
 
 /// What the pointer is hovering over in the document body, for hover
@@ -179,6 +184,8 @@ fn build_command_registry() -> CommandRegistry {
         ("goto.line", "Go: Line\u{2026}", "Ctrl+G"),
         ("help.keys", "Help: Keyboard Shortcuts", "F1"),
         ("agents.dashboard", "Agents: pi Dashboard", "Ctrl+Shift+A"),
+        ("remote.open", "Remote: Open File over SSH\u{2026}", ""),
+        ("remote.disconnect", "Remote: Disconnect Workspace", ""),
         ("view.toggle.terminal", "View: Toggle Terminal Feature", ""),
         ("app.quit", "Application: Quit", "Ctrl+Q"),
     ] {
@@ -325,6 +332,10 @@ fn main() -> ExitCode {
         agents_scroll: 0,
         agent_proc: None,
         agent_prompt: String::new(),
+        remote: None,
+        remote_file: None,
+        remote_host_input: String::new(),
+        remote_path_input: String::new(),
         help_scroll: 0,
         goto_input: String::new(),
         ssh_hosts: Vec::new(),
@@ -452,6 +463,16 @@ struct App {
     /// In-progress prompt text for the live agent.
     agent_prompt: String,
 
+    // --- P3b-deep: remote workspace over umberd/SSH ---
+    /// Connected remote workspace; when set, the buffer is remote-backed and
+    /// Ctrl+S writes through the protocol.
+    remote: Option<RemoteWorkspace>,
+    /// Remote path of the open buffer (the daemon-relative path).
+    remote_file: Option<String>,
+    /// In-progress host / path entry for the remote-open flow.
+    remote_host_input: String,
+    remote_path_input: String,
+
     // --- P3b/QoL: help, go-to-line, SSH picker ---
     /// Scroll offset of the help overlay.
     help_scroll: usize,
@@ -547,11 +568,16 @@ impl App {
         } else {
             ""
         };
-        let name = self
-            .buffer
-            .path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "*scratch*".to_string());
+        let name = match (&self.remote, &self.remote_file) {
+            // Remote-backed buffer (P3b): show host:path so the source is
+            // unambiguous and Ctrl+S's remote target is visible.
+            (Some(ws), Some(path)) => format!("{}:{path}", ws.label),
+            _ => self
+                .buffer
+                .path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "*scratch*".to_string()),
+        };
         let mut prefix = format!(
             "umber P0 \u{2014} {dirty}{name} \u{2014} {} lines, {} bytes \u{2014} Ln {}, Col {}",
             self.buffer.len_lines(),
@@ -979,10 +1005,116 @@ impl App {
 
     /// Write the buffer to disk (Ctrl+S). Scratch buffers have no path yet.
     fn do_save(&mut self) {
+        // Remote-backed buffer (P3b): write the whole file back over the
+        // umber-proto workspace instead of the local filesystem.
+        if let (Some(ws), Some(path)) = (self.remote.as_mut(), self.remote_file.clone()) {
+            let text = self.buffer.full_text();
+            match ws.write_file(&path, &text) {
+                Ok(_) => self.buffer.mark_saved(),
+                Err(err) => eprintln!("umber: remote save failed: {err}"),
+            }
+            return;
+        }
         match self.buffer.save() {
             Ok(true) => {}
             Ok(false) => eprintln!("umber: no path to save (scratch buffer)"),
             Err(err) => eprintln!("umber: save failed: {err}"),
+        }
+    }
+
+    /// Handle the remote-host entry prompt: Enter connects, then asks for a
+    /// path. Typed text or a selected ssh_config host both work.
+    fn remote_host_key(&mut self, event: KeyEvent) {
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => self.close_overlay(),
+            Key::Named(NamedKey::Enter) => {
+                if self.remote_host_input.trim().is_empty() {
+                    return;
+                }
+                self.remote_path_input.clear();
+                self.view = View::RemotePath;
+                self.refresh_overlay();
+            }
+            Key::Named(NamedKey::Backspace) => {
+                self.remote_host_input.pop();
+                self.refresh_overlay();
+            }
+            _ => {
+                if let Some(t) = &event.text {
+                    let mut changed = false;
+                    for ch in t.chars() {
+                        if !ch.is_control() && !ch.is_whitespace() {
+                            self.remote_host_input.push(ch);
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        self.refresh_overlay();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handle the remote-path prompt: Enter connects to the host over
+    /// `ssh <host> umberd`, reads the file, and loads it as a remote-backed
+    /// buffer.
+    fn remote_path_key(&mut self, event: KeyEvent) {
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => self.close_overlay(),
+            Key::Named(NamedKey::Enter) => {
+                let host = self.remote_host_input.trim().to_string();
+                let path = self.remote_path_input.trim().to_string();
+                if path.is_empty() {
+                    return;
+                }
+                match RemoteWorkspace::connect_ssh(&host) {
+                    Ok(mut ws) => match ws.read_file(&path) {
+                        Ok(contents) => {
+                            self.buffer = TextBuffer::from_string(&contents);
+                            self.cursor_char = 0;
+                            self.selection_anchor = None;
+                            self.first_visible_line = 0;
+                            self.remote = Some(ws);
+                            self.remote_file = Some(path);
+                            self.view = View::Editor;
+                            self.close_overlay();
+                            self.apply_view(true);
+                            if let Some(r) = self.renderer.as_ref() {
+                                r.window().request_redraw();
+                            }
+                        }
+                        Err(err) => {
+                            self.remote_host_input = format!("{host}  (read failed: {err})");
+                            self.view = View::RemoteHost;
+                            self.refresh_overlay();
+                        }
+                    },
+                    Err(err) => {
+                        self.remote_host_input = format!("{host}  (connect failed: {err})");
+                        self.view = View::RemoteHost;
+                        self.refresh_overlay();
+                    }
+                }
+            }
+            Key::Named(NamedKey::Backspace) => {
+                self.remote_path_input.pop();
+                self.refresh_overlay();
+            }
+            _ => {
+                if let Some(t) = &event.text {
+                    let mut changed = false;
+                    for ch in t.chars() {
+                        if !ch.is_control() {
+                            self.remote_path_input.push(ch);
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        self.refresh_overlay();
+                    }
+                }
+            }
         }
     }
 
@@ -1275,6 +1407,37 @@ impl App {
                 split_frac: 0.62,
                 selected: None,
                 hint: Some("Enter send (steer if running) \u{2022} Esc back".to_string()),
+            }),
+            View::RemoteHost => {
+                let rows = self
+                    .ssh_hosts
+                    .iter()
+                    .take(8)
+                    .map(|h| (h.clone(), "~/.ssh/config".to_string()))
+                    .collect();
+                Some(OverlaySpec {
+                    title: Some("Remote workspace \u{2014} SSH host".to_string()),
+                    input: Some(format!("host> {}", self.remote_host_input)),
+                    rows,
+                    left_color: [225, 225, 230],
+                    right_color: [135, 135, 150],
+                    split_frac: 0.7,
+                    selected: None,
+                    hint: Some(
+                        "type a host (runs `ssh <host> umberd`) \u{2022} Enter next \u{2022} Esc"
+                            .to_string(),
+                    ),
+                })
+            }
+            View::RemotePath => Some(OverlaySpec {
+                title: Some(format!("Remote file on {}", self.remote_host_input.trim())),
+                input: Some(format!("path> {}", self.remote_path_input)),
+                rows: Vec::new(),
+                left_color: [225, 225, 230],
+                right_color: [135, 135, 150],
+                split_frac: 0.62,
+                selected: None,
+                hint: Some("Enter open (daemon-relative path) \u{2022} Esc cancel".to_string()),
             }),
             View::Settings => {
                 let c = &self.config;
@@ -2290,6 +2453,21 @@ impl App {
                 self.open_agents();
                 return;
             }
+            "remote.open" => {
+                self.remote_host_input.clear();
+                self.ssh_hosts = ssh_config_hosts();
+                self.view = View::RemoteHost;
+                self.refresh_overlay();
+                return;
+            }
+            "remote.disconnect" => {
+                if let Some(mut ws) = self.remote.take() {
+                    ws.shutdown();
+                }
+                self.remote_file = None;
+                self.close_overlay();
+                return;
+            }
             // Not a built-in id: route to the module host (external command).
             other => self.invoke_module(other),
         }
@@ -2633,6 +2811,14 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     View::AgentPrompt => {
                         self.agent_prompt_key(event);
+                        return;
+                    }
+                    View::RemoteHost => {
+                        self.remote_host_key(event);
+                        return;
+                    }
+                    View::RemotePath => {
+                        self.remote_path_key(event);
                         return;
                     }
                     View::Settings => {

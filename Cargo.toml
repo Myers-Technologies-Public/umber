@@ -21,6 +21,7 @@ authors = ["Mason Myers <mason@myerscorp.net>"]
 [workspace.dependencies]
 alacritty_terminal = "0.26.0"
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 # Internal crates (path deps, single-sourced here).
 umber-ui = { path = "crates/umber-ui" }
 umber-text = { path = "crates/umber-text" }

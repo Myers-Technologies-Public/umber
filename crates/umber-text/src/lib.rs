@@ -91,6 +91,24 @@ impl TextBuffer {
         Ok(Self::wrap(rope, Some(path.to_path_buf())))
     }
 
+    /// Wrap in-memory `text` as a buffer with no local backing path (used for
+    /// remote-backed buffers, whose bytes live on the daemon side).
+    pub fn from_string(text: &str) -> Self {
+        Self::wrap(Rope::from_str(text), None)
+    }
+
+    /// The entire buffer as a `String` (for remote save / whole-file ops).
+    pub fn full_text(&self) -> String {
+        self.rope.to_string()
+    }
+
+    /// Mark the current state as saved (clears `is_dirty`) without a local
+    /// write — used after a successful remote save over the protocol.
+    pub fn mark_saved(&mut self) {
+        self.saved_id = self.undo.last().map(|g| g.id);
+        self.open_coalesce = false;
+    }
+
     fn wrap(rope: Rope, path: Option<PathBuf>) -> Self {
         Self {
             rope,

@@ -2993,6 +2993,7 @@ dependencies = [
  "serde_json",
  "umber-host",
  "umber-kernel",
+ "umber-proto",
  "umber-text",
  "umber-ui",
  "winit",
@@ -3013,6 +3014,10 @@ version = "0.0.0"
 [[package]]
 name = "umber-proto"
 version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "umber-syntax"
@@ -3039,6 +3044,9 @@ dependencies = [
 [[package]]
 name = "umberd"
 version = "0.0.0"
+dependencies = [
+ "umber-proto",
+]
 
 [[package]]
 name = "unicode-bidi"
