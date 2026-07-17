@@ -189,6 +189,11 @@ fn build_command_registry() -> CommandRegistry {
         ("terminal.focus", "Terminal: Focus", ""),
         ("terminal.ssh", "Terminal: SSH to Host\u{2026}", ""),
         ("terminal.maximize", "Terminal: Toggle Fullscreen", "F11"),
+        (
+            "view.toggleSidebar",
+            "View: Toggle Sidebar Labels",
+            "Ctrl+B",
+        ),
         ("goto.line", "Go: Line\u{2026}", "Ctrl+G"),
         ("help.keys", "Help: Keyboard Shortcuts", "F1"),
         ("agents.dashboard", "Agents: pi Dashboard", "Ctrl+Shift+A"),
@@ -694,6 +699,7 @@ impl App {
             renderer.set_stats_prefix(prefix);
         }
         self.sel_spans = spans;
+        self.sync_sidebar_active();
     }
 
     /// Adjust the scroll offset by `delta` lines, clamped to the buffer.
@@ -1384,6 +1390,7 @@ impl App {
     /// (or clear it in the editor), then request a redraw. All modal text is
     /// shaped here (the state-change path), never in `render`.
     fn refresh_overlay(&mut self) {
+        self.sync_sidebar_active();
         let spec = self.build_overlay_spec();
         if let Some(r) = self.renderer.as_mut() {
             r.set_overlay(spec);
@@ -2418,6 +2425,33 @@ impl App {
 
     /// Activate a left tab-bar tab (0 palette, 1 find, 2 agents, 3 terminal,
     /// 4 settings) — the mouse backup for the keyboard commands.
+    /// Expand/collapse the left activity bar (icons only <-> icons + labels).
+    fn toggle_sidebar(&mut self) {
+        if let Some(r) = self.renderer.as_mut() {
+            let e = !r.sidebar_expanded();
+            r.set_sidebar_expanded(e);
+        }
+        self.apply_view(false);
+        if let Some(r) = self.renderer.as_ref() {
+            r.window().request_redraw();
+        }
+    }
+
+    /// Mark the activity-bar tab matching the current view (accent bar).
+    fn sync_sidebar_active(&mut self) {
+        let active = match self.view {
+            View::Palette => Some(0),
+            View::Search => Some(1),
+            View::Agents | View::AgentPrompt => Some(2),
+            View::Settings => Some(4),
+            View::Editor if self.term_focused => Some(3),
+            _ => None,
+        };
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_sidebar_active(active);
+        }
+    }
+
     fn sidebar_tab_activate(&mut self, tab: usize) {
         match tab {
             0 => self.open_palette(),
@@ -2781,6 +2815,10 @@ impl App {
                 self.terminal_toggle_max();
                 return;
             }
+            "view.toggleSidebar" => {
+                self.toggle_sidebar();
+                return;
+            }
             "terminal.ssh" => {
                 self.open_ssh_picker();
                 return;
@@ -2984,6 +3022,13 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.pointer = (position.x, position.y);
+                // Sidebar hover highlight (redraw only on change).
+                if let Some(r) = self.renderer.as_mut() {
+                    let tab = r.sidebar_tab_at(position.x as f32, position.y as f32);
+                    if r.set_sidebar_hover(tab) {
+                        r.window().request_redraw();
+                    }
+                }
                 if self.term_resizing {
                     self.terminal_resize_to(position.y);
                 } else if self.scrollbar_dragging {
@@ -3276,6 +3321,10 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             "g" => {
                                 self.open_goto();
+                                return;
+                            }
+                            "b" => {
+                                self.toggle_sidebar();
                                 return;
                             }
                             "q" => {

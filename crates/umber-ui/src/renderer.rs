@@ -109,6 +109,14 @@ const SIDEBAR_BG_COLOR: [f32; 4] = [0.085, 0.085, 0.105, 1.0];
 const SIDEBAR_GLYPH_COLOR: Color = Color::rgb(150, 150, 168);
 /// Per-tab vertical pitch as a multiple of the line height.
 const SIDEBAR_TAB_PITCH: f32 = 1.6;
+/// Expanded activity-bar width (icons + text labels).
+const SIDEBAR_W_EXPANDED: f32 = 168.0;
+/// Tab labels shown when expanded (aligned to the glyph rows).
+const SIDEBAR_LABELS: &str = "Palette\nFind\nAgents\nTerminal\nSettings";
+const SIDEBAR_HOVER_COLOR: [f32; 4] = [0.20, 0.20, 0.24, 1.0];
+/// Left accent bar marking the active tab (Crail rust).
+const SIDEBAR_ACTIVE_COLOR: [f32; 4] = [0.902, 0.706, 0.471, 0.95];
+const SIDEBAR_LABEL_COLOR: Color = Color::rgb(198, 198, 212);
 
 /// Modal overlay palette (command palette / settings / modules). All
 /// straight-alpha RGBA. The dim quad darkens the still-visible editor behind
@@ -488,6 +496,13 @@ pub struct Renderer {
     /// Left tab-bar glyph column, shaped once (rebuilt on scale change).
     sidebar_buffer: Buffer,
     sidebar_enabled: bool,
+    /// Expanded (icons + labels) vs collapsed (icons only).
+    sidebar_expanded: bool,
+    /// Tab under the pointer (hover highlight), and the active view's tab.
+    sidebar_hover: Option<usize>,
+    sidebar_active: Option<usize>,
+    /// Text labels column, shown when expanded.
+    sidebar_labels_buffer: Buffer,
 
     /// The last document window text, kept so a scale change can re-shape it
     /// without the caller re-supplying it.
@@ -585,6 +600,15 @@ impl Renderer {
             None,
         );
         sidebar_buffer.shape_until_scroll(&mut font_system, false);
+        let mut sidebar_labels_buffer = Buffer::new(&mut font_system, sidebar_metrics);
+        sidebar_labels_buffer.set_wrap(Wrap::None);
+        sidebar_labels_buffer.set_text(
+            SIDEBAR_LABELS,
+            &Attrs::new().family(Family::Monospace),
+            Shaping::Advanced,
+            None,
+        );
+        sidebar_labels_buffer.shape_until_scroll(&mut font_system, false);
         stats_buffer.set_wrap(Wrap::None);
         let mut doc_buffer = Buffer::new(&mut font_system, metrics);
         doc_buffer.set_wrap(Wrap::None);
@@ -675,7 +699,7 @@ impl Renderer {
         });
         let sidebar_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("umber sidebar bg"),
-            size: (6 * QUAD_FLOATS_PER_VERT * 4) as wgpu::BufferAddress,
+            size: (24 * QUAD_FLOATS_PER_VERT * 4) as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -726,7 +750,7 @@ impl Renderer {
             git_bytes: Vec::with_capacity(GIT_MARK_VERTS * QUAD_FLOATS_PER_VERT * 4),
             gutter_marks: Vec::new(),
             sidebar_vbuf,
-            sidebar_bytes: Vec::with_capacity(6 * QUAD_FLOATS_PER_VERT * 4),
+            sidebar_bytes: Vec::with_capacity(24 * QUAD_FLOATS_PER_VERT * 4),
             scrollbar: None,
             selection: Vec::new(),
             hover_word_buffer,
@@ -748,6 +772,10 @@ impl Renderer {
             term_buffer,
             sidebar_buffer,
             sidebar_enabled: true,
+            sidebar_expanded: true,
+            sidebar_hover: None,
+            sidebar_active: None,
+            sidebar_labels_buffer,
             doc_text: String::new(),
             stats_prefix: String::new(),
             banner_dirty: true,
@@ -821,11 +849,43 @@ impl Renderer {
 
     /// Width of the left activity bar in physical px (0 when disabled).
     pub fn sidebar_w(&self) -> f32 {
-        if self.sidebar_enabled {
-            SIDEBAR_W * self.scale_factor as f32
-        } else {
-            0.0
+        if !self.sidebar_enabled {
+            return 0.0;
         }
+        let base = if self.sidebar_expanded {
+            SIDEBAR_W_EXPANDED
+        } else {
+            SIDEBAR_W
+        };
+        base * self.scale_factor as f32
+    }
+
+    pub fn sidebar_expanded(&self) -> bool {
+        self.sidebar_expanded
+    }
+
+    /// Expand/collapse the activity bar; reflows content to the new left edge.
+    pub fn set_sidebar_expanded(&mut self, expanded: bool) {
+        if self.sidebar_expanded == expanded {
+            return;
+        }
+        self.sidebar_expanded = expanded;
+        self.reflow_terminal_geometry();
+        self.banner_dirty = true;
+    }
+
+    /// Set the hovered tab (highlight), returns true if it changed.
+    pub fn set_sidebar_hover(&mut self, hover: Option<usize>) -> bool {
+        if self.sidebar_hover == hover {
+            return false;
+        }
+        self.sidebar_hover = hover;
+        true
+    }
+
+    /// Set the active tab (accent bar), matching the current view.
+    pub fn set_sidebar_active(&mut self, active: Option<usize>) {
+        self.sidebar_active = active;
     }
 
     /// Left content edge: past the activity bar, plus window padding. Banner,
@@ -1575,6 +1635,22 @@ impl Renderer {
                 default_color: SIDEBAR_GLYPH_COLOR,
                 custom_glyphs: &[],
             });
+            if self.sidebar_expanded {
+                areas.push(TextArea {
+                    buffer: &self.sidebar_labels_buffer,
+                    left: pad * 0.5 + cell_w * 2.2,
+                    top: pad + line_px * 0.3,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left: 0,
+                        top: 0,
+                        right: self.sidebar_w() as i32,
+                        bottom: h,
+                    },
+                    default_color: SIDEBAR_LABEL_COLOR,
+                    custom_glyphs: &[],
+                });
+            }
         }
         areas.push(TextArea {
             buffer: &self.stats_buffer,
@@ -2060,6 +2136,11 @@ impl Renderer {
         let mut sidebar_verts: u32 = 0;
         if self.sidebar_enabled {
             let sw = self.sidebar_w();
+            let sb_top = self.pad_px() + self.line_px() * 0.3;
+            let pitch = self.line_px() * SIDEBAR_TAB_PITCH;
+            let s = self.scale_factor as f32;
+            let hover = self.sidebar_hover;
+            let active = self.sidebar_active;
             self.sidebar_bytes.clear();
             sidebar_verts = push_quad(
                 &mut self.sidebar_bytes,
@@ -2071,6 +2152,32 @@ impl Renderer {
                 fh,
                 SIDEBAR_BG_COLOR,
             );
+            // Hover highlight behind the pointed-at tab.
+            if let Some(hrow) = hover {
+                sidebar_verts += push_quad(
+                    &mut self.sidebar_bytes,
+                    fw,
+                    fh,
+                    0.0,
+                    sb_top + hrow as f32 * pitch,
+                    sw,
+                    pitch,
+                    SIDEBAR_HOVER_COLOR,
+                );
+            }
+            // Active-tab accent bar on the left edge.
+            if let Some(arow) = active {
+                sidebar_verts += push_quad(
+                    &mut self.sidebar_bytes,
+                    fw,
+                    fh,
+                    0.0,
+                    sb_top + arow as f32 * pitch,
+                    (3.0 * s).max(2.0),
+                    pitch,
+                    SIDEBAR_ACTIVE_COLOR,
+                );
+            }
             self.queue
                 .write_buffer(&self.sidebar_vbuf, 0, &self.sidebar_bytes);
         }
