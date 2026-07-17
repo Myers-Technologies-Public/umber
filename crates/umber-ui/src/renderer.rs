@@ -116,7 +116,17 @@ const SIDEBAR_LABELS: &str = "Palette\nFind\nAgents\nTerminal\nSettings";
 const SIDEBAR_HOVER_COLOR: [f32; 4] = [0.20, 0.20, 0.24, 1.0];
 /// Left accent bar marking the active tab (Crail rust).
 const SIDEBAR_ACTIVE_COLOR: [f32; 4] = [0.902, 0.706, 0.471, 0.95];
+/// Faint full-row tint behind the active tab so the whole item reads as
+/// selected (not just the edge bar).
+const SIDEBAR_ACTIVE_BG_COLOR: [f32; 4] = [0.902, 0.706, 0.471, 0.15];
 const SIDEBAR_LABEL_COLOR: Color = Color::rgb(198, 198, 212);
+
+/// Open-document tab strip (below the banner). Height multiple of line, bg,
+/// active-tab tint, and text color.
+const TABSTRIP_H_MULT: f32 = 1.5;
+const TABSTRIP_BG_COLOR: [f32; 4] = [0.10, 0.10, 0.125, 1.0];
+const TABSTRIP_ACTIVE_COLOR: [f32; 4] = [0.18, 0.18, 0.22, 1.0];
+const TABSTRIP_TEXT_COLOR: Color = Color::rgb(205, 205, 218);
 
 /// Modal overlay palette (command palette / settings / modules). All
 /// straight-alpha RGBA. The dim quad darkens the still-visible editor behind
@@ -503,6 +513,12 @@ pub struct Renderer {
     sidebar_active: Option<usize>,
     /// Text labels column, shown when expanded.
     sidebar_labels_buffer: Buffer,
+    /// Open-document tab strip: shaped label row + per-tab char-column ranges
+    /// for hit-testing + the active tab index.
+    tabstrip_buffer: Buffer,
+    tabstrip_text: String,
+    tab_layout: Vec<(usize, usize)>,
+    tab_active: usize,
 
     /// The last document window text, kept so a scale change can re-shape it
     /// without the caller re-supplying it.
@@ -609,6 +625,8 @@ impl Renderer {
             None,
         );
         sidebar_labels_buffer.shape_until_scroll(&mut font_system, false);
+        let mut tabstrip_buffer = Buffer::new(&mut font_system, metrics);
+        tabstrip_buffer.set_wrap(Wrap::None);
         stats_buffer.set_wrap(Wrap::None);
         let mut doc_buffer = Buffer::new(&mut font_system, metrics);
         doc_buffer.set_wrap(Wrap::None);
@@ -699,7 +717,7 @@ impl Renderer {
         });
         let sidebar_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("umber sidebar bg"),
-            size: (24 * QUAD_FLOATS_PER_VERT * 4) as wgpu::BufferAddress,
+            size: (48 * QUAD_FLOATS_PER_VERT * 4) as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -750,7 +768,7 @@ impl Renderer {
             git_bytes: Vec::with_capacity(GIT_MARK_VERTS * QUAD_FLOATS_PER_VERT * 4),
             gutter_marks: Vec::new(),
             sidebar_vbuf,
-            sidebar_bytes: Vec::with_capacity(24 * QUAD_FLOATS_PER_VERT * 4),
+            sidebar_bytes: Vec::with_capacity(48 * QUAD_FLOATS_PER_VERT * 4),
             scrollbar: None,
             selection: Vec::new(),
             hover_word_buffer,
@@ -776,6 +794,10 @@ impl Renderer {
             sidebar_hover: None,
             sidebar_active: None,
             sidebar_labels_buffer,
+            tabstrip_buffer,
+            tabstrip_text: String::new(),
+            tab_layout: Vec::new(),
+            tab_active: 0,
             doc_text: String::new(),
             stats_prefix: String::new(),
             banner_dirty: true,
@@ -920,7 +942,74 @@ impl Renderer {
 
     /// Y of the document top: below the stats banner.
     pub fn doc_top(&self) -> f32 {
+        self.pad_px() + self.line_px() * STATS_GAP + self.tabstrip_h()
+    }
+
+    /// Y of the tab strip (just below the banner).
+    pub fn tabstrip_top(&self) -> f32 {
         self.pad_px() + self.line_px() * STATS_GAP
+    }
+
+    /// Tab strip height (0 when no tabs are set).
+    pub fn tabstrip_h(&self) -> f32 {
+        if self.tab_layout.is_empty() {
+            0.0
+        } else {
+            self.line_px() * TABSTRIP_H_MULT
+        }
+    }
+
+    /// Set the open-document tabs (labels + active index). Reshapes the strip
+    /// only when the label text changes.
+    pub fn set_tabs(&mut self, labels: &[String], active: usize) {
+        self.tab_active = active;
+        let sep = "    ";
+        let mut text = String::new();
+        self.tab_layout.clear();
+        let mut col = 0usize;
+        for (i, label) in labels.iter().enumerate() {
+            if i > 0 {
+                text.push_str(sep);
+                col += sep.chars().count();
+            }
+            let start = col;
+            text.push_str(label);
+            col += label.chars().count();
+            self.tab_layout.push((start, col));
+        }
+        if self.tabstrip_text != text {
+            self.tabstrip_text.clear();
+            self.tabstrip_text.push_str(&text);
+            self.tabstrip_buffer.set_text(
+                &text,
+                &Attrs::new().family(Family::Monospace),
+                Shaping::Advanced,
+                None,
+            );
+            let w = (self.surface_config.width as f32).max(1.0);
+            self.tabstrip_buffer.set_size(Some(w), Some(self.line_px()));
+            self.tabstrip_buffer
+                .shape_until_scroll(&mut self.font_system, false);
+        }
+    }
+
+    /// Tab index at physical `(x, y)` in the strip, or `None`.
+    pub fn tabstrip_at(&self, x: f32, y: f32) -> Option<usize> {
+        if self.tab_layout.is_empty() {
+            return None;
+        }
+        let top = self.tabstrip_top();
+        if y < top || y >= top + self.tabstrip_h() {
+            return None;
+        }
+        let origin = self.left_edge() + self.pad_px() * 0.5;
+        if x < origin {
+            return None;
+        }
+        let col = ((x - origin) / self.cell_w()) as usize;
+        self.tab_layout
+            .iter()
+            .position(|(s, e)| col >= *s && col < *e)
     }
 
     fn metrics(&self) -> Metrics {
@@ -1617,7 +1706,7 @@ impl Renderer {
         let w = self.surface_config.width as i32;
         let h = self.surface_config.height as i32;
 
-        let mut areas: Vec<TextArea> = Vec::with_capacity(7);
+        let mut areas: Vec<TextArea> = Vec::with_capacity(8);
         if self.sidebar_enabled {
             // Left tab bar: a vertical glyph column (palette/find/agents/
             // terminal/settings), a mouse backup for the keyboard commands.
@@ -1666,6 +1755,23 @@ impl Renderer {
             default_color: Color::rgb(150, 150, 165),
             custom_glyphs: &[],
         });
+        if !self.tab_layout.is_empty() {
+            let ts_top = pad + line_px * STATS_GAP;
+            areas.push(TextArea {
+                buffer: &self.tabstrip_buffer,
+                left: left + pad * 0.5,
+                top: ts_top + line_px * 0.25,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: left as i32,
+                    top: ts_top as i32,
+                    right: w,
+                    bottom: h,
+                },
+                default_color: TABSTRIP_TEXT_COLOR,
+                custom_glyphs: &[],
+            });
+        }
         if self.gutter_enabled && self.gutter_digits > 0 {
             areas.push(TextArea {
                 buffer: &self.gutter_buffer,
@@ -2134,6 +2240,7 @@ impl Renderer {
         }
         // Left tab-bar background quad (own buffer, drawn behind the glyphs).
         let mut sidebar_verts: u32 = 0;
+        self.sidebar_bytes.clear();
         if self.sidebar_enabled {
             let sw = self.sidebar_w();
             let sb_top = self.pad_px() + self.line_px() * 0.3;
@@ -2141,8 +2248,7 @@ impl Renderer {
             let s = self.scale_factor as f32;
             let hover = self.sidebar_hover;
             let active = self.sidebar_active;
-            self.sidebar_bytes.clear();
-            sidebar_verts = push_quad(
+            sidebar_verts += push_quad(
                 &mut self.sidebar_bytes,
                 fw,
                 fh,
@@ -2152,7 +2258,6 @@ impl Renderer {
                 fh,
                 SIDEBAR_BG_COLOR,
             );
-            // Hover highlight behind the pointed-at tab.
             if let Some(hrow) = hover {
                 sidebar_verts += push_quad(
                     &mut self.sidebar_bytes,
@@ -2165,19 +2270,69 @@ impl Renderer {
                     SIDEBAR_HOVER_COLOR,
                 );
             }
-            // Active-tab accent bar on the left edge.
             if let Some(arow) = active {
+                let ay = sb_top + arow as f32 * pitch;
                 sidebar_verts += push_quad(
                     &mut self.sidebar_bytes,
                     fw,
                     fh,
                     0.0,
-                    sb_top + arow as f32 * pitch,
+                    ay,
+                    sw,
+                    pitch,
+                    SIDEBAR_ACTIVE_BG_COLOR,
+                );
+                sidebar_verts += push_quad(
+                    &mut self.sidebar_bytes,
+                    fw,
+                    fh,
+                    0.0,
+                    ay,
                     (3.0 * s).max(2.0),
                     pitch,
                     SIDEBAR_ACTIVE_COLOR,
                 );
             }
+        }
+        // Open-document tab strip background + active-tab tint (shares the
+        // sidebar vertex buffer; drawn before the text pass).
+        if !self.tab_layout.is_empty() {
+            let ts_top = self.tabstrip_top();
+            let ts_h = self.tabstrip_h();
+            let le = self.left_edge();
+            let origin = le + self.pad_px() * 0.5;
+            let cw = self.cell_w();
+            let (astart, aend) = self
+                .tab_layout
+                .get(self.tab_active)
+                .copied()
+                .unwrap_or((0, 0));
+            sidebar_verts += push_quad(
+                &mut self.sidebar_bytes,
+                fw,
+                fh,
+                le,
+                ts_top,
+                (fw - le).max(0.0),
+                ts_h,
+                TABSTRIP_BG_COLOR,
+            );
+            if aend > astart {
+                let ax = origin + astart as f32 * cw;
+                let aw = (aend - astart) as f32 * cw;
+                sidebar_verts += push_quad(
+                    &mut self.sidebar_bytes,
+                    fw,
+                    fh,
+                    ax - cw * 0.5,
+                    ts_top,
+                    aw + cw,
+                    ts_h,
+                    TABSTRIP_ACTIVE_COLOR,
+                );
+            }
+        }
+        if sidebar_verts > 0 {
             self.queue
                 .write_buffer(&self.sidebar_vbuf, 0, &self.sidebar_bytes);
         }

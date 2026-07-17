@@ -189,6 +189,8 @@ fn build_command_registry() -> CommandRegistry {
         ("terminal.focus", "Terminal: Focus", ""),
         ("terminal.ssh", "Terminal: SSH to Host\u{2026}", ""),
         ("terminal.maximize", "Terminal: Toggle Fullscreen", "F11"),
+        ("view.nextTab", "View: Next Tab", "Ctrl+Tab"),
+        ("view.closeTab", "View: Close Tab", "Ctrl+W"),
         (
             "view.toggleSidebar",
             "View: Toggle Sidebar Labels",
@@ -313,6 +315,8 @@ fn main() -> ExitCode {
 
     let mut app = App {
         buffer,
+        docs: vec![Document::husk()],
+        active_doc: 0,
         renderer: None,
         view: View::Editor,
         config,
@@ -390,8 +394,44 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// One open editor tab's saved state. The ACTIVE document's live state lives
+/// in the `App` fields directly (so the ~50 `self.buffer` call sites need no
+/// change); `App::docs[active_doc]` is a husk whose buffer is swapped out.
+/// Switching stashes the active fields back into its slot and swaps the target
+/// in. `TextBuffer` isn't `Clone` (owns rope + undo), so this is move/swap,
+/// never copy.
+struct Document {
+    buffer: TextBuffer,
+    cursor_char: usize,
+    goal_col: usize,
+    selection_anchor: Option<usize>,
+    first_visible_line: usize,
+    git_status: std::collections::HashMap<usize, LineChange>,
+    remote_file: Option<String>,
+}
+
+impl Document {
+    /// An empty placeholder slot (used for the active tab, whose real state is
+    /// in the `App` fields).
+    fn husk() -> Self {
+        Self {
+            buffer: TextBuffer::empty(),
+            cursor_char: 0,
+            goal_col: 0,
+            selection_anchor: None,
+            first_visible_line: 0,
+            git_status: std::collections::HashMap::new(),
+            remote_file: None,
+        }
+    }
+}
+
 struct App {
     buffer: TextBuffer,
+    /// Open editor tabs (one husk slot per tab; active tab's data is in the
+    /// App fields). Always ≥ 1.
+    docs: Vec<Document>,
+    active_doc: usize,
     renderer: Option<Renderer>,
 
     // --- Slice 2: kernel + modal views ---
@@ -563,6 +603,9 @@ impl App {
     /// renderer. `follow_cursor` scrolls to keep the cursor visible (edits and
     /// caret moves); explicit scrolls pass `false` so the view stays put.
     fn apply_view(&mut self, follow_cursor: bool) {
+        // Refresh the tab strip first so doc_top() reflects its height for the
+        // window/geometry computed below.
+        self.sync_tabs();
         let cap = match self.renderer.as_ref() {
             Some(r) => r.visible_line_capacity().max(1),
             None => return,
@@ -1115,34 +1158,159 @@ impl App {
     }
 
     /// Open the file for the selected match and jump to its line/col.
+    // ===================================================================
+    //  Multi-buffer open-editor tabs.
+    // ===================================================================
+
+    /// Display name for tab `i` (active tab reads the live buffer).
+    fn tab_name(&self, i: usize) -> String {
+        let path = if i == self.active_doc {
+            self.buffer.path()
+        } else {
+            self.docs[i].buffer.path()
+        };
+        path.and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "*scratch*".to_string())
+    }
+
+    /// Index of an already-open tab for `path`, if any.
+    fn find_tab_by_path(&self, path: &std::path::Path) -> Option<usize> {
+        (0..self.docs.len()).find(|&i| {
+            let p = if i == self.active_doc {
+                self.buffer.path()
+            } else {
+                self.docs[i].buffer.path()
+            };
+            p == Some(path)
+        })
+    }
+
+    /// Stash the live editor fields back into the active tab's slot.
+    fn stash_active(&mut self) {
+        let d = &mut self.docs[self.active_doc];
+        std::mem::swap(&mut d.buffer, &mut self.buffer);
+        d.cursor_char = self.cursor_char;
+        d.goal_col = self.goal_col;
+        d.selection_anchor = self.selection_anchor;
+        d.first_visible_line = self.first_visible_line;
+        d.git_status = std::mem::take(&mut self.git_status);
+        d.remote_file = self.remote_file.take();
+    }
+
+    /// Load tab `i`'s slot into the live editor fields.
+    fn load_active_from(&mut self, i: usize) {
+        let d = &mut self.docs[i];
+        std::mem::swap(&mut self.buffer, &mut d.buffer);
+        self.cursor_char = d.cursor_char;
+        self.goal_col = d.goal_col;
+        self.selection_anchor = d.selection_anchor;
+        self.first_visible_line = d.first_visible_line;
+        self.git_status = std::mem::take(&mut d.git_status);
+        self.remote_file = d.remote_file.take();
+        self.active_doc = i;
+    }
+
+    /// Switch to tab `i`.
+    fn switch_tab(&mut self, i: usize) {
+        if i == self.active_doc || i >= self.docs.len() {
+            return;
+        }
+        self.stash_active();
+        self.load_active_from(i);
+        self.selecting = false;
+        self.apply_view(true);
+        if let Some(r) = self.renderer.as_ref() {
+            r.window().request_redraw();
+        }
+    }
+
+    /// Cycle to the next tab (Ctrl+Tab).
+    fn next_tab(&mut self) {
+        if self.docs.len() > 1 {
+            let next = (self.active_doc + 1) % self.docs.len();
+            self.switch_tab(next);
+        }
+    }
+
+    /// Open `path` in a new tab, or switch to it if already open.
+    fn open_path_in_tab(&mut self, path: &std::path::Path) {
+        if let Some(i) = self.find_tab_by_path(path) {
+            self.switch_tab(i);
+            return;
+        }
+        let buf = match TextBuffer::from_path(path) {
+            Ok(b) => b,
+            Err(err) => {
+                eprintln!("umber: cannot open {:?}: {err}", path);
+                return;
+            }
+        };
+        self.stash_active();
+        self.docs.push(Document::husk());
+        self.active_doc = self.docs.len() - 1;
+        self.buffer = buf;
+        self.cursor_char = 0;
+        self.goal_col = 0;
+        self.selection_anchor = None;
+        self.first_visible_line = 0;
+        if let Some(mut ws) = self.remote.take() {
+            ws.shutdown();
+        }
+        self.remote_file = None;
+        self.selecting = false;
+        self.refresh_git();
+        self.apply_view(true);
+        if let Some(r) = self.renderer.as_ref() {
+            r.window().request_redraw();
+        }
+    }
+
+    /// Close the active tab (always keeps at least one open).
+    fn close_active_tab(&mut self) {
+        if self.docs.len() <= 1 {
+            return;
+        }
+        let i = self.active_doc;
+        let new = if i + 1 < self.docs.len() {
+            i + 1
+        } else {
+            i - 1
+        };
+        // Load the neighbor into the live fields, dropping the closing buffer.
+        self.buffer = std::mem::replace(&mut self.docs[new].buffer, TextBuffer::empty());
+        self.cursor_char = self.docs[new].cursor_char;
+        self.goal_col = self.docs[new].goal_col;
+        self.selection_anchor = self.docs[new].selection_anchor;
+        self.first_visible_line = self.docs[new].first_visible_line;
+        self.git_status = std::mem::take(&mut self.docs[new].git_status);
+        self.remote_file = self.docs[new].remote_file.take();
+        self.docs.remove(i);
+        self.active_doc = if new > i { new - 1 } else { new };
+        self.selecting = false;
+        self.apply_view(true);
+        if let Some(r) = self.renderer.as_ref() {
+            r.window().request_redraw();
+        }
+    }
+
     fn open_search_result(&mut self) {
         let Some(m) = self.search_results.get(self.search_sel).cloned() else {
             return;
         };
-        match TextBuffer::from_path(&m.path) {
-            Ok(buf) => {
-                // Local open replaces any remote-backed buffer.
-                if let Some(mut ws) = self.remote.take() {
-                    ws.shutdown();
-                }
-                self.remote_file = None;
-                self.buffer = buf;
-                self.refresh_git();
-                let line = m.line.saturating_sub(1);
-                let base = self.buffer.line_to_char(line);
-                let col = m.col.min(self.buffer.visual_line_len_chars(line));
-                self.cursor_char = base + col;
-                self.selection_anchor = None;
-                self.first_visible_line = line.saturating_sub(4);
-                self.update_goal_col();
-                self.view = View::Editor;
-                self.close_overlay();
-                self.apply_view(true);
-                if let Some(r) = self.renderer.as_ref() {
-                    r.window().request_redraw();
-                }
-            }
-            Err(err) => eprintln!("umber: cannot open {:?}: {err}", m.path),
+        self.view = View::Editor;
+        self.close_overlay();
+        // Open (or switch to) the file in its own tab, then jump to the match.
+        self.open_path_in_tab(&m.path);
+        let line = m.line.saturating_sub(1);
+        let base = self.buffer.line_to_char(line);
+        let col = m.col.min(self.buffer.visual_line_len_chars(line));
+        self.cursor_char = base + col;
+        self.selection_anchor = None;
+        self.first_visible_line = line.saturating_sub(4);
+        self.update_goal_col();
+        self.apply_view(true);
+        if let Some(r) = self.renderer.as_ref() {
+            r.window().request_redraw();
         }
     }
 
@@ -2437,6 +2605,29 @@ impl App {
         }
     }
 
+    /// Push the open-document tab labels (with dirty markers) + active index
+    /// to the renderer's tab strip.
+    fn sync_tabs(&mut self) {
+        let mut labels: Vec<String> = Vec::with_capacity(self.docs.len());
+        for i in 0..self.docs.len() {
+            let dirty = if i == self.active_doc {
+                self.buffer.is_dirty()
+            } else {
+                self.docs[i].buffer.is_dirty()
+            };
+            let name = self.tab_name(i);
+            labels.push(if dirty {
+                format!("\u{2022} {name}")
+            } else {
+                name
+            });
+        }
+        let active = self.active_doc;
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_tabs(&labels, active);
+        }
+    }
+
     /// Mark the activity-bar tab matching the current view (accent bar).
     fn sync_sidebar_active(&mut self) {
         let active = match self.view {
@@ -2819,6 +3010,14 @@ impl App {
                 self.toggle_sidebar();
                 return;
             }
+            "view.nextTab" => {
+                self.next_tab();
+                return;
+            }
+            "view.closeTab" => {
+                self.close_active_tab();
+                return;
+            }
             "terminal.ssh" => {
                 self.open_ssh_picker();
                 return;
@@ -3081,6 +3280,15 @@ impl ApplicationHandler<UserEvent> for App {
                         self.sidebar_tab_activate(tab);
                         return;
                     }
+                    // Open-document tab strip click -> switch tab.
+                    if self.view == View::Editor {
+                        if let Some(i) = self.renderer.as_ref().and_then(|r| {
+                            r.tabstrip_at(self.pointer.0 as f32, self.pointer.1 as f32)
+                        }) {
+                            self.switch_tab(i);
+                            return;
+                        }
+                    }
                 }
                 // Overlay pages: a left click selects a list row, and clicking
                 // the already-selected row activates it (toggle / open) — the
@@ -3302,6 +3510,13 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
+                // Ctrl+Tab cycles open editor tabs (Tab is a Named key, so it
+                // is handled before the Character chords below).
+                if ctrl && matches!(&event.logical_key, Key::Named(NamedKey::Tab)) {
+                    self.next_tab();
+                    return;
+                }
+
                 // Ctrl chords: clipboard, undo/redo, save, select-all. These
                 // consume the key; the printable path below is already Ctrl-gated.
                 if ctrl {
@@ -3325,6 +3540,10 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             "b" => {
                                 self.toggle_sidebar();
+                                return;
+                            }
+                            "w" => {
+                                self.close_active_tab();
                                 return;
                             }
                             "q" => {
