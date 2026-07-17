@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use umber::agent_rpc::{AgentNotifier, AgentProcess, AgentRunState};
 use umber::agents::{self, SessionSummary};
 use umber::remote::RemoteWorkspace;
+use umber::search::{self, Match};
 use umber::terminal::{TermNotifier, TerminalSession};
 use umber_host::{HostCommand, Manifest, ModuleHost};
 use umber_kernel::{Command, CommandRegistry, Config, FeatureRegistry};
@@ -98,6 +99,8 @@ enum View {
     RemoteHost,
     /// P3b-deep: enter a remote file path to open over the workspace.
     RemotePath,
+    /// P5: project-wide text search.
+    Search,
 }
 
 /// What the pointer is hovering over in the document body, for hover
@@ -186,6 +189,11 @@ fn build_command_registry() -> CommandRegistry {
         ("agents.dashboard", "Agents: pi Dashboard", "Ctrl+Shift+A"),
         ("remote.open", "Remote: Open File over SSH\u{2026}", ""),
         ("remote.disconnect", "Remote: Disconnect Workspace", ""),
+        (
+            "search.project",
+            "Search: In Project\u{2026}",
+            "Ctrl+Shift+F",
+        ),
         ("view.toggle.terminal", "View: Toggle Terminal Feature", ""),
         ("app.quit", "Application: Quit", "Ctrl+Q"),
     ] {
@@ -336,6 +344,9 @@ fn main() -> ExitCode {
         remote_file: None,
         remote_host_input: String::new(),
         remote_path_input: String::new(),
+        search_input: String::new(),
+        search_results: Vec::new(),
+        search_sel: 0,
         help_scroll: 0,
         goto_input: String::new(),
         ssh_hosts: Vec::new(),
@@ -472,6 +483,11 @@ struct App {
     /// In-progress host / path entry for the remote-open flow.
     remote_host_input: String,
     remote_path_input: String,
+
+    // --- P5: project search ---
+    search_input: String,
+    search_results: Vec<Match>,
+    search_sel: usize,
 
     // --- P3b/QoL: help, go-to-line, SSH picker ---
     /// Scroll offset of the help overlay.
@@ -1022,6 +1038,103 @@ impl App {
         }
     }
 
+    // ===================================================================
+    //  P5: project-wide search.
+    // ===================================================================
+
+    /// Project root for search: the open file's parent, else the process cwd.
+    fn project_root(&self) -> PathBuf {
+        self.buffer
+            .path()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    }
+
+    fn open_search(&mut self) {
+        self.search_input.clear();
+        self.search_results.clear();
+        self.search_sel = 0;
+        self.view = View::Search;
+        self.refresh_overlay();
+    }
+
+    fn run_search(&mut self) {
+        let root = self.project_root();
+        self.search_results = search::search_dir(&root, self.search_input.trim(), 200);
+        self.search_sel = 0;
+        self.refresh_overlay();
+    }
+
+    /// Open the file for the selected match and jump to its line/col.
+    fn open_search_result(&mut self) {
+        let Some(m) = self.search_results.get(self.search_sel).cloned() else {
+            return;
+        };
+        match TextBuffer::from_path(&m.path) {
+            Ok(buf) => {
+                // Local open replaces any remote-backed buffer.
+                if let Some(mut ws) = self.remote.take() {
+                    ws.shutdown();
+                }
+                self.remote_file = None;
+                self.buffer = buf;
+                let line = m.line.saturating_sub(1);
+                let base = self.buffer.line_to_char(line);
+                let col = m.col.min(self.buffer.visual_line_len_chars(line));
+                self.cursor_char = base + col;
+                self.selection_anchor = None;
+                self.first_visible_line = line.saturating_sub(4);
+                self.update_goal_col();
+                self.view = View::Editor;
+                self.close_overlay();
+                self.apply_view(true);
+                if let Some(r) = self.renderer.as_ref() {
+                    r.window().request_redraw();
+                }
+            }
+            Err(err) => eprintln!("umber: cannot open {:?}: {err}", m.path),
+        }
+    }
+
+    fn search_key(&mut self, event: KeyEvent) {
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => self.close_overlay(),
+            Key::Named(NamedKey::Enter) => self.open_search_result(),
+            Key::Named(NamedKey::ArrowDown) => {
+                let n = self.search_results.len();
+                if n > 0 {
+                    self.search_sel = (self.search_sel + 1) % n;
+                }
+                self.refresh_overlay();
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                let n = self.search_results.len();
+                if n > 0 {
+                    self.search_sel = (self.search_sel + n - 1) % n;
+                }
+                self.refresh_overlay();
+            }
+            Key::Named(NamedKey::Backspace) => {
+                self.search_input.pop();
+                self.run_search();
+            }
+            _ => {
+                if let Some(t) = &event.text {
+                    let mut changed = false;
+                    for ch in t.chars() {
+                        if !ch.is_control() {
+                            self.search_input.push(ch);
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        self.run_search();
+                    }
+                }
+            }
+        }
+    }
+
     /// Handle the remote-host entry prompt: Enter connects, then asks for a
     /// path. Typed text or a selected ssh_config host both work.
     fn remote_host_key(&mut self, event: KeyEvent) {
@@ -1439,6 +1552,46 @@ impl App {
                 selected: None,
                 hint: Some("Enter open (daemon-relative path) \u{2022} Esc cancel".to_string()),
             }),
+            View::Search => {
+                let cap = self
+                    .renderer
+                    .as_ref()
+                    .map(|r| r.overlay_row_capacity())
+                    .unwrap_or(1);
+                let n = self.search_results.len();
+                let sel = if n == 0 {
+                    0
+                } else {
+                    self.search_sel.min(n - 1)
+                };
+                let start = if sel < cap { 0 } else { sel + 1 - cap };
+                let end = (start + cap).min(n);
+                let root = self.project_root();
+                let rows = self.search_results[start..end]
+                    .iter()
+                    .map(|m| {
+                        let rel = m
+                            .path
+                            .strip_prefix(&root)
+                            .unwrap_or(&m.path)
+                            .display()
+                            .to_string();
+                        (m.text.clone(), format!("{rel}:{}", m.line))
+                    })
+                    .collect();
+                Some(OverlaySpec {
+                    title: None,
+                    input: Some(format!("search> {}", self.search_input)),
+                    rows,
+                    left_color: [220, 220, 225],
+                    right_color: [150, 150, 165],
+                    split_frac: 0.66,
+                    selected: if n == 0 { None } else { Some(sel - start) },
+                    hint: Some(format!(
+                        "{n} matches \u{2014} \u{2191}\u{2193} select \u{2022} Enter open \u{2022} Esc close"
+                    )),
+                })
+            }
             View::Settings => {
                 let c = &self.config;
                 let rows = vec![
@@ -2468,6 +2621,10 @@ impl App {
                 self.close_overlay();
                 return;
             }
+            "search.project" => {
+                self.open_search();
+                return;
+            }
             // Not a built-in id: route to the module host (external command).
             other => self.invoke_module(other),
         }
@@ -2819,6 +2976,10 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     View::RemotePath => {
                         self.remote_path_key(event);
+                        return;
+                    }
+                    View::Search => {
+                        self.search_key(event);
                         return;
                     }
                     View::Settings => {
