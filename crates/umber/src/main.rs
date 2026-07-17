@@ -1293,6 +1293,25 @@ impl App {
         }
     }
 
+    /// Close any tab by index (keeps at least one open).
+    fn close_tab(&mut self, i: usize) {
+        if self.docs.len() <= 1 || i >= self.docs.len() {
+            return;
+        }
+        if i == self.active_doc {
+            self.close_active_tab();
+            return;
+        }
+        self.docs.remove(i);
+        if i < self.active_doc {
+            self.active_doc -= 1;
+        }
+        self.apply_view(false);
+        if let Some(r) = self.renderer.as_ref() {
+            r.window().request_redraw();
+        }
+    }
+
     fn open_search_result(&mut self) {
         let Some(m) = self.search_results.get(self.search_sel).cloned() else {
             return;
@@ -3268,6 +3287,17 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
+                // Middle-click a tab in the strip closes it.
+                if button == MouseButton::Middle && state == ElementState::Pressed {
+                    if let Some(i) = self
+                        .renderer
+                        .as_ref()
+                        .and_then(|r| r.tabstrip_at(self.pointer.0 as f32, self.pointer.1 as f32))
+                    {
+                        self.close_tab(i);
+                    }
+                    return;
+                }
                 if button != MouseButton::Left {
                     return;
                 }

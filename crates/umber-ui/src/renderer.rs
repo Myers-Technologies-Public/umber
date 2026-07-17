@@ -108,7 +108,7 @@ pub const SIDEBAR_TABS: usize = 5;
 const SIDEBAR_BG_COLOR: [f32; 4] = [0.085, 0.085, 0.105, 1.0];
 const SIDEBAR_GLYPH_COLOR: Color = Color::rgb(150, 150, 168);
 /// Per-tab vertical pitch as a multiple of the line height.
-const SIDEBAR_TAB_PITCH: f32 = 1.6;
+const SIDEBAR_TAB_PITCH: f32 = 1.4;
 /// Expanded activity-bar width (icons + text labels).
 const SIDEBAR_W_EXPANDED: f32 = 168.0;
 /// Tab labels shown when expanded (aligned to the glyph rows).
@@ -123,7 +123,7 @@ const SIDEBAR_LABEL_COLOR: Color = Color::rgb(198, 198, 212);
 
 /// Open-document tab strip (below the banner). Height multiple of line, bg,
 /// active-tab tint, and text color.
-const TABSTRIP_H_MULT: f32 = 1.5;
+const TABSTRIP_H_MULT: f32 = 1.3;
 const TABSTRIP_BG_COLOR: [f32; 4] = [0.10, 0.10, 0.125, 1.0];
 const TABSTRIP_ACTIVE_COLOR: [f32; 4] = [0.18, 0.18, 0.22, 1.0];
 const TABSTRIP_TEXT_COLOR: Color = Color::rgb(205, 205, 218);
