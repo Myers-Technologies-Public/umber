@@ -2416,6 +2416,22 @@ impl App {
         self.apply_view(false);
     }
 
+    /// Activate a left tab-bar tab (0 palette, 1 find, 2 agents, 3 terminal,
+    /// 4 settings) — the mouse backup for the keyboard commands.
+    fn sidebar_tab_activate(&mut self, tab: usize) {
+        match tab {
+            0 => self.open_palette(),
+            1 => self.open_search(),
+            2 => self.open_agents(),
+            3 => {
+                self.close_overlay();
+                self.terminal_toggle();
+            }
+            4 => self.open_settings(),
+            _ => {}
+        }
+    }
+
     /// Left-click activation on an overlay list row (window-relative `row`):
     /// select it, or activate it when it was already selected.
     fn overlay_click_row(&mut self, row: usize, event_loop: &ActiveEventLoop) {
@@ -3010,6 +3026,16 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseInput { state, button, .. } => {
                 if button != MouseButton::Left {
                     return;
+                }
+                // Left tab bar: works from any view (mouse backup for the
+                // palette / find / agents / terminal / settings commands).
+                if state == ElementState::Pressed {
+                    if let Some(tab) = self.renderer.as_ref().and_then(|r| {
+                        r.sidebar_tab_at(self.pointer.0 as f32, self.pointer.1 as f32)
+                    }) {
+                        self.sidebar_tab_activate(tab);
+                        return;
+                    }
                 }
                 // Overlay pages: a left click selects a list row, and clicking
                 // the already-selected row activates it (toggle / open) — the

@@ -98,6 +98,18 @@ const TERM_BORDER_FOCUS_COLOR: [f32; 4] = [0.902, 0.706, 0.471, 0.9];
 const TERM_CURSOR_COLOR: [f32; 4] = [0.902, 0.706, 0.471, 0.45];
 const TERM_TEXT_COLOR: Color = Color::rgb(210, 210, 215);
 
+/// Left activity/tab bar (P5 QoL). Width in logical px; vertical tab glyphs
+/// give a mouse backup for the palette/search/agents/terminal/settings views.
+const SIDEBAR_W: f32 = 40.0;
+/// Tabs, top to bottom: palette, find, agents, terminal, settings.
+const SIDEBAR_GLYPHS: &str = "\u{2630}\n\u{2315}\n\u{25c8}\n\u{25b8}\n\u{2699}";
+/// Number of tabs (drives hit-testing).
+pub const SIDEBAR_TABS: usize = 5;
+const SIDEBAR_BG_COLOR: [f32; 4] = [0.085, 0.085, 0.105, 1.0];
+const SIDEBAR_GLYPH_COLOR: Color = Color::rgb(150, 150, 168);
+/// Per-tab vertical pitch as a multiple of the line height.
+const SIDEBAR_TAB_PITCH: f32 = 1.6;
+
 /// Modal overlay palette (command palette / settings / modules). All
 /// straight-alpha RGBA. The dim quad darkens the still-visible editor behind
 /// the modal; the box sits behind the palette input; the highlight marks the
@@ -424,6 +436,10 @@ pub struct Renderer {
     git_vbuf: wgpu::Buffer,
     git_bytes: Vec<u8>,
     gutter_marks: Vec<(usize, [f32; 4])>,
+    /// Left tab-bar background (own buffer, one quad, drawn behind the tab
+    /// glyphs before the text pass).
+    sidebar_vbuf: wgpu::Buffer,
+    sidebar_bytes: Vec<u8>,
     /// `Some((first_line, total_lines))` when the scrollbar is visible.
     scrollbar: Option<(usize, usize)>,
     /// Selection highlight spans for the current view (window-relative lines).
@@ -469,6 +485,9 @@ pub struct Renderer {
     term_text: String,
     term_cursor: Option<(usize, usize)>,
     term_buffer: Buffer,
+    /// Left tab-bar glyph column, shaped once (rebuilt on scale change).
+    sidebar_buffer: Buffer,
+    sidebar_enabled: bool,
 
     /// The last document window text, kept so a scale change can re-shape it
     /// without the caller re-supplying it.
@@ -553,6 +572,19 @@ impl Renderer {
         let mut stats_buffer = Buffer::new(&mut font_system, metrics);
         let mut term_buffer = Buffer::new(&mut font_system, metrics);
         term_buffer.set_wrap(Wrap::None);
+        let sidebar_metrics = Metrics::new(
+            BASE_FONT * scale_factor as f32,
+            BASE_LINE * scale_factor as f32 * SIDEBAR_TAB_PITCH,
+        );
+        let mut sidebar_buffer = Buffer::new(&mut font_system, sidebar_metrics);
+        sidebar_buffer.set_wrap(Wrap::None);
+        sidebar_buffer.set_text(
+            SIDEBAR_GLYPHS,
+            &Attrs::new().family(Family::Monospace),
+            Shaping::Advanced,
+            None,
+        );
+        sidebar_buffer.shape_until_scroll(&mut font_system, false);
         stats_buffer.set_wrap(Wrap::None);
         let mut doc_buffer = Buffer::new(&mut font_system, metrics);
         doc_buffer.set_wrap(Wrap::None);
@@ -641,6 +673,12 @@ impl Renderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let sidebar_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("umber sidebar bg"),
+            size: (6 * QUAD_FLOATS_PER_VERT * 4) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let quad_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("umber-ui quad vertices"),
             size: (QUAD_VERTS * QUAD_FLOATS_PER_VERT * 4) as wgpu::BufferAddress,
@@ -687,6 +725,8 @@ impl Renderer {
             git_vbuf,
             git_bytes: Vec::with_capacity(GIT_MARK_VERTS * QUAD_FLOATS_PER_VERT * 4),
             gutter_marks: Vec::new(),
+            sidebar_vbuf,
+            sidebar_bytes: Vec::with_capacity(6 * QUAD_FLOATS_PER_VERT * 4),
             scrollbar: None,
             selection: Vec::new(),
             hover_word_buffer,
@@ -706,6 +746,8 @@ impl Renderer {
             term_text: String::new(),
             term_cursor: None,
             term_buffer,
+            sidebar_buffer,
+            sidebar_enabled: true,
             doc_text: String::new(),
             stats_prefix: String::new(),
             banner_dirty: true,
@@ -770,15 +812,50 @@ impl Renderer {
     /// hit-tests clicks against this to open settings.
     pub fn gear_bounds(&self) -> (f32, f32, f32, f32) {
         (
-            self.pad_px(),
+            self.left_edge(),
             self.pad_px(),
             self.cell_w() * 2.5,
             self.line_px(),
         )
     }
 
+    /// Width of the left activity bar in physical px (0 when disabled).
+    pub fn sidebar_w(&self) -> f32 {
+        if self.sidebar_enabled {
+            SIDEBAR_W * self.scale_factor as f32
+        } else {
+            0.0
+        }
+    }
+
+    /// Left content edge: past the activity bar, plus window padding. Banner,
+    /// gutter, and terminal all originate here so the sidebar shift is applied
+    /// in exactly one place.
+    pub fn left_edge(&self) -> f32 {
+        self.sidebar_w() + self.pad_px()
+    }
+
+    /// Sidebar tab index at physical `(x, y)`, or `None`. Tabs stack from the
+    /// top at `SIDEBAR_TAB_PITCH` line-heights, matching the shaped column.
+    pub fn sidebar_tab_at(&self, x: f32, y: f32) -> Option<usize> {
+        if !self.sidebar_enabled || x < 0.0 || x > self.sidebar_w() {
+            return None;
+        }
+        let top = self.pad_px() + self.line_px() * 0.3;
+        if y < top {
+            return None;
+        }
+        let pitch = self.line_px() * SIDEBAR_TAB_PITCH;
+        let row = ((y - top) / pitch).floor() as usize;
+        if row < SIDEBAR_TABS {
+            Some(row)
+        } else {
+            None
+        }
+    }
+
     pub fn text_left(&self) -> f32 {
-        self.pad_px() + self.gutter_width()
+        self.left_edge() + self.gutter_width()
     }
 
     /// Y of the document top: below the stats banner.
@@ -1469,6 +1546,7 @@ impl Renderer {
         // Geometry snapshot (copies) so the TextArea borrows below only touch
         // the buffer fields, keeping them disjoint from the &mut atlas/font.
         let pad = self.pad_px();
+        let left = self.left_edge();
         let doc_top = self.doc_top();
         let line_px = self.line_px();
         let cell_w = self.cell_w();
@@ -1479,10 +1557,28 @@ impl Renderer {
         let w = self.surface_config.width as i32;
         let h = self.surface_config.height as i32;
 
-        let mut areas: Vec<TextArea> = Vec::with_capacity(6);
+        let mut areas: Vec<TextArea> = Vec::with_capacity(7);
+        if self.sidebar_enabled {
+            // Left tab bar: a vertical glyph column (palette/find/agents/
+            // terminal/settings), a mouse backup for the keyboard commands.
+            areas.push(TextArea {
+                buffer: &self.sidebar_buffer,
+                left: pad * 0.5,
+                top: pad + line_px * 0.3,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: 0,
+                    top: 0,
+                    right: self.sidebar_w() as i32,
+                    bottom: h,
+                },
+                default_color: SIDEBAR_GLYPH_COLOR,
+                custom_glyphs: &[],
+            });
+        }
         areas.push(TextArea {
             buffer: &self.stats_buffer,
-            left: pad,
+            left,
             top: pad,
             scale: 1.0,
             bounds: TextBounds {
@@ -1497,7 +1593,7 @@ impl Renderer {
         if self.gutter_enabled && self.gutter_digits > 0 {
             areas.push(TextArea {
                 buffer: &self.gutter_buffer,
-                left: pad,
+                left,
                 top: doc_top,
                 scale: 1.0,
                 bounds: TextBounds {
@@ -1529,7 +1625,7 @@ impl Renderer {
         if term_open {
             areas.push(TextArea {
                 buffer: &self.term_buffer,
-                left: pad,
+                left,
                 top: term_top + pad,
                 scale: 1.0,
                 bounds: TextBounds {
@@ -1776,7 +1872,8 @@ impl Renderer {
         if !self.overlay_active && self.gutter_enabled && self.gutter_digits > 0 {
             let s = self.scale_factor as f32;
             let sep_w = (SEPARATOR_W * s).max(1.0);
-            let sep_x = self.pad_px() + self.gutter_text_w() + GUTTER_GAP * s * 0.5 - sep_w * 0.5;
+            let sep_x =
+                self.left_edge() + self.gutter_text_w() + GUTTER_GAP * s * 0.5 - sep_w * 0.5;
             let sep_h = (doc_bottom - doc_top).max(0.0);
             if sep_h > 0.0 {
                 sep_verts += push_quad(
@@ -1815,7 +1912,7 @@ impl Renderer {
         if !self.overlay_active && self.gutter_enabled {
             let s = self.scale_factor as f32;
             let mark_w = (3.0 * s).max(1.0);
-            let mark_x = self.pad_px() * 0.4;
+            let mark_x = self.sidebar_w() + self.pad_px() * 0.4;
             for (line, color) in self.gutter_marks.iter().take(GIT_MARK_MAX) {
                 let y = doc_top + *line as f32 * line_px;
                 if y >= doc_bottom {
@@ -1959,6 +2056,24 @@ impl Renderer {
         if git_verts > 0 {
             self.queue.write_buffer(&self.git_vbuf, 0, &self.git_bytes);
         }
+        // Left tab-bar background quad (own buffer, drawn behind the glyphs).
+        let mut sidebar_verts: u32 = 0;
+        if self.sidebar_enabled {
+            let sw = self.sidebar_w();
+            self.sidebar_bytes.clear();
+            sidebar_verts = push_quad(
+                &mut self.sidebar_bytes,
+                fw,
+                fh,
+                0.0,
+                0.0,
+                sw,
+                fh,
+                SIDEBAR_BG_COLOR,
+            );
+            self.queue
+                .write_buffer(&self.sidebar_vbuf, 0, &self.sidebar_bytes);
+        }
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
@@ -2019,6 +2134,14 @@ impl Renderer {
                 pass.set_pipeline(&self.quad_pipeline);
                 pass.set_vertex_buffer(0, self.quad_vbuf.slice(..));
                 pass.draw(0..sel_verts, 0..1);
+            }
+
+            // Sidebar background behind everything on the left strip; the tab
+            // glyphs (in the text pass just below) draw over it.
+            if sidebar_verts > 0 {
+                pass.set_pipeline(&self.quad_pipeline);
+                pass.set_vertex_buffer(0, self.sidebar_vbuf.slice(..));
+                pass.draw(0..sidebar_verts, 0..1);
             }
 
             self.text_renderer
