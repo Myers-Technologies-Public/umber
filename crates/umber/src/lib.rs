@@ -7,6 +7,7 @@
 
 pub mod agent_rpc;
 pub mod agents;
+pub mod git;
 pub mod remote;
 pub mod search;
 pub mod terminal;

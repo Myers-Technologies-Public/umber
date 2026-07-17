@@ -10,4 +10,7 @@
 
 mod renderer;
 
-pub use renderer::{OverlaySpec, Renderer, ScrollbarGeom, ScrollbarInfo, SelSpan};
+pub use renderer::{
+    OverlaySpec, Renderer, ScrollbarGeom, ScrollbarInfo, SelSpan, GIT_ADDED_COLOR,
+    GIT_DELETED_COLOR, GIT_MODIFIED_COLOR,
+};

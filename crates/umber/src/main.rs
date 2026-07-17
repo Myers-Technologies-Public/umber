@@ -18,13 +18,17 @@ use std::time::{Duration, Instant};
 
 use umber::agent_rpc::{AgentNotifier, AgentProcess, AgentRunState};
 use umber::agents::{self, SessionSummary};
+use umber::git::{self, LineChange};
 use umber::remote::RemoteWorkspace;
 use umber::search::{self, Match};
 use umber::terminal::{TermNotifier, TerminalSession};
 use umber_host::{HostCommand, Manifest, ModuleHost};
 use umber_kernel::{Command, CommandRegistry, Config, FeatureRegistry};
 use umber_text::TextBuffer;
-use umber_ui::{OverlaySpec, Renderer, ScrollbarInfo, SelSpan};
+use umber_ui::{
+    OverlaySpec, Renderer, ScrollbarInfo, SelSpan, GIT_ADDED_COLOR, GIT_DELETED_COLOR,
+    GIT_MODIFIED_COLOR,
+};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -344,6 +348,7 @@ fn main() -> ExitCode {
         remote_file: None,
         remote_host_input: String::new(),
         remote_path_input: String::new(),
+        git_status: std::collections::HashMap::new(),
         search_input: String::new(),
         search_results: Vec::new(),
         search_sel: 0,
@@ -484,6 +489,9 @@ struct App {
     remote_host_input: String,
     remote_path_input: String,
 
+    // --- P5: git gutter status (line -> change) ---
+    git_status: std::collections::HashMap<usize, LineChange>,
+
     // --- P5: project search ---
     search_input: String,
     search_results: Vec<Match>,
@@ -595,7 +603,7 @@ impl App {
                 .unwrap_or_else(|| "*scratch*".to_string()),
         };
         let mut prefix = format!(
-            "umber P0 \u{2014} {dirty}{name} \u{2014} {} lines, {} bytes \u{2014} Ln {}, Col {}",
+            "\u{2699}  umber \u{2014} {dirty}{name} \u{2014} {} lines, {} bytes \u{2014} Ln {}, Col {}",
             self.buffer.len_lines(),
             self.buffer.len_bytes(),
             cl + 1,
@@ -656,11 +664,29 @@ impl App {
             }
         }
 
+        // Git gutter markers for the visible window (P5): map each changed
+        // absolute line that falls in view to its window-relative row + color.
+        let mut marks: Vec<(usize, [f32; 4])> = Vec::new();
+        if !self.git_status.is_empty() {
+            for row in 0..cap {
+                let abs = self.first_visible_line + row + 1; // git lines are 1-based
+                if let Some(change) = self.git_status.get(&abs) {
+                    let color = match change {
+                        LineChange::Added => GIT_ADDED_COLOR,
+                        LineChange::Modified => GIT_MODIFIED_COLOR,
+                        LineChange::Deleted => GIT_DELETED_COLOR,
+                    };
+                    marks.push((row, color));
+                }
+            }
+        }
+
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.set_gutter(&numbers, digits);
             renderer.set_document(&text);
             renderer.set_cursor(cursor);
             renderer.set_selection(&spans);
+            renderer.set_gutter_marks(marks);
             renderer.set_stats_prefix(prefix);
         }
         self.sel_spans = spans;
@@ -1020,6 +1046,19 @@ impl App {
     }
 
     /// Write the buffer to disk (Ctrl+S). Scratch buffers have no path yet.
+    /// Recompute git line-status for the open local file (P5). Remote/scratch
+    /// buffers clear it. Called on open + save (not per keystroke).
+    fn refresh_git(&mut self) {
+        if self.remote.is_some() {
+            self.git_status.clear();
+            return;
+        }
+        self.git_status = match self.buffer.path() {
+            Some(p) => git::file_line_status(p),
+            None => std::collections::HashMap::new(),
+        };
+    }
+
     fn do_save(&mut self) {
         // Remote-backed buffer (P3b): write the whole file back over the
         // umber-proto workspace instead of the local filesystem.
@@ -1032,7 +1071,7 @@ impl App {
             return;
         }
         match self.buffer.save() {
-            Ok(true) => {}
+            Ok(true) => self.refresh_git(),
             Ok(false) => eprintln!("umber: no path to save (scratch buffer)"),
             Err(err) => eprintln!("umber: save failed: {err}"),
         }
@@ -1078,6 +1117,7 @@ impl App {
                 }
                 self.remote_file = None;
                 self.buffer = buf;
+                self.refresh_git();
                 let line = m.line.saturating_sub(1);
                 let base = self.buffer.line_to_char(line);
                 let col = m.col.min(self.buffer.visual_line_len_chars(line));
@@ -2843,6 +2883,18 @@ impl ApplicationHandler<UserEvent> for App {
                         // A press changes the caret/selection context under the
                         // pointer: drop any hover highlight (redraws once).
                         self.clear_hover();
+                        // Settings gear (top-left of the banner): a mouse
+                        // backup for Ctrl+, — keyboard-first with mouse-click
+                        // fallbacks (original requirement 2).
+                        if let Some(r) = self.renderer.as_ref() {
+                            let (gx, gy, gw, gh) = r.gear_bounds();
+                            let px = self.pointer.0 as f32;
+                            let py = self.pointer.1 as f32;
+                            if px >= gx && px < gx + gw && py >= gy && py < gy + gh {
+                                self.open_settings();
+                                return;
+                            }
+                        }
                         // P3: clicks in the terminal panel move focus there;
                         // clicks in the document return it to the editor.
                         if let Some(renderer) = self.renderer.as_ref() {

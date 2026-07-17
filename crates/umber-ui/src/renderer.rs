@@ -121,6 +121,16 @@ const OVERLAY_HINT_COLOR: Color = Color::rgb(140, 140, 155);
 /// scrollbar (2) + separator (1) + hover segment (1) always have room.
 const QUAD_MAX: usize = 256;
 const QUAD_VERTS: usize = QUAD_MAX * 6;
+
+/// Git gutter markers get their own vertex buffer (one thin quad per changed
+/// visible line) so they never compete with the QUAD_MAX overlay budget. Cap
+/// = a generous visible-line ceiling.
+const GIT_MARK_MAX: usize = 512;
+const GIT_MARK_VERTS: usize = GIT_MARK_MAX * 6;
+/// Gutter marker colors (added / modified / deleted).
+pub const GIT_ADDED_COLOR: [f32; 4] = [0.44, 0.73, 0.42, 0.95];
+pub const GIT_MODIFIED_COLOR: [f32; 4] = [0.85, 0.65, 0.30, 0.95];
+pub const GIT_DELETED_COLOR: [f32; 4] = [0.80, 0.35, 0.35, 0.95];
 const QUAD_FLOATS_PER_VERT: usize = 6; // vec2 position + vec4 color
 
 /// Minimal solid-quad shader: clip-space position + per-vertex color, alpha
@@ -403,6 +413,11 @@ pub struct Renderer {
     quad_pipeline: wgpu::RenderPipeline,
     quad_vbuf: wgpu::Buffer,
     quad_bytes: Vec<u8>,
+    /// Git gutter markers (own buffer; see [`GIT_MARK_MAX`]). Each entry is
+    /// `(line_in_window, rgba)`, set by the app from git line-status.
+    git_vbuf: wgpu::Buffer,
+    git_bytes: Vec<u8>,
+    gutter_marks: Vec<(usize, [f32; 4])>,
     /// `Some((first_line, total_lines))` when the scrollbar is visible.
     scrollbar: Option<(usize, usize)>,
     /// Selection highlight spans for the current view (window-relative lines).
@@ -610,6 +625,12 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
+        let git_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("umber git gutter marks"),
+            size: (GIT_MARK_VERTS * QUAD_FLOATS_PER_VERT * 4) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let quad_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("umber-ui quad vertices"),
             size: (QUAD_VERTS * QUAD_FLOATS_PER_VERT * 4) as wgpu::BufferAddress,
@@ -653,6 +674,9 @@ impl Renderer {
             quad_pipeline,
             quad_vbuf,
             quad_bytes: Vec::with_capacity(QUAD_VERTS * QUAD_FLOATS_PER_VERT * 4),
+            git_vbuf,
+            git_bytes: Vec::with_capacity(GIT_MARK_VERTS * QUAD_FLOATS_PER_VERT * 4),
+            gutter_marks: Vec::new(),
             scrollbar: None,
             selection: Vec::new(),
             hover_word_buffer,
@@ -729,6 +753,18 @@ impl Renderer {
 
     /// X of the document text origin: window pad + gutter column. The bin maps
     /// clicks against this; the renderer places glyphs and the cursor from it.
+    /// Screen rect `(x, y, w, h)` of the settings gear glyph at the start of
+    /// the top banner (D5: keyboard-first, mouse-hover backup). The bin
+    /// hit-tests clicks against this to open settings.
+    pub fn gear_bounds(&self) -> (f32, f32, f32, f32) {
+        (
+            self.pad_px(),
+            self.pad_px(),
+            self.cell_w() * 2.5,
+            self.line_px(),
+        )
+    }
+
     pub fn text_left(&self) -> f32 {
         self.pad_px() + self.gutter_width()
     }
@@ -982,6 +1018,12 @@ impl Renderer {
     /// highlighted. Cheap: just stored, drawn as a quad in [`Renderer::render`].
     pub fn set_hover_line(&mut self, line: Option<usize>) {
         self.hover_line = line;
+    }
+
+    /// Set git gutter markers as `(line_in_window, rgba)` pairs (P5). Cheap:
+    /// stored, drawn as quads from the dedicated git buffer in `render`.
+    pub fn set_gutter_marks(&mut self, marks: Vec<(usize, [f32; 4])>) {
+        self.gutter_marks = marks;
     }
 
     /// Show/hide the terminal panel and set its keyboard focus. An open/close
@@ -1688,6 +1730,33 @@ impl Renderer {
             }
         }
 
+        // Git gutter markers: a thin colored bar at the far-left edge for each
+        // changed visible line (own buffer, own draw — never touches the
+        // QUAD_MAX overlay budget). Editor view only.
+        self.git_bytes.clear();
+        let mut git_verts: u32 = 0;
+        if !self.overlay_active && self.gutter_enabled {
+            let s = self.scale_factor as f32;
+            let mark_w = (3.0 * s).max(1.0);
+            let mark_x = self.pad_px() * 0.4;
+            for (line, color) in self.gutter_marks.iter().take(GIT_MARK_MAX) {
+                let y = doc_top + *line as f32 * line_px;
+                if y >= doc_bottom {
+                    continue;
+                }
+                git_verts += push_quad(
+                    &mut self.git_bytes,
+                    fw,
+                    fh,
+                    mark_x,
+                    y,
+                    mark_w,
+                    line_px,
+                    *color,
+                );
+            }
+        }
+
         // Terminal panel border + cursor cell, appended after the separator
         // range. The border doubles as the focus cue: rust accent while the
         // terminal owns the keyboard, muted grey otherwise.
@@ -1783,6 +1852,9 @@ impl Renderer {
             self.queue
                 .write_buffer(&self.quad_vbuf, 0, &self.quad_bytes);
         }
+        if git_verts > 0 {
+            self.queue.write_buffer(&self.git_vbuf, 0, &self.git_bytes);
+        }
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
@@ -1872,6 +1944,13 @@ impl Renderer {
                 pass.set_pipeline(&self.quad_pipeline);
                 pass.set_vertex_buffer(0, self.quad_vbuf.slice(..));
                 pass.draw(start..start + term_verts, 0..1);
+            }
+
+            // Git gutter markers from their dedicated buffer.
+            if git_verts > 0 {
+                pass.set_pipeline(&self.quad_pipeline);
+                pass.set_vertex_buffer(0, self.git_vbuf.slice(..));
+                pass.draw(0..git_verts, 0..1);
             }
 
             // Modal overlay: dim + box + highlight quads, then the overlay text
