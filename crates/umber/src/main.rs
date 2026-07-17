@@ -16,6 +16,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use umber::agent_rpc::{AgentNotifier, AgentProcess, AgentRunState};
 use umber::agents::{self, SessionSummary};
 use umber::terminal::{TermNotifier, TerminalSession};
 use umber_host::{HostCommand, Manifest, ModuleHost};
@@ -49,6 +50,8 @@ const SETTINGS_ROWS: usize = 6;
 enum UserEvent {
     TerminalWakeup,
     TerminalExited,
+    /// A live pi RPC agent updated its state/output (P4 slice 2).
+    AgentUpdated,
 }
 
 /// [`TermNotifier`] over the winit event-loop proxy.
@@ -61,6 +64,12 @@ impl TermNotifier for UmberNotifier {
     }
     fn child_exited(&self) {
         let _ = self.0.send_event(UserEvent::TerminalExited);
+    }
+}
+
+impl AgentNotifier for UmberNotifier {
+    fn agent_updated(&self) {
+        let _ = self.0.send_event(UserEvent::AgentUpdated);
     }
 }
 
@@ -82,6 +91,8 @@ enum View {
     SshPicker,
     /// P4 slice 1: read-only pi session dashboard (history from JSONL).
     Agents,
+    /// P4 slice 2: type a prompt to send to the live attached agent.
+    AgentPrompt,
 }
 
 /// What the pointer is hovering over in the document body, for hover
@@ -312,6 +323,8 @@ fn main() -> ExitCode {
         scrollbar_drawn: false,
         agents_sessions: Vec::new(),
         agents_scroll: 0,
+        agent_proc: None,
+        agent_prompt: String::new(),
         help_scroll: 0,
         goto_input: String::new(),
         ssh_hosts: Vec::new(),
@@ -434,6 +447,10 @@ struct App {
     agents_sessions: Vec<SessionSummary>,
     /// Scroll offset into the sessions list.
     agents_scroll: usize,
+    /// Live attached agent (P4 slice 2), spawned in the dashboard with `n`.
+    agent_proc: Option<AgentProcess>,
+    /// In-progress prompt text for the live agent.
+    agent_prompt: String,
 
     // --- P3b/QoL: help, go-to-line, SSH picker ---
     /// Scroll offset of the help overlay.
@@ -1204,47 +1221,61 @@ impl App {
                 let start = self.agents_scroll.min(n.saturating_sub(1));
                 let end = (start + cap).min(n);
                 let home = std::env::var("HOME").unwrap_or_default();
-                let rows = self.agents_sessions[start..end]
-                    .iter()
-                    .map(|s| {
-                        let cwd = if !home.is_empty() && s.cwd.starts_with(&home) {
-                            format!("~{}", &s.cwd[home.len()..])
-                        } else {
-                            s.cwd.clone()
-                        };
-                        // "2026-07-15T22:33:12.865Z" -> "07-15 22:33"
-                        let when: String = s
-                            .last_active
-                            .chars()
-                            .skip(5)
-                            .take(11)
-                            .map(|c| if c == 'T' { ' ' } else { c })
-                            .collect();
-                        (
-                            format!("{}  \u{2014}  {}", s.model, cwd),
-                            format!(
-                                "{} tok \u{2022} ctx {} \u{2022} {} msgs \u{2022} {}",
-                                agents::fmt_tokens(s.tokens_total),
-                                agents::fmt_tokens(s.context_tokens),
-                                s.messages,
-                                when
-                            ),
-                        )
-                    })
-                    .collect();
+                let mut rows = self.agent_live_rows();
+                rows.extend(self.agents_sessions[start..end].iter().map(|s| {
+                    let cwd = if !home.is_empty() && s.cwd.starts_with(&home) {
+                        format!("~{}", &s.cwd[home.len()..])
+                    } else {
+                        s.cwd.clone()
+                    };
+                    // "2026-07-15T22:33:12.865Z" -> "07-15 22:33"
+                    let when: String = s
+                        .last_active
+                        .chars()
+                        .skip(5)
+                        .take(11)
+                        .map(|c| if c == 'T' { ' ' } else { c })
+                        .collect();
+                    (
+                        format!("{}  \u{2014}  {}", s.model, cwd),
+                        format!(
+                            "{} tok \u{2022} ctx {} \u{2022} {} msgs \u{2022} {}",
+                            agents::fmt_tokens(s.tokens_total),
+                            agents::fmt_tokens(s.context_tokens),
+                            s.messages,
+                            when
+                        ),
+                    )
+                }));
+                let attached = self.agent_proc.is_some();
                 Some(OverlaySpec {
-                    title: Some("pi Agent Sessions \u{2014} history (live control: slice 2)".to_string()),
+                    title: Some("pi Agents \u{2014} live control + history".to_string()),
                     input: None,
                     rows,
                     left_color: [225, 225, 230],
                     right_color: [200, 170, 110],
                     split_frac: 0.52,
                     selected: None,
-                    hint: Some(format!(
-                        "{n} sessions \u{2014} \u{2191}\u{2193} scroll \u{2022} r refresh \u{2022} Esc close"
-                    )),
+                    hint: Some(if attached {
+                        "p prompt \u{2022} a abort \u{2022} k kill \u{2022} r refresh \u{2022} \u{2191}\u{2193} \u{2022} Esc"
+                            .to_string()
+                    } else {
+                        format!(
+                            "{n} sessions \u{2014} n new live agent \u{2022} r refresh \u{2022} \u{2191}\u{2193} \u{2022} Esc"
+                        )
+                    }),
                 })
             }
+            View::AgentPrompt => Some(OverlaySpec {
+                title: None,
+                input: Some(format!("prompt> {}", self.agent_prompt)),
+                rows: self.agent_live_rows(),
+                left_color: [225, 225, 230],
+                right_color: [200, 170, 110],
+                split_frac: 0.62,
+                selected: None,
+                hint: Some("Enter send (steer if running) \u{2022} Esc back".to_string()),
+            }),
             View::Settings => {
                 let c = &self.config;
                 let rows = vec![
@@ -1372,6 +1403,15 @@ impl App {
         self.refresh_overlay();
     }
 
+    /// Working directory a new live agent is spawned in: the open file's
+    /// parent, else the process cwd.
+    fn agent_cwd(&self) -> PathBuf {
+        self.buffer
+            .path()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    }
+
     fn agents_key(&mut self, event: KeyEvent) {
         match &event.logical_key {
             Key::Named(NamedKey::Escape) => self.close_overlay(),
@@ -1390,8 +1430,127 @@ impl App {
                 self.agents_scroll = scroll.min(self.agents_sessions.len().saturating_sub(1));
                 self.refresh_overlay();
             }
+            // n: spawn a live pi agent in the working dir (P4 slice 2).
+            Key::Character(c) if c.as_str() == "n" => {
+                if self.agent_proc.is_none() {
+                    let cwd = self.agent_cwd();
+                    match AgentProcess::spawn("pi", &cwd, UmberNotifier(self.event_proxy.clone())) {
+                        Ok(proc) => self.agent_proc = Some(proc),
+                        Err(err) => {
+                            eprintln!("umber: pi rpc spawn failed: {err}");
+                        }
+                    }
+                }
+                self.refresh_overlay();
+            }
+            // p: prompt the live agent.
+            Key::Character(c) if c.as_str() == "p" => {
+                if self.agent_proc.is_some() {
+                    self.agent_prompt.clear();
+                    self.view = View::AgentPrompt;
+                    self.refresh_overlay();
+                }
+            }
+            // a: abort the current run.
+            Key::Character(c) if c.as_str() == "a" => {
+                if let Some(proc) = self.agent_proc.as_mut() {
+                    let _ = proc.abort();
+                }
+            }
+            // k: kill/detach the live agent.
+            Key::Character(c) if c.as_str() == "k" => {
+                if let Some(mut proc) = self.agent_proc.take() {
+                    proc.shutdown();
+                }
+                self.refresh_overlay();
+            }
             _ => {}
         }
+    }
+
+    /// Keyboard handling for the live-agent prompt sub-view.
+    fn agent_prompt_key(&mut self, event: KeyEvent) {
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.view = View::Agents;
+                self.refresh_overlay();
+            }
+            Key::Named(NamedKey::Enter) => {
+                let text = std::mem::take(&mut self.agent_prompt);
+                if !text.trim().is_empty() {
+                    if let Some(proc) = self.agent_proc.as_mut() {
+                        // Running -> steer; idle -> a fresh prompt (§1.2).
+                        let behavior = match proc.state.run_state() {
+                            Some(AgentRunState::Running) | Some(AgentRunState::Queued) => {
+                                Some("steer")
+                            }
+                            _ => None,
+                        };
+                        if let Err(err) = proc.prompt(&text, behavior) {
+                            eprintln!("umber: prompt send failed: {err}");
+                        }
+                    }
+                }
+                self.view = View::Agents;
+                self.refresh_overlay();
+            }
+            Key::Named(NamedKey::Backspace) => {
+                self.agent_prompt.pop();
+                self.refresh_overlay();
+            }
+            _ => {
+                if let Some(t) = &event.text {
+                    let mut changed = false;
+                    for ch in t.chars() {
+                        if !ch.is_control() {
+                            self.agent_prompt.push(ch);
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        self.refresh_overlay();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Live-agent header rows for the dashboard: attach state, current tool,
+    /// and a tail of streamed output. Empty when no agent is attached.
+    fn agent_live_rows(&self) -> Vec<(String, String)> {
+        let Some(proc) = self.agent_proc.as_ref() else {
+            return Vec::new();
+        };
+        let state = match proc.state.run_state() {
+            Some(AgentRunState::Starting) => "starting\u{2026}",
+            Some(AgentRunState::Running) => "\u{25cf} running",
+            Some(AgentRunState::AwaitingInstruction) => "awaiting instruction",
+            Some(AgentRunState::Queued) => "queued work",
+            Some(AgentRunState::Exited) => "exited",
+            None => "?",
+        };
+        let tool = proc
+            .state
+            .last_tool()
+            .map(|t| format!("tool: {t}"))
+            .unwrap_or_default();
+        let mut rows = vec![(format!("LIVE AGENT \u{2014} {state}"), tool)];
+        // Last line of streamed output as a preview.
+        let tail = proc.state.output_tail();
+        if let Some(last) = tail.lines().last() {
+            if !last.trim().is_empty() {
+                let preview: String = last
+                    .chars()
+                    .rev()
+                    .take(60)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                rows.push((format!("  {preview}"), String::new()));
+            }
+        }
+        rows
     }
 
     fn open_help(&mut self) {
@@ -2194,6 +2353,13 @@ impl ApplicationHandler<UserEvent> for App {
                 // Shell ended (exit / Ctrl+D): close the panel and reap.
                 self.kill_terminal();
             }
+            UserEvent::AgentUpdated => {
+                // Live agent changed state/output: refresh the dashboard if
+                // it (or its prompt sub-view) is open.
+                if matches!(self.view, View::Agents | View::AgentPrompt) {
+                    self.refresh_overlay();
+                }
+            }
         }
     }
 
@@ -2463,6 +2629,10 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     View::Agents => {
                         self.agents_key(event);
+                        return;
+                    }
+                    View::AgentPrompt => {
+                        self.agent_prompt_key(event);
                         return;
                     }
                     View::Settings => {
