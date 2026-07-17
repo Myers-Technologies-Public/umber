@@ -48,7 +48,7 @@ const WHEEL_LINES: f32 = 3.0;
 const BASE_LINE_PX: f64 = 20.0;
 
 /// Number of rows on the settings page (drives selection clamping).
-const SETTINGS_ROWS: usize = 6;
+const SETTINGS_ROWS: usize = 7;
 
 /// Cross-thread wakeups from background machinery (P3: the terminal's PTY
 /// reader thread). Delivered through winit's user-event channel.
@@ -361,6 +361,7 @@ fn main() -> ExitCode {
         ssh_sel: 0,
         terminal: None,
         term_focused: false,
+        term_resizing: false,
         event_proxy,
         start,
         first_frame: false,
@@ -516,6 +517,8 @@ struct App {
     terminal: Option<TerminalSession<UmberNotifier>>,
     /// Keyboard focus owner: `true` = terminal panel, else the editor.
     term_focused: bool,
+    /// Dragging the terminal's top border to resize the split.
+    term_resizing: bool,
     /// Proxy for background threads to wake the event loop.
     event_proxy: EventLoopProxy<UserEvent>,
 
@@ -1645,6 +1648,7 @@ impl App {
                     ("Line-number gutter".to_string(), onoff(c.gutter)),
                     ("Overlay scrollbar".to_string(), onoff(c.scrollbar)),
                     ("Latency HUD".to_string(), onoff(c.latency_hud)),
+                    ("Open terminal".to_string(), "\u{2192} Ctrl+J".to_string()),
                 ];
                 Some(OverlaySpec {
                     title: Some("Preferences \u{2014} Settings".to_string()),
@@ -2178,6 +2182,12 @@ impl App {
             3 => self.config.gutter = !self.config.gutter,
             4 => self.config.scrollbar = !self.config.scrollbar,
             5 => self.config.latency_hud = !self.config.latency_hud,
+            6 => {
+                // Action row: open the terminal panel from settings.
+                self.close_overlay();
+                self.open_terminal();
+                return;
+            }
             _ => {}
         }
         // Keep the feature registry in step with the config booleans.
@@ -2358,6 +2368,31 @@ impl App {
         } else {
             self.hide_terminal();
         }
+    }
+
+    /// Drag-resize: set the terminal split from a pointer-y and resize the PTY.
+    fn terminal_resize_to(&mut self, pointer_y: f64) {
+        let grid = if let Some(r) = self.renderer.as_mut() {
+            if !r.terminal_open() || r.terminal_maximized() {
+                return;
+            }
+            let (_, h) = r.size();
+            if h == 0 {
+                return;
+            }
+            let frac = (((h as f64 - pointer_y) / h as f64).clamp(0.1, 0.85)) as f32;
+            r.set_terminal_split_frac(frac);
+            let (cols, lines) = r.term_grid_size();
+            let (cw, ch) = r.cell_px();
+            r.window().request_redraw();
+            Some((cols, lines, cw, ch))
+        } else {
+            None
+        };
+        if let (Some((cols, lines, cw, ch)), Some(s)) = (grid, self.terminal.as_ref()) {
+            s.resize(cols, lines, cw, ch);
+        }
+        self.apply_view(false);
     }
 
     /// Toggle fullscreen terminal, resizing the PTY grid to match.
@@ -2933,7 +2968,9 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.pointer = (position.x, position.y);
-                if self.scrollbar_dragging {
+                if self.term_resizing {
+                    self.terminal_resize_to(position.y);
+                } else if self.scrollbar_dragging {
                     self.drag_scrollbar(position.y);
                 } else if self.selecting {
                     // Drag-extend the selection. Throttle: only re-render when the
@@ -3007,6 +3044,17 @@ impl ApplicationHandler<UserEvent> for App {
                                 return;
                             }
                         }
+                        // Terminal top border: start a drag-resize (a few px
+                        // band around the border, when not maximized).
+                        if let Some(r) = self.renderer.as_ref() {
+                            if r.terminal_open() && !r.terminal_maximized() {
+                                let py = self.pointer.1 as f32;
+                                if (py - r.term_top()).abs() <= 5.0 {
+                                    self.term_resizing = true;
+                                    return;
+                                }
+                            }
+                        }
                         // P3: clicks in the terminal panel move focus there;
                         // clicks in the document return it to the editor.
                         if let Some(renderer) = self.renderer.as_ref() {
@@ -3063,6 +3111,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     ElementState::Released => {
                         self.selecting = false;
+                        self.term_resizing = false;
                         if self.scrollbar_dragging {
                             self.scrollbar_dragging = false;
                             // Start the linger countdown now the drag ended.
