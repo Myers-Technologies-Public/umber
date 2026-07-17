@@ -105,6 +105,12 @@ const TERM_TEXT_COLOR: Color = Color::rgb(210, 210, 215);
 const OVERLAY_DIM_COLOR: [f32; 4] = [0.03, 0.03, 0.04, 0.72];
 const OVERLAY_BOX_COLOR: [f32; 4] = [0.15, 0.15, 0.18, 0.92];
 const OVERLAY_HL_COLOR: [f32; 4] = [0.30, 0.40, 0.58, 0.42];
+/// Opaque panel behind overlay page content — without it the page text sits
+/// directly on the dimmed editor and is hard to read (user-reported).
+const OVERLAY_PANEL_COLOR: [f32; 4] = [0.10, 0.10, 0.125, 0.97];
+/// Terminal panel background: a shade darker than the editor clear color so
+/// the panel reads as a distinct surface.
+const TERM_BG_COLOR: [f32; 4] = [0.042, 0.042, 0.052, 1.0];
 
 /// Overlay text colors. Title uses the Crail rust accent (Claude Code
 /// palette); input is bright; hint is dim. Row column colors are supplied
@@ -1624,15 +1630,15 @@ impl Renderer {
         self.quad_bytes.clear();
 
         // Selection: one quad per visible highlighted line, using the same
-        // `col * cell_w` arithmetic as the caret. Clamped to `QUAD_MAX - 6` so
+        // `col * cell_w` arithmetic as the caret. Clamped to `QUAD_MAX - 7` so
         // the scrollbar (2), separator rule + hover segment (2), and terminal
-        // border + cursor (2) always fit the vertex buffer.
+        // background + border + cursor (3) always fit the vertex buffer.
         // the scrollbar's two quads plus the gutter separator rule and its
         // hovered-line segment always fit the vertex buffer.
         let sel_right_edge = fw - pad;
         let mut sel_verts: u32 = 0;
         if !self.overlay_active {
-            for span in self.selection.iter().take(QUAD_MAX - 6) {
+            for span in self.selection.iter().take(QUAD_MAX - 7) {
                 let y = doc_top + span.line as f32 * line_px;
                 if y >= fh {
                     continue;
@@ -1764,6 +1770,17 @@ impl Renderer {
         if term_open {
             let s = self.scale_factor as f32;
             let border_h = (1.0 * s).max(1.0);
+            // Panel background first (text draws over it), then border/cursor.
+            term_verts += push_quad(
+                &mut self.quad_bytes,
+                fw,
+                fh,
+                0.0,
+                term_top,
+                fw,
+                (fh - term_top).max(0.0),
+                TERM_BG_COLOR,
+            );
             term_verts += push_quad(
                 &mut self.quad_bytes,
                 fw,
@@ -1816,6 +1833,22 @@ impl Renderer {
                 fw,
                 fh,
                 OVERLAY_DIM_COLOR,
+            );
+            // Opaque content panel behind the whole page (title/input, rows,
+            // hint) so overlay text never fights the editor text behind it.
+            let panel_x = (ov_left - pad * 1.5).max(0.0);
+            let panel_y = (ov_top - line_px * 0.5).max(0.0);
+            let panel_w = (ov_w + pad * 3.0).min(fw - panel_x);
+            let panel_h = (fh - panel_y - pad).max(0.0);
+            ov_verts += push_quad(
+                &mut self.quad_bytes,
+                fw,
+                fh,
+                panel_x,
+                panel_y,
+                panel_w,
+                panel_h,
+                OVERLAY_PANEL_COLOR,
             );
             if self.overlay_has_input {
                 ov_verts += push_quad(
