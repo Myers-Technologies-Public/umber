@@ -462,6 +462,10 @@ pub struct Renderer {
     /// the cell cursor. The buffer reshapes only when the snapshot changes.
     term_open: bool,
     term_focused: bool,
+    /// Fullscreen terminal (fills below the banner).
+    term_maximized: bool,
+    /// User drag-resize height fraction override (else `TERM_SPLIT_FRAC`).
+    term_split_frac_override: Option<f32>,
     term_text: String,
     term_cursor: Option<(usize, usize)>,
     term_buffer: Buffer,
@@ -697,6 +701,8 @@ impl Renderer {
             cursor: None,
             term_open: false,
             term_focused: false,
+            term_maximized: false,
+            term_split_frac_override: None,
             term_text: String::new(),
             term_cursor: None,
             term_buffer,
@@ -809,8 +815,14 @@ impl Renderer {
         if !self.term_open {
             return 0.0;
         }
+        // Maximized: the panel fills everything below the banner (fullscreen
+        // terminal, banner kept for the gear + status).
+        if self.term_maximized {
+            return (self.surface_config.height as f32 - self.doc_top()).max(self.line_px());
+        }
         let h = self.surface_config.height as f32;
-        let lines = ((h * TERM_SPLIT_FRAC) / self.line_px()).floor().max(2.0);
+        let frac = self.term_split_frac_override.unwrap_or(TERM_SPLIT_FRAC);
+        let lines = ((h * frac) / self.line_px()).floor().max(2.0);
         lines * self.line_px() + self.pad_px() * 2.0
     }
 
@@ -1083,6 +1095,65 @@ impl Renderer {
 
     pub fn terminal_focused(&self) -> bool {
         self.term_focused
+    }
+
+    pub fn terminal_maximized(&self) -> bool {
+        self.term_maximized
+    }
+
+    /// Toggle/set fullscreen terminal, reflowing document + gutter + grid.
+    pub fn set_terminal_maximized(&mut self, maximized: bool) {
+        if self.term_maximized == maximized {
+            return;
+        }
+        self.term_maximized = maximized;
+        self.reflow_terminal_geometry();
+    }
+
+    /// Set the drag-resize split fraction (clamped 0.1..0.85); reflows.
+    pub fn set_terminal_split_frac(&mut self, frac: f32) {
+        if self.term_maximized {
+            return;
+        }
+        self.term_split_frac_override = Some(frac.clamp(0.1, 0.85));
+        self.reflow_terminal_geometry();
+    }
+
+    /// Reflow document, gutter, and terminal buffers to the current panel
+    /// geometry (shared by maximize + drag-resize).
+    fn reflow_terminal_geometry(&mut self) {
+        let (w, h) = self.doc_size();
+        self.doc_buffer.set_size(Some(w), Some(h));
+        self.doc_buffer
+            .shape_until_scroll(&mut self.font_system, false);
+        let gw = self.gutter_text_w().max(1.0);
+        let gh = self.doc_size().1;
+        self.gutter_buffer.set_size(Some(gw), Some(gh));
+        self.gutter_buffer
+            .shape_until_scroll(&mut self.font_system, false);
+        if self.term_open {
+            let tw = (self.surface_config.width as f32 - self.pad_px() * 2.0).max(1.0);
+            let th = (self.term_split_h() - self.pad_px()).max(1.0);
+            self.term_buffer.set_size(Some(tw), Some(th));
+            self.term_buffer
+                .shape_until_scroll(&mut self.font_system, false);
+        }
+    }
+
+    /// Window-relative list-row index at physical-y `y` on an overlay page, or
+    /// `None` above the first row / below the last visible row. Lets the app
+    /// map a mouse click to a settings/modules row.
+    pub fn overlay_row_at(&self, y: f32) -> Option<usize> {
+        let rows_top = self.overlay_rows_top();
+        if y < rows_top {
+            return None;
+        }
+        let row = ((y - rows_top) / self.line_px()).floor() as usize;
+        if row < self.overlay_row_capacity() {
+            Some(row)
+        } else {
+            None
+        }
     }
 
     // --- modal overlay (command palette / settings / modules) --------------

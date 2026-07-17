@@ -188,6 +188,7 @@ fn build_command_registry() -> CommandRegistry {
         ),
         ("terminal.focus", "Terminal: Focus", ""),
         ("terminal.ssh", "Terminal: SSH to Host\u{2026}", ""),
+        ("terminal.maximize", "Terminal: Toggle Fullscreen", "F11"),
         ("goto.line", "Go: Line\u{2026}", "Ctrl+G"),
         ("help.keys", "Help: Keyboard Shortcuts", "F1"),
         ("agents.dashboard", "Agents: pi Dashboard", "Ctrl+Shift+A"),
@@ -2359,6 +2360,92 @@ impl App {
         }
     }
 
+    /// Toggle fullscreen terminal, resizing the PTY grid to match.
+    fn terminal_toggle_max(&mut self) {
+        let grid = if let Some(r) = self.renderer.as_mut() {
+            if !r.terminal_open() {
+                return;
+            }
+            let m = !r.terminal_maximized();
+            r.set_terminal_maximized(m);
+            let (cols, lines) = r.term_grid_size();
+            let (cw, ch) = r.cell_px();
+            r.window().request_redraw();
+            Some((cols, lines, cw, ch))
+        } else {
+            None
+        };
+        if let (Some((cols, lines, cw, ch)), Some(s)) = (grid, self.terminal.as_ref()) {
+            s.resize(cols, lines, cw, ch);
+        }
+        self.apply_view(false);
+    }
+
+    /// Left-click activation on an overlay list row (window-relative `row`):
+    /// select it, or activate it when it was already selected.
+    fn overlay_click_row(&mut self, row: usize, event_loop: &ActiveEventLoop) {
+        match self.view {
+            View::Settings => {
+                if self.settings_sel == row {
+                    self.settings_adjust(1); // toggle bool / bump numeric
+                } else {
+                    self.settings_sel = row.min(SETTINGS_ROWS - 1);
+                }
+                self.refresh_overlay();
+            }
+            View::Modules => {
+                let n = self.features.features().len() + self.modules.len();
+                let idx = row.min(n.saturating_sub(1));
+                if self.modules_sel == idx {
+                    self.modules_toggle_current();
+                } else {
+                    self.modules_sel = idx;
+                    self.refresh_overlay();
+                }
+            }
+            View::Palette => {
+                let cap = self
+                    .renderer
+                    .as_ref()
+                    .map(|r| r.overlay_row_capacity())
+                    .unwrap_or(1);
+                let n = self.palette_filtered.len();
+                let sel = if n == 0 {
+                    0
+                } else {
+                    self.palette_sel.min(n - 1)
+                };
+                let start = if sel < cap { 0 } else { sel + 1 - cap };
+                let abs = start + row;
+                if abs < n {
+                    let id = self.palette_items[self.palette_filtered[abs]].id.clone();
+                    self.view = View::Editor;
+                    self.execute_command(&id, event_loop);
+                }
+            }
+            View::Search => {
+                let cap = self
+                    .renderer
+                    .as_ref()
+                    .map(|r| r.overlay_row_capacity())
+                    .unwrap_or(1);
+                let n = self.search_results.len();
+                let sel = if n == 0 {
+                    0
+                } else {
+                    self.search_sel.min(n - 1)
+                };
+                let start = if sel < cap { 0 } else { sel + 1 - cap };
+                let abs = start + row;
+                if abs < n {
+                    self.search_sel = abs;
+                    self.open_search_result();
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Encode a terminal-focused keystroke as PTY bytes. Esc never reaches the
     /// shell (it returns focus to the editor); Ctrl+letter becomes the C0
     /// control byte, so Ctrl+C is SIGINT to the PTY, deliberately NOT the
@@ -2630,6 +2717,19 @@ impl App {
                 self.open_terminal();
                 return;
             }
+            "terminal.maximize" => {
+                self.close_overlay();
+                if !self
+                    .renderer
+                    .as_ref()
+                    .map(|r| r.terminal_open())
+                    .unwrap_or(false)
+                {
+                    self.open_terminal();
+                }
+                self.terminal_toggle_max();
+                return;
+            }
             "terminal.ssh" => {
                 self.open_ssh_picker();
                 return;
@@ -2871,10 +2971,22 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
-                if self.view != View::Editor {
+                if button != MouseButton::Left {
                     return;
                 }
-                if button != MouseButton::Left {
+                // Overlay pages: a left click selects a list row, and clicking
+                // the already-selected row activates it (toggle / open) — the
+                // mouse backup for keyboard nav the user asked for.
+                if self.view != View::Editor {
+                    if state == ElementState::Pressed {
+                        if let Some(row) = self
+                            .renderer
+                            .as_ref()
+                            .and_then(|r| r.overlay_row_at(self.pointer.1 as f32))
+                        {
+                            self.overlay_click_row(row, event_loop);
+                        }
+                    }
                     return;
                 }
                 match state {
@@ -2979,11 +3091,20 @@ impl ApplicationHandler<UserEvent> for App {
                         return;
                     }
                     if matches!(&event.logical_key, Key::Named(NamedKey::Escape)) {
+                        // Esc always reveals the editor: unfocus AND un-maximize
+                        // so a fullscreen terminal can't trap the user.
                         self.term_focused = false;
                         if let Some(renderer) = self.renderer.as_mut() {
+                            renderer.set_terminal_maximized(false);
                             renderer.set_terminal(true, false);
                             renderer.window().request_redraw();
                         }
+                        self.apply_view(false);
+                        return;
+                    }
+                    // F11: toggle fullscreen terminal.
+                    if matches!(&event.logical_key, Key::Named(NamedKey::F11)) {
+                        self.terminal_toggle_max();
                         return;
                     }
                     if let (Some(session), Some(bytes)) =
