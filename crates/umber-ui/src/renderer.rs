@@ -158,6 +158,8 @@ const OVERLAY_HL_COLOR: [f32; 4] = [0.757, 0.373, 0.235, 0.30];
 /// Opaque panel behind overlay page content — without it the page text sits
 /// directly on the dimmed editor and is hard to read (user-reported).
 const OVERLAY_PANEL_COLOR: [f32; 4] = [0.024, 0.020, 0.016, 0.99];
+const CONTEXT_MENU_COLOR: [f32; 4] = [0.030, 0.025, 0.020, 1.0];
+const CONTEXT_MENU_HOVER_COLOR: [f32; 4] = [0.145, 0.075, 0.042, 0.92];
 /// Terminal panel background: a shade darker than the editor clear color so
 /// the panel reads as a distinct surface.
 const TERM_BG_COLOR: [f32; 4] = [0.010, 0.009, 0.008, 1.0];
@@ -504,6 +506,15 @@ pub struct Renderer {
     overlay_input: Buffer,
     overlay_title: Buffer,
     overlay_hint: Buffer,
+    /// Non-modal pointer context menu. It uses the normal text renderer so it
+    /// can coexist with the editor without changing the app's `View`.
+    context_buffer: Buffer,
+    context_active: bool,
+    context_x: f32,
+    context_y: f32,
+    context_width: f32,
+    context_rows: usize,
+    context_hover: Option<usize>,
     overlay_active: bool,
     overlay_has_input: bool,
     overlay_has_title: bool,
@@ -754,6 +765,8 @@ impl Renderer {
         overlay_title.set_wrap(Wrap::None);
         let mut overlay_hint = Buffer::new(&mut font_system, metrics);
         overlay_hint.set_wrap(Wrap::None);
+        let mut context_buffer = Buffer::new(&mut font_system, metrics);
+        context_buffer.set_wrap(Wrap::None);
 
         // The hovered-word overlay buffer: like the cursor glyph, shaped only
         // when the hovered word changes (never per mouse move).
@@ -903,6 +916,13 @@ impl Renderer {
             overlay_input,
             overlay_title,
             overlay_hint,
+            context_buffer,
+            context_active: false,
+            context_x: 0.0,
+            context_y: 0.0,
+            context_width: 0.0,
+            context_rows: 0,
+            context_hover: None,
             overlay_has_input: false,
             overlay_has_title: false,
             overlay_has_hint: false,
@@ -1092,6 +1112,12 @@ impl Renderer {
     /// Reshapes only when the label text changes.
     pub fn set_sidebar_tabs(&mut self, labels: &[String], active: usize) {
         self.sidebar_tab_count = labels.len();
+        // A tab may vanish under a stationary pointer (context-menu close):
+        // drop any hover index that no longer maps to a row, or a ghost
+        // hover card gets drawn in the empty slot.
+        if self.sidebar_hover.is_some_and(|h| h >= labels.len()) {
+            self.sidebar_hover = None;
+        }
         self.sidebar_active = if labels.is_empty() {
             None
         } else {
@@ -1252,6 +1278,81 @@ impl Renderer {
             .min(fh - py - pad)
             .max(line_px * 2.0);
         (px, py, pw, ph)
+    }
+
+    /// Open a non-modal context menu at the pointer, clamped to the window.
+    pub fn set_context_menu(&mut self, x: f32, y: f32, labels: &[&str]) {
+        let s = self.scale_factor as f32;
+        let pad = 10.0 * s;
+        let row_h = self.line_px() * 1.35;
+        let max_chars = labels.iter().map(|s| s.chars().count()).max().unwrap_or(1);
+        // One extra cell of slack: `cell_w` is an advance estimate, and the
+        // longest label must not kiss the card edge.
+        let width = ((max_chars as f32 + 1.0) * self.cell_w() + pad * 2.0).max(150.0 * s);
+        let height = labels.len() as f32 * row_h + pad;
+        self.context_x = x.clamp(
+            4.0 * s,
+            (self.surface_config.width as f32 - width - 4.0 * s).max(4.0 * s),
+        );
+        self.context_y = y.clamp(
+            4.0 * s,
+            (self.surface_config.height as f32 - height - 4.0 * s).max(4.0 * s),
+        );
+        self.context_width = width;
+        self.context_rows = labels.len();
+        self.context_hover = None;
+        self.context_active = !labels.is_empty();
+        let text = labels.join("\n");
+        self.context_buffer.set_text(
+            &text,
+            &Attrs::new().family(Family::Monospace),
+            Shaping::Advanced,
+            None,
+        );
+        self.context_buffer
+            .set_size(Some(width - pad * 2.0), Some(height));
+        self.context_buffer
+            .shape_until_scroll(&mut self.font_system, false);
+        self.window.request_redraw();
+    }
+
+    pub fn clear_context_menu(&mut self) {
+        if self.context_active {
+            self.context_active = false;
+            self.context_hover = None;
+            self.window.request_redraw();
+        }
+    }
+
+    pub fn context_menu_active(&self) -> bool {
+        self.context_active
+    }
+
+    pub fn context_menu_row_at(&self, x: f32, y: f32) -> Option<usize> {
+        if !self.context_active {
+            return None;
+        }
+        let s = self.scale_factor as f32;
+        let pad_y = 5.0 * s;
+        let row_h = self.line_px() * 1.35;
+        let height = self.context_rows as f32 * row_h + pad_y * 2.0;
+        if x < self.context_x
+            || x > self.context_x + self.context_width
+            || y < self.context_y
+            || y > self.context_y + height
+        {
+            return None;
+        }
+        let row = ((y - self.context_y - pad_y) / row_h).floor().max(0.0) as usize;
+        (row < self.context_rows).then_some(row)
+    }
+
+    pub fn set_context_menu_hover(&mut self, hover: Option<usize>) -> bool {
+        if self.context_hover == hover {
+            return false;
+        }
+        self.context_hover = hover;
+        true
     }
 
     /// Tab index at physical `(x, y)` in the strip, or `None`.
@@ -1934,6 +2035,9 @@ impl Renderer {
         self.overlay_title.set_wrap(Wrap::None);
         self.overlay_hint = Buffer::new(&mut self.font_system, metrics);
         self.overlay_hint.set_wrap(Wrap::None);
+        self.context_buffer = Buffer::new(&mut self.font_system, metrics);
+        self.context_buffer.set_wrap(Wrap::None);
+        self.context_active = false;
 
         // Force the gutter to re-shape at the new metrics on the next view push.
         self.gutter_text.clear();
@@ -2312,70 +2416,91 @@ impl Renderer {
         // a pass after the dim quad (glyphon renders a renderer's areas in one
         // pass). Areas borrow the overlay buffers; geometry is snapshotted from
         // the immutable accessors first.
-        if self.overlay_active {
-            let ov_left = self.overlay_content_left();
-            let ov_w = self.overlay_content_width();
-            let ov_top = self.overlay_top();
-            let ov_rows_top = self.overlay_rows_top();
-            let right_x = ov_left + ov_w * self.overlay_split_frac;
-            // Hint docks to the bottom of the floating card, not the window.
-            let (_, card_y, _, card_h) = self.overlay_panel_bounds();
-            let hint_y = card_y + card_h - line_px * 1.3;
-            let full = TextBounds {
-                left: 0,
-                top: 0,
-                right: w,
-                bottom: h,
-            };
-            let mut ov_areas: Vec<TextArea> = Vec::with_capacity(5);
-            if self.overlay_has_title {
+        if self.overlay_active || self.context_active {
+            let mut ov_areas: Vec<TextArea> = Vec::with_capacity(6);
+            if self.overlay_active {
+                let ov_left = self.overlay_content_left();
+                let ov_w = self.overlay_content_width();
+                let ov_top = self.overlay_top();
+                let ov_rows_top = self.overlay_rows_top();
+                let right_x = ov_left + ov_w * self.overlay_split_frac;
+                // Hint docks to the bottom of the floating card, not the window.
+                let (_, card_y, _, card_h) = self.overlay_panel_bounds();
+                let hint_y = card_y + card_h - line_px * 1.3;
+                let full = TextBounds {
+                    left: 0,
+                    top: 0,
+                    right: w,
+                    bottom: h,
+                };
+                if self.overlay_has_title {
+                    ov_areas.push(TextArea {
+                        buffer: &self.overlay_title,
+                        left: ov_left,
+                        top: ov_top,
+                        scale: 1.0,
+                        bounds: full,
+                        default_color: OVERLAY_TITLE_COLOR,
+                        custom_glyphs: &[],
+                    });
+                }
+                if self.overlay_has_input {
+                    ov_areas.push(TextArea {
+                        buffer: &self.overlay_input,
+                        left: ov_left,
+                        top: ov_top,
+                        scale: 1.0,
+                        bounds: full,
+                        default_color: OVERLAY_INPUT_COLOR,
+                        custom_glyphs: &[],
+                    });
+                }
                 ov_areas.push(TextArea {
-                    buffer: &self.overlay_title,
+                    buffer: &self.overlay_left,
                     left: ov_left,
-                    top: ov_top,
+                    top: ov_rows_top,
                     scale: 1.0,
                     bounds: full,
-                    default_color: OVERLAY_TITLE_COLOR,
+                    default_color: self.overlay_left_color,
                     custom_glyphs: &[],
                 });
-            }
-            if self.overlay_has_input {
                 ov_areas.push(TextArea {
-                    buffer: &self.overlay_input,
-                    left: ov_left,
-                    top: ov_top,
+                    buffer: &self.overlay_right,
+                    left: right_x,
+                    top: ov_rows_top,
                     scale: 1.0,
                     bounds: full,
-                    default_color: OVERLAY_INPUT_COLOR,
+                    default_color: self.overlay_right_color,
                     custom_glyphs: &[],
                 });
+                if self.overlay_has_hint {
+                    ov_areas.push(TextArea {
+                        buffer: &self.overlay_hint,
+                        left: ov_left,
+                        top: hint_y,
+                        scale: 1.0,
+                        bounds: full,
+                        default_color: OVERLAY_HINT_COLOR,
+                        custom_glyphs: &[],
+                    });
+                }
             }
-            ov_areas.push(TextArea {
-                buffer: &self.overlay_left,
-                left: ov_left,
-                top: ov_rows_top,
-                scale: 1.0,
-                bounds: full,
-                default_color: self.overlay_left_color,
-                custom_glyphs: &[],
-            });
-            ov_areas.push(TextArea {
-                buffer: &self.overlay_right,
-                left: right_x,
-                top: ov_rows_top,
-                scale: 1.0,
-                bounds: full,
-                default_color: self.overlay_right_color,
-                custom_glyphs: &[],
-            });
-            if self.overlay_has_hint {
+            // Pointer context-menu labels ride the overlay renderer so they
+            // composite above the post-text menu card.
+            if self.context_active {
+                let s = self.scale_factor as f32;
                 ov_areas.push(TextArea {
-                    buffer: &self.overlay_hint,
-                    left: ov_left,
-                    top: hint_y,
+                    buffer: &self.context_buffer,
+                    left: self.context_x + 10.0 * s,
+                    top: self.context_y + 5.0 * s,
                     scale: 1.0,
-                    bounds: full,
-                    default_color: OVERLAY_HINT_COLOR,
+                    bounds: TextBounds {
+                        left: self.context_x as i32,
+                        top: self.context_y as i32,
+                        right: (self.context_x + self.context_width) as i32,
+                        bottom: self.surface_config.height as i32,
+                    },
+                    default_color: Color::rgb(226, 219, 205),
                     custom_glyphs: &[],
                 });
             }
@@ -2700,7 +2825,7 @@ impl Renderer {
             let pitch = self.line_px() * SIDEBAR_TAB_PITCH;
             let s = self.scale_factor as f32;
             let gap = SHELL_GAP * s;
-            let hover = self.sidebar_hover;
+            let hover = self.sidebar_hover.filter(|&h| h < self.sidebar_tab_count);
             let active = self.sidebar_active;
             // The sidebar is now an inset floating panel, visibly detached from
             // the window and editor rather than a full-height flat column.
@@ -2953,6 +3078,51 @@ impl Renderer {
                 (SHELL_RADIUS * s - border).max(1.0),
             );
         }
+        // Pointer context menu background + hovered command. These verts are
+        // recorded past `ctx_quad_start` and drawn in a post-text range so the
+        // card occludes document/terminal glyphs beneath it.
+        let ctx_quad_start = sidebar_verts;
+        if self.context_active {
+            let s = self.scale_factor as f32;
+            let pad_y = 5.0 * s;
+            let row_h = self.line_px() * 1.35;
+            let menu_h = self.context_rows as f32 * row_h + pad_y * 2.0;
+            sidebar_verts += push_rquad(
+                &mut self.sidebar_bytes,
+                fw,
+                fh,
+                self.context_x,
+                self.context_y,
+                self.context_width,
+                menu_h,
+                PANEL_BORDER_COLOR,
+                8.0 * s,
+            );
+            sidebar_verts += push_rquad(
+                &mut self.sidebar_bytes,
+                fw,
+                fh,
+                self.context_x + s,
+                self.context_y + s,
+                (self.context_width - 2.0 * s).max(1.0),
+                (menu_h - 2.0 * s).max(1.0),
+                CONTEXT_MENU_COLOR,
+                7.0 * s,
+            );
+            if let Some(row) = self.context_hover {
+                sidebar_verts += push_rquad(
+                    &mut self.sidebar_bytes,
+                    fw,
+                    fh,
+                    self.context_x + 4.0 * s,
+                    self.context_y + pad_y + row as f32 * row_h,
+                    self.context_width - 8.0 * s,
+                    row_h,
+                    CONTEXT_MENU_HOVER_COLOR,
+                    5.0 * s,
+                );
+            }
+        }
         if sidebar_verts > 0 {
             self.queue
                 .write_buffer(&self.sidebar_vbuf, 0, &self.sidebar_bytes);
@@ -3022,11 +3192,12 @@ impl Renderer {
             }
 
             // Sidebar background behind everything on the left strip; the tab
-            // glyphs (in the text pass just below) draw over it.
-            if sidebar_verts > 0 {
+            // glyphs (in the text pass just below) draw over it. Only the
+            // pre-context range: the menu card must sit ABOVE the text.
+            if ctx_quad_start > 0 {
                 pass.set_pipeline(&self.quad_pipeline);
                 pass.set_vertex_buffer(0, self.sidebar_vbuf.slice(..));
-                pass.draw(0..sidebar_verts, 0..1);
+                pass.draw(0..ctx_quad_start, 0..1);
             }
 
             self.text_renderer
@@ -3073,7 +3244,14 @@ impl Renderer {
                 pass.set_vertex_buffer(0, self.quad_vbuf.slice(..));
                 pass.draw(start..start + ov_verts, 0..1);
             }
-            if self.overlay_active {
+            // Pointer context-menu card, composited OVER the document text;
+            // its labels render in the overlay text pass just below.
+            if sidebar_verts > ctx_quad_start {
+                pass.set_pipeline(&self.quad_pipeline);
+                pass.set_vertex_buffer(0, self.sidebar_vbuf.slice(..));
+                pass.draw(ctx_quad_start..sidebar_verts, 0..1);
+            }
+            if self.overlay_active || self.context_active {
                 self.overlay_text_renderer
                     .render(&self.atlas, &self.viewport, &mut pass)
                     .expect("render overlay text");

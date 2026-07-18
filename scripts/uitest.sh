@@ -9,6 +9,7 @@
 #   scripts/uitest.sh type <text>      # type literal text
 #   scripts/uitest.sh click <x> <y>    # left-click at coordinates
 #   scripts/uitest.sh midclick <x> <y> # middle-click at coordinates
+#   scripts/uitest.sh rclick <x> <y>   # right-click at coordinates
 #   scripts/uitest.sh move <x> <y>     # hover (for hover-effect shots)
 #   scripts/uitest.sh stop             # tear everything down
 #
@@ -62,6 +63,10 @@ click)
     ;;
 midclick)
     DISPLAY="$DISPLAY_NO" xdotool mousemove "${2:?x}" "${3:?y}" click 2
+    sleep 0.3
+    ;;
+rclick)
+    DISPLAY="$DISPLAY_NO" xdotool mousemove "${2:?x}" "${3:?y}" click 3
     sleep 0.3
     ;;
 move)

@@ -256,6 +256,11 @@ fn ssh_config_hosts() -> Vec<String> {
 /// What each visible row on the Agents page IS (parallel to the row list),
 /// so clicks and Enter know their target.
 #[derive(Clone, Copy, PartialEq)]
+enum ContextTarget {
+    Document(usize),
+    Terminal,
+}
+
 enum AgentsRow {
     /// Section header / informational — not actionable.
     Header,
@@ -435,6 +440,7 @@ fn main() -> ExitCode {
         term_resizing: false,
         sidebar_resizing: false,
         term_tab_active: false,
+        context_target: None,
         last_click_at: None,
         last_click_pos: None,
         event_proxy,
@@ -640,6 +646,8 @@ struct App {
     sidebar_resizing: bool,
     /// The terminal content-tab is active (terminal fills the content area).
     term_tab_active: bool,
+    /// Target behind the currently open pointer context menu.
+    context_target: Option<ContextTarget>,
     /// Double-click tracking for word-select.
     last_click_at: Option<Instant>,
     last_click_pos: Option<usize>,
@@ -1410,6 +1418,61 @@ impl App {
         self.apply_view(false);
         if let Some(r) = self.renderer.as_ref() {
             r.window().request_redraw();
+        }
+    }
+
+    /// Keep only document `i`, loading it into the live editor fields first.
+    fn close_other_tabs(&mut self, i: usize) {
+        if i >= self.docs.len() {
+            return;
+        }
+        if i != self.active_doc {
+            self.switch_tab(i);
+        }
+        self.stash_active();
+        let keep = std::mem::replace(&mut self.docs[self.active_doc], Document::husk());
+        self.docs.clear();
+        self.docs.push(keep);
+        self.active_doc = 0;
+        self.apply_view(false);
+    }
+
+    fn dismiss_context_menu(&mut self) {
+        self.context_target = None;
+        if let Some(r) = self.renderer.as_mut() {
+            r.clear_context_menu();
+        }
+    }
+
+    fn open_tab_context_menu(&mut self, tab: usize) {
+        if self.view != View::Editor {
+            self.close_overlay();
+        }
+        let x = self.pointer.0 as f32;
+        let y = self.pointer.1 as f32;
+        if tab >= self.docs.len() {
+            self.context_target = Some(ContextTarget::Terminal);
+            if let Some(r) = self.renderer.as_mut() {
+                r.set_context_menu(x, y, &["Close Terminal"]);
+            }
+        } else {
+            self.context_target = Some(ContextTarget::Document(tab));
+            if let Some(r) = self.renderer.as_mut() {
+                r.set_context_menu(x, y, &["Close", "Close Others"]);
+            }
+        }
+    }
+
+    fn activate_context_menu_row(&mut self, row: usize) {
+        let target = self.context_target.take();
+        if let Some(r) = self.renderer.as_mut() {
+            r.clear_context_menu();
+        }
+        match (target, row) {
+            (Some(ContextTarget::Document(i)), 0) => self.close_tab(i),
+            (Some(ContextTarget::Document(i)), 1) => self.close_other_tabs(i),
+            (Some(ContextTarget::Terminal), 0) => self.kill_terminal(),
+            _ => {}
         }
     }
 
@@ -3752,6 +3815,22 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.pointer = (position.x, position.y);
+                // Context menus own hover while open; do not leak hover state
+                // into tabs/editor underneath them.
+                if self
+                    .renderer
+                    .as_ref()
+                    .map(|r| r.context_menu_active())
+                    .unwrap_or(false)
+                {
+                    if let Some(r) = self.renderer.as_mut() {
+                        let row = r.context_menu_row_at(position.x as f32, position.y as f32);
+                        if r.set_context_menu_hover(row) {
+                            r.window().request_redraw();
+                        }
+                    }
+                    return;
+                }
                 // Sidebar separator: dragging resizes; hovering swaps in a
                 // col-resize cursor and lights the line.
                 if self.sidebar_resizing {
@@ -3842,6 +3921,40 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
+                // An open context menu captures the next press. Left-click a
+                // row to activate; any other press dismisses it.
+                if state == ElementState::Pressed
+                    && self
+                        .renderer
+                        .as_ref()
+                        .map(|r| r.context_menu_active())
+                        .unwrap_or(false)
+                {
+                    if button == MouseButton::Left {
+                        let row = self.renderer.as_ref().and_then(|r| {
+                            r.context_menu_row_at(self.pointer.0 as f32, self.pointer.1 as f32)
+                        });
+                        if let Some(row) = row {
+                            self.activate_context_menu_row(row);
+                        } else {
+                            self.dismiss_context_menu();
+                        }
+                    } else {
+                        self.dismiss_context_menu();
+                    }
+                    return;
+                }
+                // Right-click a left-side editor/terminal tab opens its menu.
+                if button == MouseButton::Right && state == ElementState::Pressed {
+                    if let Some(tab) = self.renderer.as_ref().and_then(|r| {
+                        r.sidebar_tab_at(self.pointer.0 as f32, self.pointer.1 as f32)
+                    }) {
+                        self.open_tab_context_menu(tab);
+                    } else {
+                        self.dismiss_context_menu();
+                    }
+                    return;
+                }
                 // Middle-click a file tab (left bar) closes it.
                 if button == MouseButton::Middle && state == ElementState::Pressed {
                     if let Some(i) = self.renderer.as_ref().and_then(|r| {
@@ -4046,6 +4159,17 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state != ElementState::Pressed {
+                    return;
+                }
+                // Keyboard input dismisses a pointer context menu before any
+                // editor, modal, or terminal command is handled.
+                if self
+                    .renderer
+                    .as_ref()
+                    .map(|r| r.context_menu_active())
+                    .unwrap_or(false)
+                {
+                    self.dismiss_context_menu();
                     return;
                 }
                 // P3: terminal focus owns the keyboard exclusively. Ctrl+`
