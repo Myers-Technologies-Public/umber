@@ -56,18 +56,18 @@ const CURSOR_GLYPH: &str = "\u{258f}";
 const GUTTER_GAP: f32 = 12.0;
 
 /// Dim gutter line-number color vs. the 220-grey body text (task spec).
-const GUTTER_COLOR: Color = Color::rgb(105, 105, 120);
+const GUTTER_COLOR: Color = Color::rgb(110, 104, 94);
 
 /// Gutter/document separator rule (straight-alpha RGBA). A subtle grey, dimmer
 /// than the gutter digits, sitting in the gap between the line numbers and the
 /// text. Thickness is `SEPARATOR_W` logical px scaled for HiDPI.
-const SEPARATOR_COLOR: [f32; 4] = [0.32, 0.32, 0.38, 0.55];
+const SEPARATOR_COLOR: [f32; 4] = [0.55, 0.51, 0.45, 0.22];
 const SEPARATOR_W: f32 = 1.0;
 
 /// Hovered-line segment painted over the separator rule at the pointer's line:
 /// warm gold (~rgb(212,175,55)) so the rule always shows which line the pointer
 /// is on. Straight-alpha RGBA; stands out from the grey rule and the rust caret.
-const SEPARATOR_HOVER_COLOR: [f32; 4] = [0.831, 0.686, 0.216, 0.9];
+const SEPARATOR_HOVER_COLOR: [f32; 4] = [0.757, 0.373, 0.235, 0.9];
 
 /// Hovered-word recolor: warm gold (rgb(212,175,55)) drawn over the original
 /// glyphs at the word's grid cells. Reads on the dark bg, stands out from the
@@ -75,77 +75,67 @@ const SEPARATOR_HOVER_COLOR: [f32; 4] = [0.831, 0.686, 0.216, 0.9];
 const HOVER_WORD_COLOR: Color = Color::rgb(212, 175, 55);
 
 /// Ghostty-style overlay scrollbar visuals, logical px (scaled for HiDPI).
-const SCROLLBAR_W: f32 = 10.0; // track/thumb width
+const SCROLLBAR_W: f32 = 7.0; // track/thumb width
 const SCROLLBAR_EDGE: f32 = 16.0; // right-edge hover-activation zone
 const SCROLLBAR_MARGIN: f32 = 2.0; // gap from the window's right edge
 const SCROLLBAR_MIN_THUMB: f32 = 24.0; // floor so the thumb stays grabbable
 
 /// Overlay quad colors (straight-alpha RGBA). Muted grey palette already used
 /// by the banner \u{2014} deliberately NOT the rust cursor accent.
-const TRACK_COLOR: [f32; 4] = [0.55, 0.55, 0.60, 0.10];
-const THUMB_COLOR: [f32; 4] = [0.55, 0.55, 0.60, 0.55];
+const TRACK_COLOR: [f32; 4] = [0.60, 0.56, 0.50, 0.08];
+const THUMB_COLOR: [f32; 4] = [0.60, 0.56, 0.50, 0.45];
 
 /// Selection highlight fill (straight-alpha RGBA). Muted grey-blue, translucent
 /// so the glyphs drawn over it stay legible \u{2014} deliberately NOT the rust
 /// cursor accent.
-const SELECTION_COLOR: [f32; 4] = [0.30, 0.40, 0.58, 0.35];
+const SELECTION_COLOR: [f32; 4] = [0.757, 0.373, 0.235, 0.25];
 
 /// Terminal panel (P3): height fraction of the window, border colors (the
 /// border doubles as the focus cue), cursor cell fill, and grid text color.
 const TERM_SPLIT_FRAC: f32 = 0.35;
-const TERM_BORDER_COLOR: [f32; 4] = [0.32, 0.32, 0.38, 0.8];
-const TERM_BORDER_FOCUS_COLOR: [f32; 4] = [0.902, 0.706, 0.471, 0.9];
-const TERM_CURSOR_COLOR: [f32; 4] = [0.902, 0.706, 0.471, 0.45];
-const TERM_TEXT_COLOR: Color = Color::rgb(210, 210, 215);
+const TERM_BORDER_COLOR: [f32; 4] = [0.35, 0.32, 0.28, 0.7];
+const TERM_BORDER_FOCUS_COLOR: [f32; 4] = [0.757, 0.373, 0.235, 0.95];
+const TERM_CURSOR_COLOR: [f32; 4] = [0.757, 0.373, 0.235, 0.45];
+const TERM_TEXT_COLOR: Color = Color::rgb(220, 214, 201);
 
 /// Left activity/tab bar (P5 QoL). Width in logical px; vertical tab glyphs
 /// give a mouse backup for the palette/search/agents/terminal/settings views.
 const SIDEBAR_W: f32 = 40.0;
-const SIDEBAR_BG_COLOR: [f32; 4] = [0.098, 0.098, 0.120, 1.0];
-/// Banner (top status row) background — same chrome family as the sidebar so
-/// the editor canvas reads as the darkest, focused surface.
-const BANNER_BG_COLOR: [f32; 4] = [0.098, 0.098, 0.120, 1.0];
 /// Wordmark in the sidebar corner block (Crail rust).
-const WORDMARK_COLOR: Color = Color::rgb(230, 180, 120);
-/// Current-line highlight behind the cursor's line (modern-editor cue).
-const CURRENT_LINE_COLOR: [f32; 4] = [0.55, 0.55, 0.65, 0.06];
+const WORDMARK_COLOR: Color = Color::rgb(193, 95, 60);
+/// Current-line highlight behind the cursor's line — a faint warm wash.
+const CURRENT_LINE_COLOR: [f32; 4] = [0.95, 0.90, 0.80, 0.045];
 /// Per-tab vertical pitch as a multiple of the line height.
 const SIDEBAR_TAB_PITCH: f32 = 1.4;
 /// Expanded activity-bar width (icons + text labels).
 const SIDEBAR_W_EXPANDED: f32 = 168.0;
 /// Tab labels shown when expanded (aligned to the glyph rows).
 const SIDEBAR_LABELS: &str = "Palette\nFind\nAgents\nTerminal\nSettings";
-const SIDEBAR_HOVER_COLOR: [f32; 4] = [0.55, 0.55, 0.62, 0.10];
-/// 1px seam lines separating chrome regions (sidebar | content, banner /
-/// strip / document).
-const SEAM_COLOR: [f32; 4] = [0.28, 0.28, 0.34, 0.75];
+const SIDEBAR_HOVER_COLOR: [f32; 4] = [1.0, 1.0, 0.96, 0.045];
 /// Left accent bar marking the active tab (Crail rust).
-const SIDEBAR_ACTIVE_COLOR: [f32; 4] = [0.902, 0.706, 0.471, 0.95];
-/// Faint full-row tint behind the active tab so the whole item reads as
-/// selected (not just the edge bar).
-const SIDEBAR_ACTIVE_BG_COLOR: [f32; 4] = [0.902, 0.706, 0.471, 0.16];
-const SIDEBAR_LABEL_COLOR: Color = Color::rgb(198, 198, 212);
+const SIDEBAR_ACTIVE_COLOR: [f32; 4] = [0.757, 0.373, 0.235, 1.0];
+const SIDEBAR_LABEL_COLOR: Color = Color::rgb(168, 161, 148);
 
 /// Open-document tab strip (below the banner). Height multiple of line, bg,
 /// active-tab tint, and text color.
 const TABSTRIP_H_MULT: f32 = 1.3;
-const TABSTRIP_BG_COLOR: [f32; 4] = [0.10, 0.10, 0.125, 1.0];
-const TABSTRIP_ACTIVE_COLOR: [f32; 4] = [0.902, 0.706, 0.471, 0.22];
-const TABSTRIP_TEXT_COLOR: Color = Color::rgb(205, 205, 218);
+/// Active action underline (Crail rust) — minimalist alternative to a tint.
+const TABSTRIP_ACTIVE_COLOR: [f32; 4] = [0.757, 0.373, 0.235, 0.9];
+const TABSTRIP_TEXT_COLOR: Color = Color::rgb(168, 161, 148);
 
 /// Modal overlay palette (command palette / settings / modules). All
 /// straight-alpha RGBA. The dim quad darkens the still-visible editor behind
 /// the modal; the box sits behind the palette input; the highlight marks the
 /// selected row (subtle grey-blue, not the rust accent).
-const OVERLAY_DIM_COLOR: [f32; 4] = [0.03, 0.03, 0.04, 0.72];
+const OVERLAY_DIM_COLOR: [f32; 4] = [0.030, 0.027, 0.024, 0.72];
 const OVERLAY_BOX_COLOR: [f32; 4] = [0.15, 0.15, 0.18, 0.92];
-const OVERLAY_HL_COLOR: [f32; 4] = [0.30, 0.40, 0.58, 0.42];
+const OVERLAY_HL_COLOR: [f32; 4] = [0.757, 0.373, 0.235, 0.30];
 /// Opaque panel behind overlay page content — without it the page text sits
 /// directly on the dimmed editor and is hard to read (user-reported).
-const OVERLAY_PANEL_COLOR: [f32; 4] = [0.10, 0.10, 0.125, 0.97];
+const OVERLAY_PANEL_COLOR: [f32; 4] = [0.105, 0.096, 0.086, 0.98];
 /// Terminal panel background: a shade darker than the editor clear color so
 /// the panel reads as a distinct surface.
-const TERM_BG_COLOR: [f32; 4] = [0.042, 0.042, 0.052, 1.0];
+const TERM_BG_COLOR: [f32; 4] = [0.045, 0.041, 0.037, 1.0];
 
 /// Overlay text colors. Title uses the Crail rust accent (Claude Code
 /// palette); input is bright; hint is dim. Row column colors are supplied
@@ -1812,7 +1802,7 @@ impl Renderer {
                 right: w,
                 bottom: h,
             },
-            default_color: Color::rgb(150, 150, 165),
+            default_color: Color::rgb(148, 141, 128),
             custom_glyphs: &[],
         });
         if !self.tab_layout.is_empty() {
@@ -1859,7 +1849,7 @@ impl Renderer {
                 right: w,
                 bottom: h,
             },
-            default_color: Color::rgb(220, 220, 220),
+            default_color: Color::rgb(232, 226, 213),
             custom_glyphs: &[],
         });
         // Terminal panel grid (P3), clipped to the panel region below the
@@ -1921,7 +1911,7 @@ impl Renderer {
                         bottom: h,
                     },
                     // Crail rust accent (Claude Code palette).
-                    default_color: Color::rgb(230, 180, 120),
+                    default_color: Color::rgb(216, 110, 72),
                     custom_glyphs: &[],
                 });
             }
@@ -2322,16 +2312,7 @@ impl Renderer {
             let s = self.scale_factor as f32;
             let hover = self.sidebar_hover;
             let active = self.sidebar_active;
-            sidebar_verts += push_quad(
-                &mut self.sidebar_bytes,
-                fw,
-                fh,
-                0.0,
-                0.0,
-                sw,
-                fh,
-                SIDEBAR_BG_COLOR,
-            );
+            let _ = sw;
             if let Some(hrow) = hover {
                 sidebar_verts += push_quad(
                     &mut self.sidebar_bytes,
@@ -2346,16 +2327,6 @@ impl Renderer {
             }
             if let Some(arow) = active {
                 let ay = sb_top + arow as f32 * pitch;
-                sidebar_verts += push_quad(
-                    &mut self.sidebar_bytes,
-                    fw,
-                    fh,
-                    0.0,
-                    ay,
-                    sw,
-                    pitch,
-                    SIDEBAR_ACTIVE_BG_COLOR,
-                );
                 sidebar_verts += push_quad(
                     &mut self.sidebar_bytes,
                     fw,
@@ -2381,74 +2352,23 @@ impl Renderer {
                 .get(self.tab_active)
                 .copied()
                 .unwrap_or((0, 0));
-            sidebar_verts += push_quad(
-                &mut self.sidebar_bytes,
-                fw,
-                fh,
-                le,
-                ts_top,
-                (fw - le).max(0.0),
-                ts_h,
-                TABSTRIP_BG_COLOR,
-            );
+            // Active action: a thin rust underline beneath the label
+            // (minimalist — no tint blocks, no bands).
             if aend > astart {
                 let ax = origin + astart as f32 * cw;
                 let aw = (aend - astart) as f32 * cw;
+                let uh = (2.0 * self.scale_factor as f32).max(2.0);
                 sidebar_verts += push_quad(
                     &mut self.sidebar_bytes,
                     fw,
                     fh,
-                    ax - cw * 0.5,
-                    ts_top,
-                    aw + cw,
-                    ts_h,
+                    ax,
+                    ts_top + ts_h - uh,
+                    aw,
+                    uh,
                     TABSTRIP_ACTIVE_COLOR,
                 );
             }
-        }
-        // Banner background: full-width chrome band above the activity strip.
-        {
-            let sw_edge = self.sidebar_w();
-            let ts_top = self.tabstrip_top();
-            sidebar_verts += push_quad(
-                &mut self.sidebar_bytes,
-                fw,
-                fh,
-                sw_edge,
-                0.0,
-                (fw - sw_edge).max(0.0),
-                ts_top,
-                BANNER_BG_COLOR,
-            );
-        }
-        // Seam lines: sidebar|content vertical, and horizontal under the
-        // activity strip — subtle 1px region separators.
-        {
-            let s = (1.0 * self.scale_factor as f32).max(1.0);
-            let sw_edge = self.sidebar_w();
-            if sw_edge > 0.0 {
-                sidebar_verts += push_quad(
-                    &mut self.sidebar_bytes,
-                    fw,
-                    fh,
-                    sw_edge - s,
-                    0.0,
-                    s,
-                    fh,
-                    SEAM_COLOR,
-                );
-            }
-            let seam_y = self.doc_top() - s;
-            sidebar_verts += push_quad(
-                &mut self.sidebar_bytes,
-                fw,
-                fh,
-                sw_edge,
-                seam_y,
-                (fw - sw_edge).max(0.0),
-                s,
-                SEAM_COLOR,
-            );
         }
         // Terminal panel background — BEHIND the text pass so the grid
         // glyphs render on top of it.
@@ -2509,9 +2429,11 @@ impl Renderer {
                     ops: Operations {
                         // Umber-dark background (D5 minimalist chrome).
                         load: LoadOp::Clear(wgpu::Color {
-                            r: 0.048,
-                            g: 0.048,
-                            b: 0.058,
+                            // Warm near-black canvas — umber is an earth
+                            // pigment; the palette follows.
+                            r: 0.055,
+                            g: 0.050,
+                            b: 0.044,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
