@@ -128,7 +128,7 @@ const TABSTRIP_TEXT_COLOR: Color = Color::rgb(168, 161, 148);
 /// the modal; the box sits behind the palette input; the highlight marks the
 /// selected row (subtle grey-blue, not the rust accent).
 const OVERLAY_DIM_COLOR: [f32; 4] = [0.030, 0.027, 0.024, 0.72];
-const OVERLAY_BOX_COLOR: [f32; 4] = [0.15, 0.15, 0.18, 0.92];
+const OVERLAY_BOX_COLOR: [f32; 4] = [0.150, 0.138, 0.122, 0.95];
 const OVERLAY_HL_COLOR: [f32; 4] = [0.757, 0.373, 0.235, 0.30];
 /// Opaque panel behind overlay page content — without it the page text sits
 /// directly on the dimmed editor and is hard to read (user-reported).
@@ -517,6 +517,8 @@ pub struct Renderer {
     tabstrip_text: String,
     tab_layout: Vec<(usize, usize)>,
     tab_active: usize,
+    /// Action under the pointer in the top strip (hover wash).
+    tabstrip_hover: Option<usize>,
 
     /// The last document window text, kept so a scale change can re-shape it
     /// without the caller re-supplying it.
@@ -801,6 +803,7 @@ impl Renderer {
             tabstrip_text: String::new(),
             tab_layout: Vec::new(),
             tab_active: 0,
+            tabstrip_hover: None,
             doc_text: String::new(),
             stats_prefix: String::new(),
             banner_dirty: true,
@@ -1028,6 +1031,30 @@ impl Renderer {
             self.tabstrip_buffer
                 .shape_until_scroll(&mut self.font_system, false);
         }
+    }
+
+    /// Set the hovered top-strip action; returns true when it changed (the
+    /// caller redraws only then).
+    pub fn set_tabstrip_hover(&mut self, hover: Option<usize>) -> bool {
+        if self.tabstrip_hover == hover {
+            return false;
+        }
+        self.tabstrip_hover = hover;
+        true
+    }
+
+    /// Screen rect `(x, y, w, h)` of the overlay content panel (matches the
+    /// panel quad drawn in `render`), for outside-click detection.
+    pub fn overlay_panel_bounds(&self) -> (f32, f32, f32, f32) {
+        let fw = self.surface_config.width as f32;
+        let fh = self.surface_config.height as f32;
+        let pad = self.pad_px();
+        let line_px = self.line_px();
+        let px = (self.overlay_content_left() - pad * 1.5).max(0.0);
+        let py = (self.overlay_top() - line_px * 0.5).max(0.0);
+        let pw = (self.overlay_content_width() + pad * 3.0).min(fw - px);
+        let ph = (fh - py - pad).max(0.0);
+        (px, py, pw, ph)
     }
 
     /// Tab index at physical `(x, y)` in the strip, or `None`.
@@ -2352,6 +2379,25 @@ impl Renderer {
                 .get(self.tab_active)
                 .copied()
                 .unwrap_or((0, 0));
+            // Hovered action: a faint wash behind the label.
+            if let Some(hrow) = self.tabstrip_hover {
+                if let Some(&(hs, he)) = self.tab_layout.get(hrow) {
+                    if he > hs {
+                        let hx = origin + hs as f32 * cw;
+                        let hw = (he - hs) as f32 * cw;
+                        sidebar_verts += push_quad(
+                            &mut self.sidebar_bytes,
+                            fw,
+                            fh,
+                            hx - cw * 0.5,
+                            ts_top,
+                            hw + cw,
+                            ts_h,
+                            SIDEBAR_HOVER_COLOR,
+                        );
+                    }
+                }
+            }
             // Active action: a thin rust underline beneath the label
             // (minimalist — no tint blocks, no bands).
             if aend > astart {

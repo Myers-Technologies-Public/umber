@@ -251,6 +251,17 @@ fn ssh_config_hosts() -> Vec<String> {
     }
 }
 
+/// First visible row of a windowed overlay list for a given selection (the
+/// selection is kept at the window's bottom edge once the list scrolls).
+fn windowed_start(sel: usize, n: usize, cap: usize) -> usize {
+    let sel = if n == 0 { 0 } else { sel.min(n - 1) };
+    if sel < cap {
+        0
+    } else {
+        sel + 1 - cap
+    }
+}
+
 /// Human ON/OFF label for a boolean setting/feature.
 fn onoff(v: bool) -> String {
     if v {
@@ -372,6 +383,8 @@ fn main() -> ExitCode {
         term_focused: false,
         term_resizing: false,
         term_tab_active: false,
+        last_click_at: None,
+        last_click_pos: None,
         event_proxy,
         start,
         first_frame: false,
@@ -567,6 +580,9 @@ struct App {
     term_resizing: bool,
     /// The terminal content-tab is active (terminal fills the content area).
     term_tab_active: bool,
+    /// Double-click tracking for word-select.
+    last_click_at: Option<Instant>,
+    last_click_pos: Option<usize>,
     /// Proxy for background threads to wake the event loop.
     event_proxy: EventLoopProxy<UserEvent>,
 
@@ -2114,6 +2130,122 @@ impl App {
         rows
     }
 
+    /// Connect the SSH picker's selected (or typed) host in the terminal tab.
+    fn ssh_connect_selected(&mut self) {
+        let host = self
+            .ssh_filtered
+            .get(self.ssh_sel)
+            .map(|&i| self.ssh_hosts[i].clone())
+            .or_else(|| {
+                let t = self.ssh_input.trim().to_string();
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t)
+                }
+            });
+        self.view = View::Editor;
+        self.close_overlay();
+        if let Some(host) = host {
+            self.open_terminal_session(Some(("ssh".to_string(), vec![host])));
+        }
+    }
+
+    /// Hovering an overlay row moves the selection (click activates). Applied
+    /// only while the list window is unscrolled — hover-selecting inside a
+    /// scrolled window would shift the window under the pointer.
+    fn overlay_hover_row(&mut self, row: usize) {
+        let cap = self
+            .renderer
+            .as_ref()
+            .map(|r| r.overlay_row_capacity())
+            .unwrap_or(1);
+        match self.view {
+            View::Palette => {
+                let n = self.palette_filtered.len();
+                if windowed_start(self.palette_sel, n, cap) == 0
+                    && row < n
+                    && self.palette_sel != row
+                {
+                    self.palette_sel = row;
+                    self.refresh_overlay();
+                }
+            }
+            View::Settings => {
+                let r2 = row.min(SETTINGS_ROWS - 1);
+                if self.settings_sel != r2 {
+                    self.settings_sel = r2;
+                    self.refresh_overlay();
+                }
+            }
+            View::Modules => {
+                let n = self.features.features().len() + self.modules.len();
+                if n > 0 {
+                    let idx = row.min(n - 1);
+                    if self.modules_sel != idx {
+                        self.modules_sel = idx;
+                        self.refresh_overlay();
+                    }
+                }
+            }
+            View::Search => {
+                let n = self.search_results.len();
+                if windowed_start(self.search_sel, n, cap) == 0 && row < n && self.search_sel != row
+                {
+                    self.search_sel = row;
+                    self.refresh_overlay();
+                }
+            }
+            View::SshPicker => {
+                let n = self.ssh_filtered.len();
+                if windowed_start(self.ssh_sel, n, cap) == 0 && row < n && self.ssh_sel != row {
+                    self.ssh_sel = row;
+                    self.refresh_overlay();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Wheel scrolling on overlay pages: bump the selection / scroll offset.
+    fn overlay_scroll(&mut self, steps: i64) {
+        let mag = steps.unsigned_abs() as usize;
+        let down = steps > 0;
+        fn bump(sel: usize, n: usize, down: bool, mag: usize) -> usize {
+            if n == 0 {
+                0
+            } else if down {
+                (sel + mag).min(n - 1)
+            } else {
+                sel.saturating_sub(mag)
+            }
+        }
+        match self.view {
+            View::Palette => {
+                self.palette_sel = bump(self.palette_sel, self.palette_filtered.len(), down, mag)
+            }
+            View::Search => {
+                self.search_sel = bump(self.search_sel, self.search_results.len(), down, mag)
+            }
+            View::SshPicker => {
+                self.ssh_sel = bump(self.ssh_sel, self.ssh_filtered.len(), down, mag)
+            }
+            View::Settings => self.settings_sel = bump(self.settings_sel, SETTINGS_ROWS, down, mag),
+            View::Modules => {
+                let n = self.features.features().len() + self.modules.len();
+                self.modules_sel = bump(self.modules_sel, n, down, mag)
+            }
+            View::Help => {
+                self.help_scroll = bump(self.help_scroll, self.palette_items.len(), down, mag)
+            }
+            View::Agents => {
+                self.agents_scroll = bump(self.agents_scroll, self.agents_sessions.len(), down, mag)
+            }
+            _ => return,
+        }
+        self.refresh_overlay();
+    }
+
     fn open_help(&mut self) {
         self.view = View::Help;
         self.help_scroll = 0;
@@ -2208,26 +2340,7 @@ impl App {
     fn ssh_key(&mut self, event: KeyEvent) {
         match &event.logical_key {
             Key::Named(NamedKey::Escape) => self.close_overlay(),
-            Key::Named(NamedKey::Enter) => {
-                // Selected host wins; otherwise connect to the typed text.
-                let host = self
-                    .ssh_filtered
-                    .get(self.ssh_sel)
-                    .map(|&i| self.ssh_hosts[i].clone())
-                    .or_else(|| {
-                        let t = self.ssh_input.trim().to_string();
-                        if t.is_empty() {
-                            None
-                        } else {
-                            Some(t)
-                        }
-                    });
-                self.view = View::Editor;
-                self.close_overlay();
-                if let Some(host) = host {
-                    self.open_terminal_session(Some(("ssh".to_string(), vec![host])));
-                }
-            }
+            Key::Named(NamedKey::Enter) => self.ssh_connect_selected(),
             Key::Named(NamedKey::ArrowDown) => {
                 let n = self.ssh_filtered.len();
                 if n > 0 {
@@ -2772,6 +2885,23 @@ impl App {
                     self.open_search_result();
                 }
             }
+            View::SshPicker => {
+                let cap = self
+                    .renderer
+                    .as_ref()
+                    .map(|r| r.overlay_row_capacity())
+                    .unwrap_or(1);
+                let n = self.ssh_filtered.len();
+                let abs = windowed_start(self.ssh_sel, n, cap) + row;
+                if abs < n {
+                    if self.ssh_sel == abs {
+                        self.ssh_connect_selected();
+                    } else {
+                        self.ssh_sel = abs;
+                        self.refresh_overlay();
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -3240,7 +3370,15 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
+                // Overlay pages: the wheel moves the selection / scroll.
                 if self.view != View::Editor {
+                    let steps = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => -y as i64,
+                        MouseScrollDelta::PixelDelta(p) => (-p.y / BASE_LINE_PX) as i64,
+                    };
+                    if steps != 0 {
+                        self.overlay_scroll(steps);
+                    }
                     return;
                 }
                 // Scroll is a P0 exit-criterion path (100 MB fixture), so it
@@ -3281,6 +3419,24 @@ impl ApplicationHandler<UserEvent> for App {
                     if r.set_sidebar_hover(tab) {
                         r.window().request_redraw();
                     }
+                }
+                // Top-strip action hover (any view; redraw only on change).
+                if let Some(r) = self.renderer.as_mut() {
+                    let tab = r.tabstrip_at(position.x as f32, position.y as f32);
+                    if r.set_tabstrip_hover(tab) {
+                        r.window().request_redraw();
+                    }
+                }
+                // Overlay pages: hovering a row moves the selection.
+                if self.view != View::Editor {
+                    if let Some(row) = self
+                        .renderer
+                        .as_ref()
+                        .and_then(|r| r.overlay_row_at(position.y as f32))
+                    {
+                        self.overlay_hover_row(row);
+                    }
+                    return;
                 }
                 if self.term_resizing {
                     self.terminal_resize_to(position.y);
@@ -3370,11 +3526,21 @@ impl ApplicationHandler<UserEvent> for App {
                         return;
                     }
                 }
-                // Overlay pages: a left click selects a list row, and clicking
-                // the already-selected row activates it (toggle / open) — the
-                // mouse backup for keyboard nav the user asked for.
+                // Overlay pages: click outside the panel closes; a click on a
+                // row selects it, and clicking the already-selected row
+                // activates it (toggle / open / run).
                 if self.view != View::Editor {
                     if state == ElementState::Pressed {
+                        if let Some((px, py, pw, ph)) =
+                            self.renderer.as_ref().map(|r| r.overlay_panel_bounds())
+                        {
+                            let mx = self.pointer.0 as f32;
+                            let my = self.pointer.1 as f32;
+                            if mx < px || mx > px + pw || my < py || my > py + ph {
+                                self.close_overlay();
+                                return;
+                            }
+                        }
                         if let Some(row) = self
                             .renderer
                             .as_ref()
@@ -3449,6 +3615,35 @@ impl ApplicationHandler<UserEvent> for App {
                         // plain press collapses (anchor == caret) and arms a drag.
                         // Marked in the D4 ring like a keystroke.
                         if let Some(pos) = self.pointer_to_char() {
+                            // Double-click selects the word under the pointer.
+                            let now2 = Instant::now();
+                            let double = self
+                                .last_click_at
+                                .map(|t0| now2.duration_since(t0) < Duration::from_millis(400))
+                                .unwrap_or(false)
+                                && self.last_click_pos == Some(pos);
+                            self.last_click_at = Some(now2);
+                            self.last_click_pos = Some(pos);
+                            if double {
+                                let line = self.buffer.char_to_line(pos);
+                                let ls = self.buffer.line_to_char(line);
+                                let text = self.buffer.visible_text(line, 1);
+                                let col = pos - ls;
+                                if let Some((ws, we)) =
+                                    word_span_at(text.lines().next().unwrap_or(""), col)
+                                {
+                                    self.buffer.break_coalescing();
+                                    self.selection_anchor = Some(ls + ws);
+                                    self.cursor_char = ls + we;
+                                    self.update_goal_col();
+                                    self.selecting = false;
+                                    self.apply_view(true);
+                                    if let Some(r) = self.renderer.as_ref() {
+                                        r.window().request_redraw();
+                                    }
+                                    return;
+                                }
+                            }
                             let shift = self.modifiers.shift_key();
                             self.buffer.break_coalescing();
                             if shift {
