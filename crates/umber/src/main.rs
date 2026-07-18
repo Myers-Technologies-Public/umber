@@ -456,6 +456,7 @@ fn main() -> ExitCode {
         next_pane_term: 1,
         pane_drag: None,
         pane_div_hot: None,
+        tab_drag: None,
         context_target: None,
         last_click_at: None,
         last_click_pos: None,
@@ -671,6 +672,8 @@ struct App {
     pane_drag: Option<(u32, bool)>,
     /// Divider hover state, so the resize cursor sets/resets on change.
     pane_div_hot: Option<bool>,
+    /// Drag-a-tab-to-dock: (doc index, press pos, past slop, drop zone).
+    tab_drag: Option<(usize, (f64, f64), bool, Option<(u64, SplitDir, bool)>)>,
     /// Target behind the currently open pointer context menu.
     context_target: Option<ContextTarget>,
     /// Double-click tracking for word-select.
@@ -1420,6 +1423,12 @@ impl App {
         self.remote_file = self.docs[new].remote_file.take();
         self.docs.remove(i);
         self.active_doc = if new > i { new - 1 } else { new };
+        for dead in self.pane_tree.remap_docs_after_close(i) {
+            self.pane_tree.close(dead);
+        }
+        if !self.pane_tree.is_single() {
+            self.sync_panes();
+        }
         self.selecting = false;
         self.apply_view(true);
         if let Some(r) = self.renderer.as_ref() {
@@ -1440,6 +1449,12 @@ impl App {
         if i < self.active_doc {
             self.active_doc -= 1;
         }
+        for dead in self.pane_tree.remap_docs_after_close(i) {
+            self.pane_tree.close(dead);
+        }
+        if !self.pane_tree.is_single() {
+            self.sync_panes();
+        }
         self.apply_view(false);
         if let Some(r) = self.renderer.as_ref() {
             r.window().request_redraw();
@@ -1459,6 +1474,19 @@ impl App {
         self.docs.clear();
         self.docs.push(keep);
         self.active_doc = 0;
+        // Every other doc is gone: their tiles go with them.
+        let doc_tiles: Vec<u64> = self
+            .pane_tree
+            .layout()
+            .iter()
+            .filter_map(|p| matches!(p.content, PaneContent::Doc(_)).then_some(p.id))
+            .collect();
+        for id in doc_tiles {
+            self.pane_tree.close(id);
+        }
+        if !self.pane_tree.is_single() {
+            self.sync_panes();
+        }
         self.apply_view(false);
     }
 
@@ -3066,7 +3094,7 @@ impl App {
         }
         match self.pane_tree.focused_content() {
             PaneContent::Terminal(id) => Some(id),
-            PaneContent::Editor => None,
+            PaneContent::Editor | PaneContent::Doc(_) => None,
         }
     }
 
@@ -3083,17 +3111,18 @@ impl App {
         let mut grids: Vec<(u64, usize, usize, u16, u16)> = Vec::new();
         if let Some(r) = self.renderer.as_mut() {
             if self.pane_tree.is_single() {
-                r.set_panes(None, &[], &[]);
+                r.set_panes(None, &[], &[], &[]);
             } else {
                 let mut editor = None;
                 let mut terms = Vec::new();
+                let mut doc_tiles = Vec::new();
                 for p in &self.pane_tree.layout() {
                     let rect = [p.rect.x, p.rect.y, p.rect.w, p.rect.h];
+                    let focused = self.pane_tree.focused == p.id;
                     match p.content {
-                        PaneContent::Editor => editor = Some(rect),
-                        PaneContent::Terminal(tid) => {
-                            terms.push((tid, rect, self.pane_tree.focused == p.id))
-                        }
+                        PaneContent::Editor => editor = Some((rect, focused)),
+                        PaneContent::Terminal(tid) => terms.push((tid, rect, focused)),
+                        PaneContent::Doc(_) => doc_tiles.push((p.id, rect, focused)),
                     }
                 }
                 let divs: Vec<PaneDividerSpec> = self
@@ -3109,7 +3138,7 @@ impl App {
                         h: d.rect.h,
                     })
                     .collect();
-                r.set_panes(editor, &terms, &divs);
+                r.set_panes(editor, &terms, &doc_tiles, &divs);
             }
             let (cw, ch) = r.cell_px();
             for (tid, _) in &self.pane_terms {
@@ -3202,6 +3231,43 @@ impl App {
         }
         self.term_focused = self.focused_pane_term_id().is_some();
         self.sync_panes();
+    }
+
+    /// Reshape one document tile's visible window (bounded by the tile's
+    /// rows, so refreshes stay off the keystroke-latency path).
+    fn refresh_doc_pane(&mut self, pane_id: u64, doc_idx: usize) {
+        let Some(rows) = self
+            .renderer
+            .as_ref()
+            .and_then(|r| r.doc_pane_rows(pane_id))
+        else {
+            return;
+        };
+        let (text, ext) = {
+            let (buffer, first) = if doc_idx == self.active_doc {
+                (&self.buffer, self.first_visible_line)
+            } else if let Some(d) = self.docs.get(doc_idx) {
+                (&d.buffer, d.first_visible_line)
+            } else {
+                return;
+            };
+            let total = buffer.len_lines().max(1);
+            let a = first.min(total - 1);
+            let b = (a + rows + 1).min(total);
+            let start = buffer.line_to_char(a);
+            let end = if b >= total {
+                buffer.len_chars()
+            } else {
+                buffer.line_to_char(b)
+            };
+            let ext = buffer
+                .path()
+                .and_then(|p| p.extension().map(|e| e.to_string_lossy().into_owned()));
+            (buffer.slice_chars(start, end), ext)
+        };
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_doc_pane_content(pane_id, &text, ext.as_deref());
+        }
     }
 
     /// Return keyboard focus to the editor tile.
@@ -3406,6 +3472,21 @@ impl App {
         };
         if let Some(r) = self.renderer.as_mut() {
             r.set_sidebar_tabs(&labels, active);
+        }
+        // Document tiles track their docs (cached: unchanged windows free).
+        if !self.pane_tree.is_single() {
+            let tiles: Vec<(u64, usize)> = self
+                .pane_tree
+                .layout()
+                .iter()
+                .filter_map(|p| match p.content {
+                    PaneContent::Doc(i) => Some((p.id, i)),
+                    _ => None,
+                })
+                .collect();
+            for (pid, i) in tiles {
+                self.refresh_doc_pane(pid, i);
+            }
         }
         self.sync_activity_strip();
     }
@@ -4133,6 +4214,64 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     return;
                 }
+                // Dragging a sidebar tab toward the panel: edge-zone preview,
+                // dock on release.
+                if let Some(mut drag) = self.tab_drag.take() {
+                    let (dx, dy) = (position.x - drag.1 .0, position.y - drag.1 .1);
+                    if !drag.2 && (dx * dx + dy * dy) > 64.0 {
+                        drag.2 = true;
+                    }
+                    if drag.2 {
+                        drag.3 = None;
+                        let mut preview = None;
+                        if let Some(r) = self.renderer.as_ref() {
+                            if let Some((fx, fy)) =
+                                r.content_frac_at(position.x as f32, position.y as f32)
+                            {
+                                if let Some(p) = self.pane_tree.layout().into_iter().find(|p| {
+                                    let rc = p.rect;
+                                    fx >= rc.x && fx < rc.x + rc.w && fy >= rc.y && fy < rc.y + rc.h
+                                }) {
+                                    let rx = ((fx - p.rect.x) / p.rect.w.max(1e-6)).clamp(0.0, 1.0);
+                                    let ry = ((fy - p.rect.y) / p.rect.h.max(1e-6)).clamp(0.0, 1.0);
+                                    // Nearest edge wins; corners resolve to
+                                    // the closer edge.
+                                    let dists = [rx, 1.0 - rx, ry, 1.0 - ry];
+                                    let mut k = 0;
+                                    for (i, d) in dists.iter().enumerate() {
+                                        if *d < dists[k] {
+                                            k = i;
+                                        }
+                                    }
+                                    let (dir, before) = match k {
+                                        0 => (SplitDir::Horizontal, true),
+                                        1 => (SplitDir::Horizontal, false),
+                                        2 => (SplitDir::Vertical, true),
+                                        _ => (SplitDir::Vertical, false),
+                                    };
+                                    drag.3 = Some((p.id, dir, before));
+                                    let (cx, cy, cw, ch) = r.content_area();
+                                    let (px, py, pw, ph) = (
+                                        cx + p.rect.x * cw,
+                                        cy + p.rect.y * ch,
+                                        p.rect.w * cw,
+                                        p.rect.h * ch,
+                                    );
+                                    preview = Some(match k {
+                                        0 => (px, py, pw * 0.5, ph),
+                                        1 => (px + pw * 0.5, py, pw * 0.5, ph),
+                                        2 => (px, py, pw, ph * 0.5),
+                                        _ => (px, py + ph * 0.5, pw, ph * 0.5),
+                                    });
+                                }
+                            }
+                        }
+                        if let Some(r) = self.renderer.as_mut() {
+                            r.set_drop_preview(preview);
+                        }
+                    }
+                    self.tab_drag = Some(drag);
+                }
                 // Dragging a pane divider retiles live.
                 if let Some((path, horiz)) = self.pane_drag {
                     let pos = self.renderer.as_ref().map(|r| {
@@ -4312,6 +4451,7 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             let (pid, closable) = match self.pane_tree.pane_at(fx, fy) {
                                 Some((pid, PaneContent::Terminal(_))) => (pid, true),
+                                Some((pid, PaneContent::Doc(_))) => (pid, true),
                                 Some((pid, PaneContent::Editor)) => (pid, false),
                                 None => (self.pane_tree.focused, false),
                             };
@@ -4345,6 +4485,22 @@ impl ApplicationHandler<UserEvent> for App {
                     // End separator / divider drags no matter which view is up.
                     self.sidebar_resizing = false;
                     self.pane_drag = None;
+                    // Drop a dragged tab: dock it as a document tile.
+                    if let Some((doc_idx, _, past_slop, zone)) = self.tab_drag.take() {
+                        if let Some(r) = self.renderer.as_mut() {
+                            r.set_drop_preview(None);
+                        }
+                        if past_slop {
+                            if let Some((pid, dir, before)) = zone {
+                                if doc_idx < self.docs.len() && self.pane_tree.contains(pid) {
+                                    self.pane_tree.focused = pid;
+                                    self.pane_tree.split(dir, PaneContent::Doc(doc_idx), before);
+                                    self.term_focused = false;
+                                    self.sync_panes();
+                                }
+                            }
+                        }
+                    }
                 }
                 if state == ElementState::Pressed {
                     // Grab the sidebar separator to resize it.
@@ -4375,11 +4531,37 @@ impl ApplicationHandler<UserEvent> for App {
                             r.content_frac_at(self.pointer.0 as f32, self.pointer.1 as f32)
                         }) {
                             self.pane_tree.focus_at(fx, fy);
-                            let is_term = self.focused_pane_term_id().is_some();
-                            self.term_focused = is_term;
-                            self.sync_panes();
-                            if is_term {
-                                return;
+                            match self.pane_tree.focused_content() {
+                                PaneContent::Terminal(_) => {
+                                    self.term_focused = true;
+                                    self.sync_panes();
+                                    return;
+                                }
+                                PaneContent::Doc(j) => {
+                                    // Live-editor swap: the clicked tile
+                                    // becomes the editor; the editor tile
+                                    // takes over this tile's document.
+                                    self.term_focused = false;
+                                    let clicked = self.pane_tree.focused;
+                                    let old_doc = self.active_doc;
+                                    let ed_id = self
+                                        .pane_tree
+                                        .layout()
+                                        .iter()
+                                        .find(|p| p.content == PaneContent::Editor)
+                                        .map(|p| p.id);
+                                    if let (Some(ed), true) = (ed_id, j < self.docs.len()) {
+                                        self.pane_tree.set_content(ed, PaneContent::Doc(old_doc));
+                                        self.pane_tree.set_content(clicked, PaneContent::Editor);
+                                        self.switch_tab(j);
+                                    }
+                                    self.sync_panes();
+                                    return;
+                                }
+                                PaneContent::Editor => {
+                                    self.term_focused = false;
+                                    self.sync_panes();
+                                }
                             }
                         }
                     }
@@ -4397,6 +4579,10 @@ impl ApplicationHandler<UserEvent> for App {
                             if self.term_tab_active {
                                 self.deactivate_terminal_tab();
                             }
+                            // Arm drag-to-dock: past the slop this press
+                            // becomes a tile drag instead of a plain switch.
+                            self.tab_drag =
+                                Some((tab, (self.pointer.0, self.pointer.1), false, None));
                             self.switch_tab(tab);
                         }
                         return;

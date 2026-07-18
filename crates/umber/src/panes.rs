@@ -24,8 +24,12 @@ pub enum SplitDir {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneContent {
+    /// The live editing surface (exactly one exists).
     Editor,
     Terminal(u64),
+    /// A read-view tile of the sidebar document at this index; clicking it
+    /// swaps it with the live editor.
+    Doc(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -198,6 +202,52 @@ impl PaneTree {
         let found = Self::close_node(&mut a, target).or_else(|| Self::close_node(&mut b, target));
         *node = PaneNode::Split { dir, ratio, a, b };
         found
+    }
+
+    /// Replace the content of pane `id` (the live-editor swap on click).
+    pub fn set_content(&mut self, id: u64, content: PaneContent) {
+        Self::set_content_node(&mut self.root, id, content);
+    }
+
+    fn set_content_node(node: &mut PaneNode, id: u64, content: PaneContent) -> bool {
+        match node {
+            PaneNode::Leaf { id: i, content: c } if *i == id => {
+                *c = content;
+                true
+            }
+            PaneNode::Leaf { .. } => false,
+            PaneNode::Split { a, b, .. } => {
+                Self::set_content_node(a, id, content) || Self::set_content_node(b, id, content)
+            }
+        }
+    }
+
+    /// A closed sidebar document shifts every later doc index down by one;
+    /// tiles bound to the closed doc are returned so the caller closes them.
+    pub fn remap_docs_after_close(&mut self, closed: usize) -> Vec<u64> {
+        let mut dead = Vec::new();
+        Self::remap_node(&mut self.root, closed, &mut dead);
+        dead
+    }
+
+    fn remap_node(node: &mut PaneNode, closed: usize, dead: &mut Vec<u64>) {
+        match node {
+            PaneNode::Leaf {
+                id,
+                content: PaneContent::Doc(i),
+            } => {
+                if *i == closed {
+                    dead.push(*id);
+                } else if *i > closed {
+                    *i -= 1;
+                }
+            }
+            PaneNode::Leaf { .. } => {}
+            PaneNode::Split { a, b, .. } => {
+                Self::remap_node(a, closed, dead);
+                Self::remap_node(b, closed, dead);
+            }
+        }
     }
 
     pub fn contains(&self, id: u64) -> bool {
@@ -506,6 +556,24 @@ mod tests {
         assert_eq!(t.layout().len(), 2);
         // Focus stayed valid (t2 was focused; falls back to first leaf).
         assert!(t.contains(t.focused));
+    }
+
+    #[test]
+    fn doc_tiles_swap_and_remap() {
+        let mut t = PaneTree::new();
+        let d = t.split(SplitDir::Horizontal, PaneContent::Doc(2), false);
+        // Live-editor swap: doc tile becomes the editor and vice versa.
+        t.set_content(0, PaneContent::Doc(0));
+        t.set_content(d, PaneContent::Editor);
+        assert_eq!(PaneTree::find(&t.root, d), Some(PaneContent::Editor));
+        assert_eq!(PaneTree::find(&t.root, 0), Some(PaneContent::Doc(0)));
+        // Closing sidebar doc 0: the Doc(0) tile dies, higher indices shift.
+        t.set_content(0, PaneContent::Doc(3));
+        let dead = t.remap_docs_after_close(1);
+        assert!(dead.is_empty());
+        assert_eq!(PaneTree::find(&t.root, 0), Some(PaneContent::Doc(2)));
+        let dead = t.remap_docs_after_close(2);
+        assert_eq!(dead, vec![0]);
     }
 
     #[test]

@@ -162,6 +162,8 @@ const CONTEXT_MENU_COLOR: [f32; 4] = [0.030, 0.025, 0.020, 1.0];
 const CONTEXT_MENU_HOVER_COLOR: [f32; 4] = [0.145, 0.075, 0.042, 0.92];
 /// Focused-pane accent border (tiled panes; Ghostty-style focus ring).
 const PANE_FOCUS_BORDER_COLOR: [f32; 4] = [0.30, 0.135, 0.070, 1.0];
+/// Drag-to-dock drop-zone preview wash (translucent accent over the text).
+const DROP_PREVIEW_COLOR: [f32; 4] = [0.757, 0.373, 0.235, 0.16];
 /// Terminal panel background: a shade darker than the editor clear color so
 /// the panel reads as a distinct surface.
 const TERM_BG_COLOR: [f32; 4] = [0.010, 0.009, 0.008, 1.0];
@@ -306,6 +308,16 @@ struct TermPaneView {
     buffer: Buffer,
     cursor: Option<(usize, usize)>,
     focused: bool,
+}
+
+/// One tiled read-view document tile (drag-a-tab docking).
+struct DocPaneView {
+    id: u64,
+    rect: [f32; 4],
+    buffer: Buffer,
+    focused: bool,
+    /// Shaped text cache: refresh calls with unchanged windows are free.
+    text: String,
 }
 
 /// Divider hit-test spec from the app's pane tree, normalized to the
@@ -625,6 +637,11 @@ pub struct Renderer {
     /// Divider hit-test specs: (split path, is-horizontal-split, normalized
     /// line rect within the content area).
     pane_divs: Vec<PaneDividerSpec>,
+    doc_panes: Vec<DocPaneView>,
+    /// The editor tile owns focus (drives its accent ring when tiled).
+    editor_pane_focused: bool,
+    /// Drag-to-dock drop preview, physical px (drawn over the text).
+    drop_preview: Option<(f32, f32, f32, f32)>,
     term_text: String,
     term_spans: Vec<TerminalTextSpan>,
     term_cursor: Option<(usize, usize)>,
@@ -993,6 +1010,9 @@ impl Renderer {
             editor_pane: None,
             term_panes: Vec::new(),
             pane_divs: Vec::new(),
+            doc_panes: Vec::new(),
+            editor_pane_focused: true,
+            drop_preview: None,
             term_text: String::new(),
             term_spans: Vec::new(),
             term_cursor: None,
@@ -1912,12 +1932,42 @@ impl Renderer {
     /// every pane reflows to its card.
     pub fn set_panes(
         &mut self,
-        editor: Option<[f32; 4]>,
+        editor: Option<([f32; 4], bool)>,
         terms: &[(u64, [f32; 4], bool)],
+        docs: &[(u64, [f32; 4], bool)],
         divs: &[PaneDividerSpec],
     ) {
-        self.editor_pane = editor;
+        self.editor_pane = editor.map(|(r, _)| r);
+        self.editor_pane_focused = editor.map(|(_, f)| f).unwrap_or(true);
         self.pane_divs = divs.to_vec();
+        self.doc_panes
+            .retain(|p| docs.iter().any(|(id, ..)| *id == p.id));
+        let doc_metrics = self.doc_buffer.metrics();
+        for &(id, rect, focused) in docs {
+            if let Some(p) = self.doc_panes.iter_mut().find(|p| p.id == id) {
+                p.rect = rect;
+                p.focused = focused;
+            } else {
+                let mut buffer = Buffer::new(&mut self.font_system, doc_metrics);
+                buffer.set_wrap(Wrap::None);
+                self.doc_panes.push(DocPaneView {
+                    id,
+                    rect,
+                    buffer,
+                    focused,
+                    text: String::new(),
+                });
+            }
+        }
+        for i in 0..self.doc_panes.len() {
+            let (_, _, pw, ph) = self.pane_card_px(self.doc_panes[i].rect);
+            let w = (pw - self.pad_px() * 2.0).max(1.0);
+            let h = (ph - self.pad_px() * 2.0).max(1.0);
+            self.doc_panes[i].buffer.set_size(Some(w), Some(h));
+            self.doc_panes[i]
+                .buffer
+                .shape_until_scroll(&mut self.font_system, false);
+        }
         self.term_panes
             .retain(|p| terms.iter().any(|(id, ..)| *id == p.id));
         let metrics = self.doc_buffer.metrics();
@@ -2029,6 +2079,79 @@ impl Renderer {
             .buffer
             .shape_until_scroll(&mut self.font_system, false);
         self.window.request_redraw();
+    }
+
+    /// Rows a document tile can show, for the app's window slicing.
+    pub fn doc_pane_rows(&self, id: u64) -> Option<usize> {
+        let p = self.doc_panes.iter().find(|p| p.id == id)?;
+        let (_, _, _, ph) = self.pane_card_px(p.rect);
+        Some(
+            ((ph - self.pad_px() * 2.0) / self.line_px())
+                .floor()
+                .max(1.0) as usize,
+        )
+    }
+
+    /// Reshape one document tile's window (syntax-highlighted by extension).
+    pub fn set_doc_pane_content(&mut self, id: u64, text: &str, ext: Option<&str>) {
+        let Some(idx) = self.doc_panes.iter().position(|p| p.id == id) else {
+            return;
+        };
+        if self.doc_panes[idx].text == text {
+            return;
+        }
+        self.doc_panes[idx].text.clear();
+        self.doc_panes[idx].text.push_str(text);
+        let lang = ext
+            .map(|e| e.to_ascii_lowercase())
+            .and_then(|e| umber_syntax::lang_for_ext(&e));
+        let default_attrs = Attrs::new().family(Family::Monospace);
+        let mut highlighted = false;
+        if let Some(lang) = lang {
+            let spans = self.syntax.highlight(lang, text);
+            if !spans.is_empty() {
+                let mut rich: Vec<(&str, Attrs)> = Vec::with_capacity(spans.len() * 2 + 1);
+                let mut pos = 0usize;
+                for sp in &spans {
+                    if sp.start > pos {
+                        if let Some(seg) = text.get(pos..sp.start) {
+                            rich.push((seg, default_attrs.clone()));
+                        }
+                    }
+                    if let Some(seg) = text.get(sp.start..sp.end) {
+                        rich.push((seg, default_attrs.clone().color(syntax_color(sp.style))));
+                    }
+                    pos = sp.end;
+                }
+                if let Some(seg) = text.get(pos..) {
+                    rich.push((seg, default_attrs.clone()));
+                }
+                self.doc_panes[idx].buffer.set_rich_text(
+                    rich,
+                    &default_attrs,
+                    Shaping::Advanced,
+                    None,
+                );
+                highlighted = true;
+            }
+        }
+        if !highlighted {
+            self.doc_panes[idx]
+                .buffer
+                .set_text(text, &default_attrs, Shaping::Advanced, None);
+        }
+        self.doc_panes[idx]
+            .buffer
+            .shape_until_scroll(&mut self.font_system, false);
+        self.window.request_redraw();
+    }
+
+    /// Show/clear the drag-to-dock drop preview (physical px rect).
+    pub fn set_drop_preview(&mut self, rect: Option<(f32, f32, f32, f32)>) {
+        if self.drop_preview != rect {
+            self.drop_preview = rect;
+            self.window.request_redraw();
+        }
     }
 
     /// Normalize a window point into the content area (0..1), if inside.
@@ -2649,6 +2772,24 @@ impl Renderer {
                 custom_glyphs: &[],
             });
         }
+        // Tiled document read-views, syntax-lit, clipped to their cards.
+        for p in &self.doc_panes {
+            let (px, py, pw, ph) = self.pane_card_px(p.rect);
+            areas.push(TextArea {
+                buffer: &p.buffer,
+                left: px + pad,
+                top: py + pad,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: px as i32,
+                    top: py as i32,
+                    right: (px + pw) as i32,
+                    bottom: (py + ph) as i32,
+                },
+                default_color: Color::rgb(232, 226, 213),
+                custom_glyphs: &[],
+            });
+        }
         // Hovered word recolored gold, drawn over the original glyphs at the
         // word's exact grid cell (monospace -> covers them precisely). Shaped
         // only when the word changes (set_hover_word); here it is just placed.
@@ -3246,8 +3387,7 @@ impl Renderer {
             );
             // Inset editor canvas below the dock, with its own hairline edge.
             // When tiling is active, editor focus wears the accent ring.
-            let editor_ring =
-                self.editor_pane.is_some() && !self.term_panes.iter().any(|p| p.focused);
+            let editor_ring = self.editor_pane.is_some() && self.editor_pane_focused;
             sidebar_verts += push_rquad(
                 &mut self.sidebar_bytes,
                 fw,
@@ -3326,6 +3466,38 @@ impl Renderer {
                         );
                     }
                 }
+            }
+            // Tiled document read-view cards: editor-colored fill, accent
+            // ring when the tile owns focus.
+            for i in 0..self.doc_panes.len() {
+                let (px, py, pw, ph) = self.pane_card_px(self.doc_panes[i].rect);
+                let ring = if self.doc_panes[i].focused {
+                    PANE_FOCUS_BORDER_COLOR
+                } else {
+                    PANEL_BORDER_COLOR
+                };
+                sidebar_verts += push_rquad(
+                    &mut self.sidebar_bytes,
+                    fw,
+                    fh,
+                    px,
+                    py,
+                    pw,
+                    ph,
+                    ring,
+                    SHELL_RADIUS * s,
+                );
+                sidebar_verts += push_rquad(
+                    &mut self.sidebar_bytes,
+                    fw,
+                    fh,
+                    px + border,
+                    py + border,
+                    (pw - border * 2.0).max(1.0),
+                    (ph - border * 2.0).max(1.0),
+                    EDITOR_PANEL_COLOR,
+                    (SHELL_RADIUS * s - border).max(1.0),
+                );
             }
             // Hovered action: a rounded pill wash sized from the REAL glyph
             // extents (pixel-exact; no column arithmetic).
@@ -3479,6 +3651,22 @@ impl Renderer {
                     5.0 * s,
                 );
             }
+        }
+        // Drag-to-dock preview: a translucent accent wash over the target
+        // half, in the post-text range so it reads over the glyphs.
+        if let Some((pxr, pyr, pwr, phr)) = self.drop_preview {
+            let s = self.scale_factor as f32;
+            sidebar_verts += push_rquad(
+                &mut self.sidebar_bytes,
+                fw,
+                fh,
+                pxr,
+                pyr,
+                pwr,
+                phr,
+                DROP_PREVIEW_COLOR,
+                SHELL_RADIUS * s,
+            );
         }
         if sidebar_verts > 0 {
             self.queue
