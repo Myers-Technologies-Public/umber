@@ -371,6 +371,7 @@ fn main() -> ExitCode {
         terminal: None,
         term_focused: false,
         term_resizing: false,
+        term_tab_active: false,
         event_proxy,
         start,
         first_frame: false,
@@ -564,6 +565,8 @@ struct App {
     term_focused: bool,
     /// Dragging the terminal's top border to resize the split.
     term_resizing: bool,
+    /// The terminal content-tab is active (terminal fills the content area).
+    term_tab_active: bool,
     /// Proxy for background threads to wake the event loop.
     event_proxy: EventLoopProxy<UserEvent>,
 
@@ -1225,6 +1228,10 @@ impl App {
 
     /// Cycle to the next tab (Ctrl+Tab).
     fn next_tab(&mut self) {
+        if self.term_tab_active {
+            self.deactivate_terminal_tab();
+            return;
+        }
         if self.docs.len() > 1 {
             let next = (self.active_doc + 1) % self.docs.len();
             self.switch_tab(next);
@@ -2515,25 +2522,15 @@ impl App {
         }
     }
 
-    /// Hide the panel (the shell stays alive) and refocus the editor.
-    fn hide_terminal(&mut self) {
-        self.term_focused = false;
-        if let Some(renderer) = self.renderer.as_mut() {
-            renderer.set_terminal(false, false);
-        }
-        self.apply_view(false);
-        if let Some(r) = self.renderer.as_ref() {
-            r.window().request_redraw();
-        }
-    }
-
     /// Kill the shell and reap it (feature disable, child exit, quit).
     fn kill_terminal(&mut self) {
         if let Some(mut session) = self.terminal.take() {
             session.shutdown();
         }
         self.term_focused = false;
+        self.term_tab_active = false;
         if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_terminal_maximized(false);
             renderer.set_terminal(false, false);
         }
         self.apply_view(false);
@@ -2542,24 +2539,48 @@ impl App {
         }
     }
 
-    /// Ctrl+` semantics: closed -> open+focus; open unfocused -> focus;
-    /// open focused -> hide.
-    fn terminal_toggle(&mut self) {
-        let open = self
-            .renderer
-            .as_ref()
-            .map(|r| r.terminal_open())
-            .unwrap_or(false);
-        if !open {
-            self.open_terminal();
-        } else if !self.term_focused {
-            self.term_focused = true;
-            if let Some(renderer) = self.renderer.as_mut() {
-                renderer.set_terminal(true, true);
-                renderer.window().request_redraw();
-            }
+    /// Show the terminal as a full content tab (spawning the shell if
+    /// needed) and focus it.
+    fn activate_terminal_tab(&mut self) {
+        self.open_terminal_session(None);
+        if self.terminal.is_none() {
+            return; // spawn failed; open_terminal_session reported it
+        }
+        self.term_tab_active = true;
+        let grid = if let Some(r) = self.renderer.as_mut() {
+            r.set_terminal_maximized(true);
+            let g = r.term_grid_size();
+            let c = r.cell_px();
+            r.window().request_redraw();
+            Some((g, c))
         } else {
-            self.hide_terminal();
+            None
+        };
+        if let (Some(((cols, lines), (cw, ch))), Some(s)) = (grid, self.terminal.as_ref()) {
+            s.resize(cols, lines, cw, ch);
+        }
+        self.apply_view(false);
+    }
+
+    /// Leave the terminal tab, returning to the active document tab. The
+    /// shell session stays alive for the next visit.
+    fn deactivate_terminal_tab(&mut self) {
+        self.term_tab_active = false;
+        self.term_focused = false;
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_terminal_maximized(false);
+            r.set_terminal(false, false);
+            r.window().request_redraw();
+        }
+        self.apply_view(false);
+    }
+
+    /// Ctrl+`/Ctrl+J: toggle the terminal content tab.
+    fn terminal_toggle(&mut self) {
+        if self.term_tab_active {
+            self.deactivate_terminal_tab();
+        } else {
+            self.activate_terminal_tab();
         }
     }
 
@@ -2640,7 +2661,15 @@ impl App {
                 name
             });
         }
-        let active = self.active_doc;
+        // The terminal (when spawned) appears as the last tab in the list.
+        if self.terminal.is_some() {
+            labels.push("\u{25b8} Terminal".to_string());
+        }
+        let active = if self.term_tab_active {
+            self.docs.len()
+        } else {
+            self.active_doc
+        };
         if let Some(r) = self.renderer.as_mut() {
             r.set_sidebar_tabs(&labels, active);
         }
@@ -3298,7 +3327,12 @@ impl ApplicationHandler<UserEvent> for App {
                     if let Some(i) = self.renderer.as_ref().and_then(|r| {
                         r.sidebar_tab_at(self.pointer.0 as f32, self.pointer.1 as f32)
                     }) {
-                        self.close_tab(i);
+                        if i >= self.docs.len() {
+                            // Terminal tab: middle-click kills the shell.
+                            self.kill_terminal();
+                        } else {
+                            self.close_tab(i);
+                        }
                     }
                     return;
                 }
@@ -3315,7 +3349,15 @@ impl ApplicationHandler<UserEvent> for App {
                         if self.view != View::Editor {
                             self.close_overlay();
                         }
-                        self.switch_tab(tab);
+                        if tab >= self.docs.len() {
+                            // Last row = the terminal tab.
+                            self.activate_terminal_tab();
+                        } else {
+                            if self.term_tab_active {
+                                self.deactivate_terminal_tab();
+                            }
+                            self.switch_tab(tab);
+                        }
                         return;
                     }
                     // Top strip = activity actions: click activates.
@@ -3457,15 +3499,8 @@ impl ApplicationHandler<UserEvent> for App {
                         return;
                     }
                     if matches!(&event.logical_key, Key::Named(NamedKey::Escape)) {
-                        // Esc always reveals the editor: unfocus AND un-maximize
-                        // so a fullscreen terminal can't trap the user.
-                        self.term_focused = false;
-                        if let Some(renderer) = self.renderer.as_mut() {
-                            renderer.set_terminal_maximized(false);
-                            renderer.set_terminal(true, false);
-                            renderer.window().request_redraw();
-                        }
-                        self.apply_view(false);
+                        // Esc leaves the terminal tab back to the document.
+                        self.deactivate_terminal_tab();
                         return;
                     }
                     // F11: toggle fullscreen terminal.
