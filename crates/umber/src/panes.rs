@@ -95,13 +95,15 @@ impl PaneTree {
         matches!(self.root, PaneNode::Leaf { .. })
     }
 
-    /// Split the focused pane in `dir`, placing `content` in the new second
-    /// half. Returns the new pane's id and focuses it.
-    pub fn split(&mut self, dir: SplitDir, content: PaneContent) -> u64 {
+    /// Split the focused pane in `dir`, placing `content` in the new half.
+    /// `before` = the new pane takes the left/top half (split left/up);
+    /// otherwise the right/bottom half. Returns the new pane's id and
+    /// focuses it.
+    pub fn split(&mut self, dir: SplitDir, content: PaneContent, before: bool) -> u64 {
         let new_id = self.next_id;
         self.next_id += 1;
         let focused = self.focused;
-        Self::split_node(&mut self.root, focused, dir, content, new_id);
+        Self::split_node(&mut self.root, focused, dir, content, new_id, before);
         self.focused = new_id;
         new_id
     }
@@ -112,6 +114,7 @@ impl PaneTree {
         dir: SplitDir,
         content: PaneContent,
         new_id: u64,
+        before: bool,
     ) -> bool {
         match node {
             PaneNode::Leaf { id, .. } if *id == target => {
@@ -122,21 +125,27 @@ impl PaneTree {
                         content: PaneContent::Editor,
                     },
                 );
+                let new_leaf = PaneNode::Leaf {
+                    id: new_id,
+                    content,
+                };
+                let (a, b) = if before {
+                    (new_leaf, old)
+                } else {
+                    (old, new_leaf)
+                };
                 *node = PaneNode::Split {
                     dir,
                     ratio: 0.5,
-                    a: Box::new(old),
-                    b: Box::new(PaneNode::Leaf {
-                        id: new_id,
-                        content,
-                    }),
+                    a: Box::new(a),
+                    b: Box::new(b),
                 };
                 true
             }
             PaneNode::Leaf { .. } => false,
             PaneNode::Split { a, b, .. } => {
-                Self::split_node(a, target, dir, content, new_id)
-                    || Self::split_node(b, target, dir, content, new_id)
+                Self::split_node(a, target, dir, content, new_id, before)
+                    || Self::split_node(b, target, dir, content, new_id, before)
             }
         }
     }
@@ -416,9 +425,9 @@ mod tests {
     #[test]
     fn split_right_then_down() {
         let mut t = PaneTree::new();
-        let a = t.split(SplitDir::Horizontal, PaneContent::Terminal(1));
+        let a = t.split(SplitDir::Horizontal, PaneContent::Terminal(1), false);
         assert_eq!(t.focused, a);
-        let b = t.split(SplitDir::Vertical, PaneContent::Terminal(2));
+        let b = t.split(SplitDir::Vertical, PaneContent::Terminal(2), false);
         assert_eq!(t.focused, b);
         let l = t.layout();
         assert_eq!(l.len(), 3);
@@ -443,7 +452,7 @@ mod tests {
     #[test]
     fn close_merges_sibling_back() {
         let mut t = PaneTree::new();
-        let a = t.split(SplitDir::Horizontal, PaneContent::Terminal(1));
+        let a = t.split(SplitDir::Horizontal, PaneContent::Terminal(1), false);
         let closed = t.close(a);
         assert_eq!(closed, Some(PaneContent::Terminal(1)));
         assert!(t.is_single());
@@ -453,7 +462,7 @@ mod tests {
     #[test]
     fn editor_pane_cannot_close() {
         let mut t = PaneTree::new();
-        t.split(SplitDir::Horizontal, PaneContent::Terminal(1));
+        t.split(SplitDir::Horizontal, PaneContent::Terminal(1), false);
         assert_eq!(t.close(0), None);
         assert_eq!(t.layout().len(), 2);
     }
@@ -461,7 +470,7 @@ mod tests {
     #[test]
     fn focus_at_picks_pane_under_point() {
         let mut t = PaneTree::new();
-        t.split(SplitDir::Horizontal, PaneContent::Terminal(1));
+        t.split(SplitDir::Horizontal, PaneContent::Terminal(1), false);
         assert_eq!(t.focus_at(0.25, 0.5), 0);
         assert_eq!(t.focused_content(), PaneContent::Editor);
         let id = t.focus_at(0.75, 0.5);
@@ -472,7 +481,7 @@ mod tests {
     #[test]
     fn drag_moves_divider_clamped() {
         let mut t = PaneTree::new();
-        t.split(SplitDir::Horizontal, PaneContent::Terminal(1));
+        t.split(SplitDir::Horizontal, PaneContent::Terminal(1), false);
         let divs = t.dividers();
         assert_eq!(divs.len(), 1);
         assert!((divs[0].rect.x - 0.5).abs() < 1e-6);
@@ -488,14 +497,41 @@ mod tests {
     #[test]
     fn nested_close_refocuses_first_leaf() {
         let mut t = PaneTree::new();
-        let t1 = t.split(SplitDir::Horizontal, PaneContent::Terminal(1));
+        let t1 = t.split(SplitDir::Horizontal, PaneContent::Terminal(1), false);
         t.focused = t1;
-        let t2 = t.split(SplitDir::Vertical, PaneContent::Terminal(2));
+        let t2 = t.split(SplitDir::Vertical, PaneContent::Terminal(2), false);
         assert_eq!(t.layout().len(), 3);
         assert_eq!(t.close(t2), Some(PaneContent::Terminal(2)));
         assert!(t.contains(t1));
         assert_eq!(t.layout().len(), 2);
         // Focus stayed valid (t2 was focused; falls back to first leaf).
         assert!(t.contains(t.focused));
+    }
+
+    #[test]
+    fn split_before_places_new_pane_first() {
+        let mut t = PaneTree::new();
+        // Split LEFT: the new terminal takes the left half.
+        t.split(SplitDir::Horizontal, PaneContent::Terminal(1), true);
+        let l = t.layout();
+        let term = l
+            .iter()
+            .find(|p| p.content == PaneContent::Terminal(1))
+            .unwrap();
+        let ed = l.iter().find(|p| p.content == PaneContent::Editor).unwrap();
+        assert!(term.rect.x.abs() < 1e-6);
+        assert!((ed.rect.x - 0.5).abs() < 1e-6);
+        // Split UP from the editor: the new terminal sits above it.
+        t.focused = ed.id;
+        t.split(SplitDir::Vertical, PaneContent::Terminal(2), true);
+        let l = t.layout();
+        let t2 = l
+            .iter()
+            .find(|p| p.content == PaneContent::Terminal(2))
+            .unwrap();
+        let ed = l.iter().find(|p| p.content == PaneContent::Editor).unwrap();
+        assert!(t2.rect.y.abs() < 1e-6);
+        assert!((t2.rect.x - 0.5).abs() < 1e-6);
+        assert!((ed.rect.y - 0.5).abs() < 1e-6);
     }
 }

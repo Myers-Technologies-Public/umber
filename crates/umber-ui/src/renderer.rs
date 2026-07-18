@@ -1179,13 +1179,18 @@ impl Renderer {
 
     /// Left content edge: past the floating sidebar and the shell gutter.
     /// Gutter, document, terminal, and hit-testing share this origin.
+    /// Stable inner-left anchor of the content column (top dock text, pills,
+    /// legacy terminal panel). Deliberately NOT pane-aware: the dock must not
+    /// follow the editor tile. Document anchors are `gutter_left()` /
+    /// `text_left()`.
     pub fn left_edge(&self) -> f32 {
-        if self.editor_pane.is_some() {
-            let (px, ..) = self.editor_card_rect();
-            px + self.pad_px()
-        } else {
-            self.sidebar_w() + SHELL_GAP * self.scale_factor as f32 + self.pad_px()
-        }
+        self.sidebar_w() + SHELL_GAP * self.scale_factor as f32 + self.pad_px()
+    }
+
+    /// Left edge of the editor's gutter — follows the editor tile when
+    /// tiling is active (single-pane value equals `left_edge()`).
+    pub fn gutter_left(&self) -> f32 {
+        self.editor_card_rect().0 + self.pad_px()
     }
 
     /// The region tiled by panes: the full editor-card footprint between
@@ -1258,7 +1263,7 @@ impl Renderer {
     }
 
     pub fn text_left(&self) -> f32 {
-        self.left_edge() + self.gutter_width()
+        self.gutter_left() + self.gutter_width()
     }
 
     /// Y of the inset editor canvas, below the floating command dock (or
@@ -1576,8 +1581,10 @@ impl Renderer {
         }
         let s = self.scale_factor as f32;
         let track_w = SCROLLBAR_W * s;
-        let track_x =
-            self.surface_config.width as f32 - track_w - SCROLLBAR_MARGIN * s - SHELL_GAP * s;
+        // Anchor to the editor card's right edge (pane-aware); in the legacy
+        // single-pane layout this equals the old window-right formula.
+        let (ecx, _, ecw, _) = self.editor_card_rect();
+        let track_x = ecx + ecw - track_w - SCROLLBAR_MARGIN * s;
         let track_top = self.doc_top();
         let track_h = (self.doc_bottom() - track_top).max(1.0);
         let min_thumb = (SCROLLBAR_MIN_THUMB * s).min(track_h);
@@ -2475,6 +2482,7 @@ impl Renderer {
         // the buffer fields, keeping them disjoint from the &mut atlas/font.
         let pad = self.pad_px();
         let left = self.left_edge();
+        let gutter_x = self.gutter_left();
         let doc_top = self.doc_top();
         let line_px = self.line_px();
         let cell_w = self.cell_w();
@@ -2578,7 +2586,7 @@ impl Renderer {
         if self.gutter_enabled && self.gutter_digits > 0 {
             areas.push(TextArea {
                 buffer: &self.gutter_buffer,
-                left,
+                left: gutter_x,
                 top: doc_top,
                 scale: 1.0,
                 bounds: TextBounds {
@@ -2922,7 +2930,7 @@ impl Renderer {
             let s = self.scale_factor as f32;
             let sep_w = (SEPARATOR_W * s).max(1.0);
             let sep_x =
-                self.left_edge() + self.gutter_text_w() + GUTTER_GAP * s * 0.5 - sep_w * 0.5;
+                self.gutter_left() + self.gutter_text_w() + GUTTER_GAP * s * 0.5 - sep_w * 0.5;
             let sep_h = (doc_bottom - doc_top).max(0.0);
             if sep_h > 0.0 {
                 sep_verts += push_quad(
@@ -2961,7 +2969,7 @@ impl Renderer {
         if !self.overlay_active && self.gutter_enabled {
             let s = self.scale_factor as f32;
             let mark_w = (3.0 * s).max(1.0);
-            let mark_x = self.left_edge() - self.pad_px() * 0.6;
+            let mark_x = self.gutter_left() - self.pad_px() * 0.6;
             for (line, color) in self.gutter_marks.iter().take(GIT_MARK_MAX) {
                 let y = doc_top + *line as f32 * line_px;
                 if y >= doc_bottom {

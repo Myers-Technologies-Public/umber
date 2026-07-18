@@ -211,7 +211,9 @@ fn build_command_registry() -> CommandRegistry {
             "Ctrl+Shift+F",
         ),
         ("view.toggle.terminal", "View: Toggle Terminal Feature", ""),
+        ("pane.splitLeft", "Pane: Split Left", ""),
         ("pane.splitRight", "Pane: Split Right", "Ctrl+Shift+O"),
+        ("pane.splitUp", "Pane: Split Up", ""),
         ("pane.splitDown", "Pane: Split Down", "Ctrl+Shift+E"),
         ("pane.close", "Pane: Close Focused", ""),
         ("app.quit", "Application: Quit", "Ctrl+Q"),
@@ -266,6 +268,8 @@ enum ContextTarget {
     Terminal,
     /// Tiled pane: (pane id, true = closable terminal tile).
     Pane(u64, bool),
+    /// The fullscreen terminal content-tab (splits convert it to tiles).
+    TerminalView,
 }
 
 enum AgentsRow {
@@ -1493,19 +1497,29 @@ impl App {
             (Some(ContextTarget::Document(i)), 0) => self.close_tab(i),
             (Some(ContextTarget::Document(i)), 1) => self.close_other_tabs(i),
             (Some(ContextTarget::Terminal), 0) => self.kill_terminal(),
-            (Some(ContextTarget::Pane(pid, _)), 0) => {
+            (Some(ContextTarget::Pane(pid, _)), row @ 0..=3) => {
                 if self.pane_tree.contains(pid) {
                     self.pane_tree.focused = pid;
                 }
-                self.split_pane(SplitDir::Horizontal);
+                let (dir, before) = match row {
+                    0 => (SplitDir::Horizontal, true),
+                    1 => (SplitDir::Horizontal, false),
+                    2 => (SplitDir::Vertical, true),
+                    _ => (SplitDir::Vertical, false),
+                };
+                self.split_pane(dir, before);
             }
-            (Some(ContextTarget::Pane(pid, _)), 1) => {
-                if self.pane_tree.contains(pid) {
-                    self.pane_tree.focused = pid;
-                }
-                self.split_pane(SplitDir::Vertical);
+            (Some(ContextTarget::Pane(pid, true)), 4) => self.close_pane(pid),
+            (Some(ContextTarget::TerminalView), row @ 0..=3) => {
+                let (dir, before) = match row {
+                    0 => (SplitDir::Horizontal, true),
+                    1 => (SplitDir::Horizontal, false),
+                    2 => (SplitDir::Vertical, true),
+                    _ => (SplitDir::Vertical, false),
+                };
+                self.tile_terminal_tab(dir, before);
             }
-            (Some(ContextTarget::Pane(pid, true)), 2) => self.close_pane(pid),
+            (Some(ContextTarget::TerminalView), 4) => self.kill_terminal(),
             _ => {}
         }
     }
@@ -3113,8 +3127,23 @@ impl App {
         self.apply_view(true);
     }
 
+    /// Convert the fullscreen terminal tab into tiles: the live session
+    /// moves into a pane on the chosen side of the editor.
+    fn tile_terminal_tab(&mut self, dir: SplitDir, before: bool) {
+        let Some(sess) = self.terminal.take() else {
+            return;
+        };
+        self.deactivate_terminal_tab();
+        let id = self.next_pane_term;
+        self.next_pane_term += 1;
+        self.pane_terms.push((id, sess));
+        self.pane_tree.split(dir, PaneContent::Terminal(id), before);
+        self.term_focused = true;
+        self.sync_panes();
+    }
+
     /// Split the focused pane, spawning a shell in the new tile.
-    fn split_pane(&mut self, dir: SplitDir) {
+    fn split_pane(&mut self, dir: SplitDir, before: bool) {
         if !self.features.is_enabled("terminal") {
             self.modules_hint = Some("terminal feature is disabled".to_string());
             return;
@@ -3132,7 +3161,7 @@ impl App {
         // Split the tree FIRST so the tile's real grid exists before the
         // shell spawns — spawning small and resizing garbles the first paint.
         let id = self.next_pane_term;
-        let pane_id = self.pane_tree.split(dir, PaneContent::Terminal(id));
+        let pane_id = self.pane_tree.split(dir, PaneContent::Terminal(id), before);
         self.sync_panes();
         let (cols, rows) = self
             .renderer
@@ -3191,9 +3220,23 @@ impl App {
         self.context_target = Some(ContextTarget::Pane(pane_id, closable));
         if let Some(r) = self.renderer.as_mut() {
             if closable {
-                r.set_context_menu(x, y, &["Split Right", "Split Down", "Close Pane"]);
+                r.set_context_menu(
+                    x,
+                    y,
+                    &[
+                        "Split Left",
+                        "Split Right",
+                        "Split Up",
+                        "Split Down",
+                        "Close Pane",
+                    ],
+                );
             } else {
-                r.set_context_menu(x, y, &["Split Right", "Split Down"]);
+                r.set_context_menu(
+                    x,
+                    y,
+                    &["Split Left", "Split Right", "Split Up", "Split Down"],
+                );
             }
         }
     }
@@ -3769,14 +3812,24 @@ impl App {
                 self.terminal_toggle();
                 return;
             }
+            "pane.splitLeft" => {
+                self.close_overlay();
+                self.split_pane(SplitDir::Horizontal, true);
+                return;
+            }
             "pane.splitRight" => {
                 self.close_overlay();
-                self.split_pane(SplitDir::Horizontal);
+                self.split_pane(SplitDir::Horizontal, false);
+                return;
+            }
+            "pane.splitUp" => {
+                self.close_overlay();
+                self.split_pane(SplitDir::Vertical, true);
                 return;
             }
             "pane.splitDown" => {
                 self.close_overlay();
-                self.split_pane(SplitDir::Vertical);
+                self.split_pane(SplitDir::Vertical, false);
                 return;
             }
             "pane.close" => {
@@ -4233,11 +4286,30 @@ impl ApplicationHandler<UserEvent> for App {
                         self.open_tab_context_menu(tab);
                         return;
                     }
-                    // Content area: pane menu (split / close tile).
-                    if self.view == View::Editor && !self.term_tab_active {
+                    // Content area: pane menu (split / close tile). The
+                    // fullscreen terminal tab converts into tiles instead.
+                    if self.view == View::Editor {
                         if let Some((fx, fy)) = self.renderer.as_ref().and_then(|r| {
                             r.content_frac_at(self.pointer.0 as f32, self.pointer.1 as f32)
                         }) {
+                            if self.term_tab_active {
+                                self.context_target = Some(ContextTarget::TerminalView);
+                                let (x, y) = (self.pointer.0 as f32, self.pointer.1 as f32);
+                                if let Some(r) = self.renderer.as_mut() {
+                                    r.set_context_menu(
+                                        x,
+                                        y,
+                                        &[
+                                            "Split Left",
+                                            "Split Right",
+                                            "Split Up",
+                                            "Split Down",
+                                            "Close Terminal",
+                                        ],
+                                    );
+                                }
+                                return;
+                            }
                             let (pid, closable) = match self.pane_tree.pane_at(fx, fy) {
                                 Some((pid, PaneContent::Terminal(_))) => (pid, true),
                                 Some((pid, PaneContent::Editor)) => (pid, false),
@@ -4526,11 +4598,11 @@ impl ApplicationHandler<UserEvent> for App {
                         if let Key::Character(c) = &event.logical_key {
                             match c.to_lowercase().as_str() {
                                 "o" => {
-                                    self.split_pane(SplitDir::Horizontal);
+                                    self.split_pane(SplitDir::Horizontal, false);
                                     return;
                                 }
                                 "e" => {
-                                    self.split_pane(SplitDir::Vertical);
+                                    self.split_pane(SplitDir::Vertical, false);
                                     return;
                                 }
                                 _ => {}
@@ -4638,11 +4710,11 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             // Ghostty-style tiling: split the focused pane.
                             "o" if shift => {
-                                self.split_pane(SplitDir::Horizontal);
+                                self.split_pane(SplitDir::Horizontal, false);
                                 return;
                             }
                             "e" if shift => {
-                                self.split_pane(SplitDir::Vertical);
+                                self.split_pane(SplitDir::Vertical, false);
                                 return;
                             }
                             "," => {
