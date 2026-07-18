@@ -1764,8 +1764,18 @@ impl Renderer {
         if avail <= 0.0 {
             1
         } else {
-            (avail / self.line_px()).floor().max(1.0) as usize
+            // Long pages scroll inside a deliberate card viewport instead of
+            // expanding into an almost full-window sheet.
+            ((avail / self.line_px()).floor().max(1.0) as usize).min(16)
         }
+    }
+
+    /// Measured monospace columns available inside the centered overlay card.
+    /// Transcript producers use this instead of hardcoding a wrap width.
+    pub fn overlay_text_columns(&self) -> usize {
+        (self.overlay_content_width() / self.cell_w())
+            .floor()
+            .max(20.0) as usize
     }
 
     /// Install (or clear with `None`) the modal overlay. Shapes the supplied

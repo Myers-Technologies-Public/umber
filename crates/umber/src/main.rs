@@ -269,8 +269,8 @@ enum AgentsRow {
 
 /// Word-wrap one transcript message into display rows: `you ▸` / `  ●`
 /// prefix on the first line, indent on continuations, blank spacer after.
-fn wrap_message(rows: &mut Vec<(String, String)>, speaker: &str, text: &str) {
-    const WIDTH: usize = 100;
+fn wrap_message(rows: &mut Vec<(String, String)>, speaker: &str, text: &str, width: usize) {
+    let width = width.max(24);
     let prefix = if speaker == "you" {
         "you \u{25b8} "
     } else {
@@ -280,7 +280,7 @@ fn wrap_message(rows: &mut Vec<(String, String)>, speaker: &str, text: &str) {
     let mut line = String::new();
     let mut first = true;
     for word in text.split_whitespace() {
-        if !line.is_empty() && line.chars().count() + word.chars().count() + 1 > WIDTH {
+        if !line.is_empty() && line.chars().count() + word.chars().count() + 1 > width {
             let lead = if first { prefix } else { indent };
             rows.push((format!("{lead}{line}"), String::new()));
             first = false;
@@ -2205,10 +2205,15 @@ impl App {
             agents::fmt_age(s.age_secs)
         );
         let mut rows = Vec::new();
+        let wrap_width = self
+            .renderer
+            .as_ref()
+            .map(|r| r.overlay_text_columns().saturating_sub(8))
+            .unwrap_or(72);
         match std::fs::read_to_string(&s.path) {
             Ok(text) => {
                 for (role, msg) in agents::session_transcript(&text, 80) {
-                    wrap_message(&mut rows, &role, &msg);
+                    wrap_message(&mut rows, &role, &msg, wrap_width);
                 }
             }
             Err(err) => rows.push((format!("cannot read session: {err}"), String::new())),
