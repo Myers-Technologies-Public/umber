@@ -19,12 +19,14 @@ use std::time::{Duration, Instant};
 use umber::agent_rpc::{AgentNotifier, AgentProcess, AgentRunState};
 use umber::agents::{self, SessionSummary};
 use umber::git::{self, LineChange};
+use umber::panes::{PaneContent, PaneTree, SplitDir};
 use umber::remote::RemoteWorkspace;
 use umber::search::{self, Match};
 use umber::terminal::{TermNotifier, TerminalSession};
 use umber_host::{HostCommand, Manifest, ModuleHost};
 use umber_kernel::{Command, CommandRegistry, Config, FeatureRegistry};
 use umber_text::TextBuffer;
+use umber_ui::PaneDividerSpec;
 use umber_ui::{
     OverlaySpec, Renderer, ScrollbarInfo, SelSpan, TerminalTextSpan, GIT_ADDED_COLOR,
     GIT_DELETED_COLOR, GIT_MODIFIED_COLOR,
@@ -209,6 +211,9 @@ fn build_command_registry() -> CommandRegistry {
             "Ctrl+Shift+F",
         ),
         ("view.toggle.terminal", "View: Toggle Terminal Feature", ""),
+        ("pane.splitRight", "Pane: Split Right", "Ctrl+Shift+O"),
+        ("pane.splitDown", "Pane: Split Down", "Ctrl+Shift+E"),
+        ("pane.close", "Pane: Close Focused", ""),
         ("app.quit", "Application: Quit", "Ctrl+Q"),
     ] {
         reg.register(Command {
@@ -259,6 +264,8 @@ fn ssh_config_hosts() -> Vec<String> {
 enum ContextTarget {
     Document(usize),
     Terminal,
+    /// Tiled pane: (pane id, true = closable terminal tile).
+    Pane(u64, bool),
 }
 
 enum AgentsRow {
@@ -440,6 +447,11 @@ fn main() -> ExitCode {
         term_resizing: false,
         sidebar_resizing: false,
         term_tab_active: false,
+        pane_tree: PaneTree::new(),
+        pane_terms: Vec::new(),
+        next_pane_term: 1,
+        pane_drag: None,
+        pane_div_hot: None,
         context_target: None,
         last_click_at: None,
         last_click_pos: None,
@@ -646,6 +658,15 @@ struct App {
     sidebar_resizing: bool,
     /// The terminal content-tab is active (terminal fills the content area).
     term_tab_active: bool,
+    /// Ghostty-style tiling: the split tree over the content area.
+    pane_tree: PaneTree,
+    /// PTY sessions for terminal tiles, keyed by terminal id.
+    pane_terms: Vec<(u64, TerminalSession<UmberNotifier>)>,
+    next_pane_term: u64,
+    /// Dragging a pane divider: (split path, is-horizontal-split).
+    pane_drag: Option<(u32, bool)>,
+    /// Divider hover state, so the resize cursor sets/resets on change.
+    pane_div_hot: Option<bool>,
     /// Target behind the currently open pointer context menu.
     context_target: Option<ContextTarget>,
     /// Double-click tracking for word-select.
@@ -1472,6 +1493,19 @@ impl App {
             (Some(ContextTarget::Document(i)), 0) => self.close_tab(i),
             (Some(ContextTarget::Document(i)), 1) => self.close_other_tabs(i),
             (Some(ContextTarget::Terminal), 0) => self.kill_terminal(),
+            (Some(ContextTarget::Pane(pid, _)), 0) => {
+                if self.pane_tree.contains(pid) {
+                    self.pane_tree.focused = pid;
+                }
+                self.split_pane(SplitDir::Horizontal);
+            }
+            (Some(ContextTarget::Pane(pid, _)), 1) => {
+                if self.pane_tree.contains(pid) {
+                    self.pane_tree.focused = pid;
+                }
+                self.split_pane(SplitDir::Vertical);
+            }
+            (Some(ContextTarget::Pane(pid, true)), 2) => self.close_pane(pid),
             _ => {}
         }
     }
@@ -3008,6 +3042,162 @@ impl App {
     }
 
     /// Kill the shell and reap it (feature disable, child exit, quit).
+    // --- Ghostty-style tiled panes -----------------------------------------
+
+    /// Focused pane's terminal id, when tiling is active and a terminal tile
+    /// owns focus.
+    fn focused_pane_term_id(&self) -> Option<u64> {
+        if self.pane_tree.is_single() {
+            return None;
+        }
+        match self.pane_tree.focused_content() {
+            PaneContent::Terminal(id) => Some(id),
+            PaneContent::Editor => None,
+        }
+    }
+
+    fn pane_session(&self, id: u64) -> Option<&TerminalSession<UmberNotifier>> {
+        self.pane_terms
+            .iter()
+            .find(|(t, _)| *t == id)
+            .map(|(_, s)| s)
+    }
+
+    /// Push the pane tree's layout into the renderer and resize each tile's
+    /// PTY to its grid.
+    fn sync_panes(&mut self) {
+        let mut grids: Vec<(u64, usize, usize, u16, u16)> = Vec::new();
+        if let Some(r) = self.renderer.as_mut() {
+            if self.pane_tree.is_single() {
+                r.set_panes(None, &[], &[]);
+            } else {
+                let mut editor = None;
+                let mut terms = Vec::new();
+                for p in &self.pane_tree.layout() {
+                    let rect = [p.rect.x, p.rect.y, p.rect.w, p.rect.h];
+                    match p.content {
+                        PaneContent::Editor => editor = Some(rect),
+                        PaneContent::Terminal(tid) => {
+                            terms.push((tid, rect, self.pane_tree.focused == p.id))
+                        }
+                    }
+                }
+                let divs: Vec<PaneDividerSpec> = self
+                    .pane_tree
+                    .dividers()
+                    .iter()
+                    .map(|d| PaneDividerSpec {
+                        path: d.path,
+                        horizontal_split: matches!(d.dir, SplitDir::Horizontal),
+                        x: d.rect.x,
+                        y: d.rect.y,
+                        w: d.rect.w,
+                        h: d.rect.h,
+                    })
+                    .collect();
+                r.set_panes(editor, &terms, &divs);
+            }
+            let (cw, ch) = r.cell_px();
+            for (tid, _) in &self.pane_terms {
+                if let Some((cols, rows)) = r.term_pane_grid(*tid) {
+                    grids.push((*tid, cols, rows, cw, ch));
+                }
+            }
+            r.window().request_redraw();
+        }
+        for (tid, cols, rows, cw, ch) in grids {
+            if let Some(s) = self.pane_session(tid) {
+                s.resize(cols, rows, cw, ch);
+            }
+        }
+        self.apply_view(true);
+    }
+
+    /// Split the focused pane, spawning a shell in the new tile.
+    fn split_pane(&mut self, dir: SplitDir) {
+        if !self.features.is_enabled("terminal") {
+            self.modules_hint = Some("terminal feature is disabled".to_string());
+            return;
+        }
+        // The legacy bottom panel / terminal tab and tiling are exclusive.
+        if self.terminal.is_some() {
+            self.kill_terminal();
+        }
+        if self.term_tab_active {
+            self.deactivate_terminal_tab();
+        }
+        let Some((cw, ch)) = self.renderer.as_ref().map(|r| r.cell_px()) else {
+            return;
+        };
+        // Split the tree FIRST so the tile's real grid exists before the
+        // shell spawns — spawning small and resizing garbles the first paint.
+        let id = self.next_pane_term;
+        let pane_id = self.pane_tree.split(dir, PaneContent::Terminal(id));
+        self.sync_panes();
+        let (cols, rows) = self
+            .renderer
+            .as_ref()
+            .and_then(|r| r.term_pane_grid(id))
+            .unwrap_or((80, 24));
+        match TerminalSession::spawn_with_shell(
+            UmberNotifier(self.event_proxy.clone()),
+            cols,
+            rows,
+            cw,
+            ch,
+            None,
+        ) {
+            Ok(sess) => {
+                self.next_pane_term += 1;
+                self.pane_terms.push((id, sess));
+                self.term_focused = true;
+                self.sync_panes();
+            }
+            Err(e) => {
+                // Roll the split back; an empty tile helps nobody.
+                self.pane_tree.close(pane_id);
+                self.term_focused = self.focused_pane_term_id().is_some();
+                self.sync_panes();
+                self.modules_hint = Some(format!("terminal spawn failed: {e}"));
+            }
+        }
+    }
+
+    /// Close a tiled pane by pane id (terminal tiles only).
+    fn close_pane(&mut self, pane_id: u64) {
+        if let Some(PaneContent::Terminal(tid)) = self.pane_tree.close(pane_id) {
+            if let Some(i) = self.pane_terms.iter().position(|(t, _)| *t == tid) {
+                let (_, mut sess) = self.pane_terms.remove(i);
+                sess.shutdown();
+            }
+        }
+        self.term_focused = self.focused_pane_term_id().is_some();
+        self.sync_panes();
+    }
+
+    /// Return keyboard focus to the editor tile.
+    fn pane_focus_editor(&mut self) {
+        self.pane_tree.focused = 0;
+        self.term_focused = false;
+        self.sync_panes();
+    }
+
+    fn open_pane_context_menu(&mut self, pane_id: u64, closable: bool) {
+        if self.view != View::Editor {
+            self.close_overlay();
+        }
+        let x = self.pointer.0 as f32;
+        let y = self.pointer.1 as f32;
+        self.context_target = Some(ContextTarget::Pane(pane_id, closable));
+        if let Some(r) = self.renderer.as_mut() {
+            if closable {
+                r.set_context_menu(x, y, &["Split Right", "Split Down", "Close Pane"]);
+            } else {
+                r.set_context_menu(x, y, &["Split Right", "Split Down"]);
+            }
+        }
+    }
+
     fn kill_terminal(&mut self) {
         if let Some(mut session) = self.terminal.take() {
             session.shutdown();
@@ -3062,6 +3252,22 @@ impl App {
 
     /// Ctrl+`/Ctrl+J: toggle the terminal content tab.
     fn terminal_toggle(&mut self) {
+        // Tiled panes: Ctrl+` walks focus editor <-> first terminal tile.
+        if !self.pane_tree.is_single() {
+            if self.focused_pane_term_id().is_some() {
+                self.pane_focus_editor();
+            } else if let Some(id) = self
+                .pane_tree
+                .layout()
+                .iter()
+                .find_map(|p| matches!(p.content, PaneContent::Terminal(_)).then_some(p.id))
+            {
+                self.pane_tree.focused = id;
+                self.term_focused = true;
+                self.sync_panes();
+            }
+            return;
+        }
         if self.term_tab_active {
             self.deactivate_terminal_tab();
         } else {
@@ -3563,6 +3769,22 @@ impl App {
                 self.terminal_toggle();
                 return;
             }
+            "pane.splitRight" => {
+                self.close_overlay();
+                self.split_pane(SplitDir::Horizontal);
+                return;
+            }
+            "pane.splitDown" => {
+                self.close_overlay();
+                self.split_pane(SplitDir::Vertical);
+                return;
+            }
+            "pane.close" => {
+                self.close_overlay();
+                let focused = self.pane_tree.focused;
+                self.close_pane(focused);
+                return;
+            }
             "terminal.focus" => {
                 self.close_overlay();
                 self.open_terminal();
@@ -3672,6 +3894,33 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::TerminalWakeup => {
+                // Tiled panes first: same coalescing contract per session.
+                let mut pane_updates = Vec::new();
+                for (tid, session) in &self.pane_terms {
+                    if session.take_dirty() {
+                        let snapshot = session.styled_content();
+                        let spans: Vec<TerminalTextSpan> = snapshot
+                            .spans
+                            .iter()
+                            .map(|span| TerminalTextSpan {
+                                start: span.start,
+                                end: span.end,
+                                rgb: span.rgb,
+                                bold: span.bold,
+                                italic: span.italic,
+                            })
+                            .collect();
+                        pane_updates.push((*tid, snapshot.text, snapshot.cursor, spans));
+                    }
+                }
+                if !pane_updates.is_empty() {
+                    if let Some(renderer) = self.renderer.as_mut() {
+                        for (tid, text, cursor, spans) in &pane_updates {
+                            renderer.set_term_pane_content(*tid, text, *cursor, spans);
+                        }
+                        renderer.window().request_redraw();
+                    }
+                }
                 let Some(session) = self.terminal.as_ref() else {
                     return;
                 };
@@ -3831,6 +4080,22 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     return;
                 }
+                // Dragging a pane divider retiles live.
+                if let Some((path, horiz)) = self.pane_drag {
+                    let pos = self.renderer.as_ref().map(|r| {
+                        let (cx, cy, cw, ch) = r.content_area();
+                        if horiz {
+                            (position.x as f32 - cx) / cw.max(1.0)
+                        } else {
+                            (position.y as f32 - cy) / ch.max(1.0)
+                        }
+                    });
+                    if let Some(p) = pos {
+                        self.pane_tree.drag(path, p.clamp(0.0, 1.0));
+                        self.sync_panes();
+                    }
+                    return;
+                }
                 // Sidebar separator: dragging resizes; hovering swaps in a
                 // col-resize cursor and lights the line.
                 if self.sidebar_resizing {
@@ -3854,6 +4119,22 @@ impl ApplicationHandler<UserEvent> for App {
                             winit::window::CursorIcon::Default
                         });
                         r.window().request_redraw();
+                    }
+                }
+                // Pane divider hover: col/row resize cursor on enter/leave.
+                let div_hot = self
+                    .renderer
+                    .as_ref()
+                    .and_then(|r| r.pane_divider_at(position.x as f32, position.y as f32))
+                    .map(|(_, horiz)| horiz);
+                if div_hot != self.pane_div_hot {
+                    self.pane_div_hot = div_hot;
+                    if let Some(r) = self.renderer.as_ref() {
+                        r.window().set_cursor(match div_hot {
+                            Some(true) => winit::window::CursorIcon::ColResize,
+                            Some(false) => winit::window::CursorIcon::RowResize,
+                            None => winit::window::CursorIcon::Default,
+                        });
                     }
                 }
                 // Sidebar hover highlight (redraw only on change).
@@ -3950,9 +4231,23 @@ impl ApplicationHandler<UserEvent> for App {
                         r.sidebar_tab_at(self.pointer.0 as f32, self.pointer.1 as f32)
                     }) {
                         self.open_tab_context_menu(tab);
-                    } else {
-                        self.dismiss_context_menu();
+                        return;
                     }
+                    // Content area: pane menu (split / close tile).
+                    if self.view == View::Editor && !self.term_tab_active {
+                        if let Some((fx, fy)) = self.renderer.as_ref().and_then(|r| {
+                            r.content_frac_at(self.pointer.0 as f32, self.pointer.1 as f32)
+                        }) {
+                            let (pid, closable) = match self.pane_tree.pane_at(fx, fy) {
+                                Some((pid, PaneContent::Terminal(_))) => (pid, true),
+                                Some((pid, PaneContent::Editor)) => (pid, false),
+                                None => (self.pane_tree.focused, false),
+                            };
+                            self.open_pane_context_menu(pid, closable);
+                            return;
+                        }
+                    }
+                    self.dismiss_context_menu();
                     return;
                 }
                 // Middle-click a file tab (left bar) closes it.
@@ -3975,8 +4270,9 @@ impl ApplicationHandler<UserEvent> for App {
                 // Left tab bar: works from any view (mouse backup for the
                 // palette / find / agents / terminal / settings commands).
                 if state == ElementState::Released {
-                    // End a separator drag no matter which view is up.
+                    // End separator / divider drags no matter which view is up.
                     self.sidebar_resizing = false;
+                    self.pane_drag = None;
                 }
                 if state == ElementState::Pressed {
                     // Grab the sidebar separator to resize it.
@@ -3988,6 +4284,32 @@ impl ApplicationHandler<UserEvent> for App {
                     {
                         self.sidebar_resizing = true;
                         return;
+                    }
+                    // Grab a pane divider to retile.
+                    if let Some(hit) = self.renderer.as_ref().and_then(|r| {
+                        r.pane_divider_at(self.pointer.0 as f32, self.pointer.1 as f32)
+                    }) {
+                        self.pane_drag = Some(hit);
+                        return;
+                    }
+                    // Tiled panes: a click focuses its tile. Terminal tiles
+                    // swallow the press; the editor tile falls through to the
+                    // caret/selection path.
+                    if self.view == View::Editor
+                        && !self.pane_tree.is_single()
+                        && !self.term_tab_active
+                    {
+                        if let Some((fx, fy)) = self.renderer.as_ref().and_then(|r| {
+                            r.content_frac_at(self.pointer.0 as f32, self.pointer.1 as f32)
+                        }) {
+                            self.pane_tree.focus_at(fx, fy);
+                            let is_term = self.focused_pane_term_id().is_some();
+                            self.term_focused = is_term;
+                            self.sync_panes();
+                            if is_term {
+                                return;
+                            }
+                        }
                     }
                     // Left bar = open file tabs: click switches.
                     if let Some(tab) = self.renderer.as_ref().and_then(|r| {
@@ -4184,8 +4506,13 @@ impl ApplicationHandler<UserEvent> for App {
                         return;
                     }
                     if matches!(&event.logical_key, Key::Named(NamedKey::Escape)) {
-                        // Esc leaves the terminal tab back to the document.
-                        self.deactivate_terminal_tab();
+                        // Esc: pane focus back to the editor tile, or leave
+                        // the terminal tab for the document.
+                        if self.focused_pane_term_id().is_some() {
+                            self.pane_focus_editor();
+                        } else {
+                            self.deactivate_terminal_tab();
+                        }
                         return;
                     }
                     // F11: toggle fullscreen terminal.
@@ -4193,8 +4520,29 @@ impl ApplicationHandler<UserEvent> for App {
                         self.terminal_toggle_max();
                         return;
                     }
+                    // Split chords stay global even with terminal focus, or
+                    // a tiled shell could never be split again.
+                    if ctrl && self.modifiers.shift_key() {
+                        if let Key::Character(c) = &event.logical_key {
+                            match c.to_lowercase().as_str() {
+                                "o" => {
+                                    self.split_pane(SplitDir::Horizontal);
+                                    return;
+                                }
+                                "e" => {
+                                    self.split_pane(SplitDir::Vertical);
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    let session = self
+                        .focused_pane_term_id()
+                        .and_then(|id| self.pane_session(id))
+                        .or(self.terminal.as_ref());
                     if let (Some(session), Some(bytes)) =
-                        (self.terminal.as_ref(), Self::term_key_bytes(&event, ctrl))
+                        (session, Self::term_key_bytes(&event, ctrl))
                     {
                         session.write(bytes);
                     }
@@ -4286,6 +4634,15 @@ impl ApplicationHandler<UserEvent> for App {
                         match c.to_lowercase().as_str() {
                             "p" if shift => {
                                 self.open_palette();
+                                return;
+                            }
+                            // Ghostty-style tiling: split the focused pane.
+                            "o" if shift => {
+                                self.split_pane(SplitDir::Horizontal);
+                                return;
+                            }
+                            "e" if shift => {
+                                self.split_pane(SplitDir::Vertical);
                                 return;
                             }
                             "," => {

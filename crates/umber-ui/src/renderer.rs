@@ -160,6 +160,8 @@ const OVERLAY_HL_COLOR: [f32; 4] = [0.757, 0.373, 0.235, 0.30];
 const OVERLAY_PANEL_COLOR: [f32; 4] = [0.024, 0.020, 0.016, 0.99];
 const CONTEXT_MENU_COLOR: [f32; 4] = [0.030, 0.025, 0.020, 1.0];
 const CONTEXT_MENU_HOVER_COLOR: [f32; 4] = [0.145, 0.075, 0.042, 0.92];
+/// Focused-pane accent border (tiled panes; Ghostty-style focus ring).
+const PANE_FOCUS_BORDER_COLOR: [f32; 4] = [0.30, 0.135, 0.070, 1.0];
 /// Terminal panel background: a shade darker than the editor clear color so
 /// the panel reads as a distinct surface.
 const TERM_BG_COLOR: [f32; 4] = [0.010, 0.009, 0.008, 1.0];
@@ -294,6 +296,28 @@ pub struct TerminalTextSpan {
     pub rgb: [u8; 3],
     pub bold: bool,
     pub italic: bool,
+}
+
+/// One tiled terminal pane's render state (Ghostty-style splits).
+struct TermPaneView {
+    id: u64,
+    /// Normalized share of the content area.
+    rect: [f32; 4],
+    buffer: Buffer,
+    cursor: Option<(usize, usize)>,
+    focused: bool,
+}
+
+/// Divider hit-test spec from the app's pane tree, normalized to the
+/// content area. `horizontal_split` = the divider line is vertical.
+#[derive(Debug, Clone, Copy)]
+pub struct PaneDividerSpec {
+    pub path: u32,
+    pub horizontal_split: bool,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
 }
 
 /// Physical-pixel scrollbar rectangles, shared by the renderer's draw path and
@@ -594,6 +618,13 @@ pub struct Renderer {
     term_maximized: bool,
     /// User drag-resize height fraction override (else `TERM_SPLIT_FRAC`).
     term_split_frac_override: Option<f32>,
+    /// Tiled panes (Ghostty-style splits). `None` = the editor alone fills
+    /// the content area and all legacy geometry applies unchanged.
+    editor_pane: Option<[f32; 4]>,
+    term_panes: Vec<TermPaneView>,
+    /// Divider hit-test specs: (split path, is-horizontal-split, normalized
+    /// line rect within the content area).
+    pane_divs: Vec<PaneDividerSpec>,
     term_text: String,
     term_spans: Vec<TerminalTextSpan>,
     term_cursor: Option<(usize, usize)>,
@@ -880,7 +911,9 @@ impl Renderer {
         });
         let sidebar_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("umber sidebar bg"),
-            size: (96 * QUAD_FLOATS_PER_VERT * 4) as wgpu::BufferAddress,
+            // 64 quads (6 verts each): base shell chrome runs ~15, context
+            // menus add 3, and every tiled terminal pane adds up to 3 more.
+            size: (384 * QUAD_FLOATS_PER_VERT * 4) as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -957,6 +990,9 @@ impl Renderer {
             term_focused: false,
             term_maximized: false,
             term_split_frac_override: None,
+            editor_pane: None,
+            term_panes: Vec::new(),
+            pane_divs: Vec::new(),
             term_text: String::new(),
             term_spans: Vec::new(),
             term_cursor: None,
@@ -1144,7 +1180,54 @@ impl Renderer {
     /// Left content edge: past the floating sidebar and the shell gutter.
     /// Gutter, document, terminal, and hit-testing share this origin.
     pub fn left_edge(&self) -> f32 {
-        self.sidebar_w() + SHELL_GAP * self.scale_factor as f32 + self.pad_px()
+        if self.editor_pane.is_some() {
+            let (px, ..) = self.editor_card_rect();
+            px + self.pad_px()
+        } else {
+            self.sidebar_w() + SHELL_GAP * self.scale_factor as f32 + self.pad_px()
+        }
+    }
+
+    /// The region tiled by panes: the full editor-card footprint between
+    /// sidebar, dock, and window edges (physical px: x, y, w, h).
+    pub fn content_area(&self) -> (f32, f32, f32, f32) {
+        let s = self.scale_factor as f32;
+        let gap = SHELL_GAP * s;
+        let fw = self.surface_config.width as f32;
+        let fh = self.surface_config.height as f32;
+        let x = self.sidebar_w() + gap;
+        let y = self.doc_top_base() - self.pad_px() * 0.45;
+        (x, y, (fw - x - gap).max(1.0), (fh - gap - y).max(1.0))
+    }
+
+    /// A pane's floating card in physical px: its normalized share of the
+    /// content area, deflated by half a shell gap so tiles visibly separate.
+    fn pane_card_px(&self, r: [f32; 4]) -> (f32, f32, f32, f32) {
+        let (cx, cy, cw, ch) = self.content_area();
+        let g = SHELL_GAP * self.scale_factor as f32 * 0.5;
+        (
+            cx + r[0] * cw + g,
+            cy + r[1] * ch + g,
+            (r[2] * cw - g * 2.0).max(1.0),
+            (r[3] * ch - g * 2.0).max(1.0),
+        )
+    }
+
+    /// The editor's card rect in physical px — the pane share when tiled,
+    /// else the legacy full content area (minus the bottom-split terminal).
+    pub fn editor_card_rect(&self) -> (f32, f32, f32, f32) {
+        if let Some(r) = self.editor_pane {
+            return self.pane_card_px(r);
+        }
+        let (cx, cy, cw, _) = self.content_area();
+        let gap = SHELL_GAP * self.scale_factor as f32;
+        let fh = self.surface_config.height as f32;
+        let bottom = if self.term_open {
+            self.term_top() - gap
+        } else {
+            fh - gap
+        };
+        (cx, cy, cw, (bottom - cy).max(1.0))
     }
 
     /// Y where the sidebar file-tab list begins: below the banner + activity
@@ -1178,8 +1261,19 @@ impl Renderer {
         self.left_edge() + self.gutter_width()
     }
 
-    /// Y of the inset editor canvas, below the floating command dock.
+    /// Y of the inset editor canvas, below the floating command dock (or
+    /// within the editor's pane card when tiling is active).
     pub fn doc_top(&self) -> f32 {
+        if self.editor_pane.is_some() {
+            let (_, py, ..) = self.editor_card_rect();
+            py + self.pad_px() * 0.45
+        } else {
+            self.doc_top_base()
+        }
+    }
+
+    /// Legacy single-pane doc top (also the content area's inner top).
+    fn doc_top_base(&self) -> f32 {
         self.tabstrip_top() + self.tabstrip_h().max(self.line_px() * 1.3) + self.pad_px()
     }
 
@@ -1284,7 +1378,11 @@ impl Renderer {
     pub fn set_context_menu(&mut self, x: f32, y: f32, labels: &[&str]) {
         let s = self.scale_factor as f32;
         let pad = 10.0 * s;
-        let row_h = self.line_px() * 1.35;
+        // Row pitch MUST equal the label buffer's line height: hit-test,
+        // hover pill, and card height all derive from it, and any other
+        // value drifts from the rendered rows (a 3-row menu once executed
+        // "Split Down" from a click on "Close Pane").
+        let row_h = self.line_px();
         let max_chars = labels.iter().map(|s| s.chars().count()).max().unwrap_or(1);
         // One extra cell of slack: `cell_w` is an advance estimate, and the
         // longest label must not kiss the card edge.
@@ -1334,7 +1432,7 @@ impl Renderer {
         }
         let s = self.scale_factor as f32;
         let pad_y = 5.0 * s;
-        let row_h = self.line_px() * 1.35;
+        let row_h = self.line_px();
         let height = self.context_rows as f32 * row_h + pad_y * 2.0;
         if x < self.context_x
             || x > self.context_x + self.context_width
@@ -1378,6 +1476,14 @@ impl Renderer {
 
     /// Document shaping box in physical pixels (width and visible height).
     fn doc_size(&self) -> (f32, f32) {
+        if self.editor_pane.is_some() {
+            // Pane card: right/bottom edges come from the card itself (the
+            // half-gap deflation already separates tiles).
+            let (px, py, pw, ph) = self.editor_card_rect();
+            let w = (px + pw - self.text_left() - self.pad_px()).max(1.0);
+            let h = (py + ph - self.doc_top() - self.pad_px()).max(1.0);
+            return (w, h);
+        }
         let inset = SHELL_GAP * self.scale_factor as f32;
         let w =
             (self.surface_config.width as f32 - self.text_left() - self.pad_px() - inset).max(1.0);
@@ -1390,6 +1496,10 @@ impl Renderer {
     /// region (shaping box, line capacity, scrollbar track, hover/click
     /// mapping in the bin) derives from this so the panel shrink is uniform.
     pub fn doc_bottom(&self) -> f32 {
+        if self.editor_pane.is_some() {
+            let (_, py, _, ph) = self.editor_card_rect();
+            return py + ph;
+        }
         if self.term_open {
             self.term_top()
         } else {
@@ -1787,6 +1897,168 @@ impl Renderer {
         }
         self.term_split_frac_override = Some(frac.clamp(0.1, 0.85));
         self.reflow_terminal_geometry();
+    }
+
+    /// Sync the tiled-pane layout from the app's pane tree: the editor's
+    /// normalized rect (`None` = tiling off), terminal panes (id, rect,
+    /// focused), and divider specs. Buffers are created/dropped by id and
+    /// every pane reflows to its card.
+    pub fn set_panes(
+        &mut self,
+        editor: Option<[f32; 4]>,
+        terms: &[(u64, [f32; 4], bool)],
+        divs: &[PaneDividerSpec],
+    ) {
+        self.editor_pane = editor;
+        self.pane_divs = divs.to_vec();
+        self.term_panes
+            .retain(|p| terms.iter().any(|(id, ..)| *id == p.id));
+        let metrics = self.doc_buffer.metrics();
+        for &(id, rect, focused) in terms {
+            if let Some(p) = self.term_panes.iter_mut().find(|p| p.id == id) {
+                p.rect = rect;
+                p.focused = focused;
+            } else {
+                let mut buffer = Buffer::new(&mut self.font_system, metrics);
+                buffer.set_wrap(Wrap::None);
+                self.term_panes.push(TermPaneView {
+                    id,
+                    rect,
+                    buffer,
+                    cursor: None,
+                    focused,
+                });
+            }
+        }
+        for i in 0..self.term_panes.len() {
+            let (_, _, pw, ph) = self.pane_card_px(self.term_panes[i].rect);
+            let w = (pw - self.pad_px() * 2.0).max(1.0);
+            let h = (ph - self.pad_px() * 2.0).max(1.0);
+            self.term_panes[i].buffer.set_size(Some(w), Some(h));
+            self.term_panes[i]
+                .buffer
+                .shape_until_scroll(&mut self.font_system, false);
+        }
+        let (w, h) = self.doc_size();
+        self.doc_buffer.set_size(Some(w), Some(h));
+        self.doc_buffer
+            .shape_until_scroll(&mut self.font_system, false);
+        let gw = self.gutter_text_w().max(1.0);
+        let gh = self.doc_size().1;
+        self.gutter_buffer.set_size(Some(gw), Some(gh));
+        self.gutter_buffer
+            .shape_until_scroll(&mut self.font_system, false);
+        self.window.request_redraw();
+    }
+
+    /// True when Ghostty-style tiling is active.
+    pub fn panes_active(&self) -> bool {
+        self.editor_pane.is_some()
+    }
+
+    /// Terminal pane grid `(cols, rows)` for PTY sizing.
+    pub fn term_pane_grid(&self, id: u64) -> Option<(usize, usize)> {
+        let p = self.term_panes.iter().find(|p| p.id == id)?;
+        let (_, _, pw, ph) = self.pane_card_px(p.rect);
+        let cols = ((pw - self.pad_px() * 2.0) / self.cell_w())
+            .floor()
+            .max(1.0) as usize;
+        let rows = ((ph - self.pad_px() * 2.0) / self.line_px())
+            .floor()
+            .max(1.0) as usize;
+        Some((cols, rows))
+    }
+
+    /// Reshape one terminal pane's grid snapshot (rich spans + cursor cell).
+    pub fn set_term_pane_content(
+        &mut self,
+        id: u64,
+        text: &str,
+        cursor: Option<(usize, usize)>,
+        spans: &[TerminalTextSpan],
+    ) {
+        let Some(i) = self.term_panes.iter().position(|p| p.id == id) else {
+            return;
+        };
+        self.term_panes[i].cursor = cursor;
+        let default_attrs = Attrs::new().family(Family::Monospace);
+        if spans.is_empty() {
+            self.term_panes[i]
+                .buffer
+                .set_text(text, &default_attrs, Shaping::Advanced, None);
+        } else {
+            let mut rich: Vec<(&str, Attrs)> = Vec::with_capacity(spans.len() * 2 + 1);
+            let mut pos = 0;
+            for span in spans {
+                if span.start > pos {
+                    if let Some(segment) = text.get(pos..span.start) {
+                        rich.push((segment, default_attrs.clone()));
+                    }
+                }
+                if let Some(segment) = text.get(span.start..span.end) {
+                    let mut attrs = default_attrs.clone().color(Color::rgb(
+                        span.rgb[0],
+                        span.rgb[1],
+                        span.rgb[2],
+                    ));
+                    if span.bold {
+                        attrs = attrs.weight(Weight::BOLD);
+                    }
+                    if span.italic {
+                        attrs = attrs.style(FontStyle::Italic);
+                    }
+                    rich.push((segment, attrs));
+                }
+                pos = span.end;
+            }
+            if let Some(segment) = text.get(pos..) {
+                rich.push((segment, default_attrs.clone()));
+            }
+            self.term_panes[i]
+                .buffer
+                .set_rich_text(rich, &default_attrs, Shaping::Advanced, None);
+        }
+        self.term_panes[i]
+            .buffer
+            .shape_until_scroll(&mut self.font_system, false);
+        self.window.request_redraw();
+    }
+
+    /// Normalize a window point into the content area (0..1), if inside.
+    pub fn content_frac_at(&self, x: f32, y: f32) -> Option<(f32, f32)> {
+        let (cx, cy, cw, ch) = self.content_area();
+        if x < cx || y < cy || x >= cx + cw || y >= cy + ch {
+            return None;
+        }
+        Some(((x - cx) / cw, (y - cy) / ch))
+    }
+
+    /// Divider under the pointer: `(split path, is-horizontal-split)`, with
+    /// a full tile-gap of grab tolerance.
+    pub fn pane_divider_at(&self, x: f32, y: f32) -> Option<(u32, bool)> {
+        if self.editor_pane.is_none() {
+            return None;
+        }
+        let (cx, cy, cw, ch) = self.content_area();
+        let tol = SHELL_GAP * self.scale_factor as f32;
+        for d in &self.pane_divs {
+            if d.horizontal_split {
+                let dx = cx + d.x * cw;
+                let y0 = cy + d.y * ch;
+                let y1 = y0 + d.h * ch;
+                if (x - dx).abs() <= tol && y >= y0 && y <= y1 {
+                    return Some((d.path, true));
+                }
+            } else {
+                let dy = cy + d.y * ch;
+                let x0 = cx + d.x * cw;
+                let x1 = x0 + d.w * cw;
+                if (y - dy).abs() <= tol && x >= x0 && x <= x1 {
+                    return Some((d.path, false));
+                }
+            }
+        }
+        None
     }
 
     /// Reflow document, gutter, and terminal buffers to the current panel
@@ -2210,6 +2482,11 @@ impl Renderer {
         let term_open = self.term_open;
         let term_top = self.term_top();
         let doc_bottom = self.doc_bottom();
+        // Editor glyphs clip to the editor card: with `Wrap::None`, long
+        // lines otherwise run under tiled panes to the window edge.
+        let card = self.editor_card_rect();
+        let doc_clip_right = (card.0 + card.2) as i32;
+        let doc_clip_bottom = (card.1 + card.3) as i32;
         let w = self.surface_config.width as i32;
         let h = self.surface_config.height as i32;
 
@@ -2308,7 +2585,7 @@ impl Renderer {
                     left: 0,
                     top: doc_top as i32,
                     right: text_left as i32,
-                    bottom: h,
+                    bottom: doc_clip_bottom,
                 },
                 default_color: GUTTER_COLOR,
                 custom_glyphs: &[],
@@ -2322,8 +2599,8 @@ impl Renderer {
             bounds: TextBounds {
                 left: text_left as i32,
                 top: doc_top as i32,
-                right: w,
-                bottom: h,
+                right: doc_clip_right,
+                bottom: doc_clip_bottom,
             },
             default_color: Color::rgb(232, 226, 213),
             custom_glyphs: &[],
@@ -2341,6 +2618,24 @@ impl Renderer {
                     top: term_top as i32,
                     right: w,
                     bottom: h,
+                },
+                default_color: TERM_TEXT_COLOR,
+                custom_glyphs: &[],
+            });
+        }
+        // Tiled terminal panes: each pane's grid clipped to its own card.
+        for p in &self.term_panes {
+            let (px, py, pw, ph) = self.pane_card_px(p.rect);
+            areas.push(TextArea {
+                buffer: &p.buffer,
+                left: px + pad,
+                top: py + pad,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: px as i32,
+                    top: py as i32,
+                    right: (px + pw) as i32,
+                    bottom: (py + ph) as i32,
                 },
                 default_color: TERM_TEXT_COLOR,
                 custom_glyphs: &[],
@@ -2912,13 +3207,9 @@ impl Renderer {
             let s = self.scale_factor as f32;
             let gap = SHELL_GAP * s;
             let sidebar_w = self.sidebar_w();
-            let editor_x = le - self.pad_px();
-            let editor_y = self.doc_top() - self.pad_px() * 0.45;
-            let editor_bottom = if self.term_open {
-                self.term_top() - gap
-            } else {
-                fh - gap
-            };
+            // Editor card: the pane share when tiling, else legacy full-area.
+            let (editor_x, editor_y, editor_w, editor_h) = self.editor_card_rect();
+            let _ = le;
             let border = s.max(1.0);
             let dock_x = sidebar_w + gap;
             let dock_w = (fw - sidebar_w - gap * 2.0).max(1.0);
@@ -2946,8 +3237,9 @@ impl Renderer {
                 (SHELL_RADIUS * s - border).max(1.0),
             );
             // Inset editor canvas below the dock, with its own hairline edge.
-            let editor_w = (fw - editor_x - gap).max(1.0);
-            let editor_h = (editor_bottom - editor_y).max(1.0);
+            // When tiling is active, editor focus wears the accent ring.
+            let editor_ring =
+                self.editor_pane.is_some() && !self.term_panes.iter().any(|p| p.focused);
             sidebar_verts += push_rquad(
                 &mut self.sidebar_bytes,
                 fw,
@@ -2956,7 +3248,11 @@ impl Renderer {
                 editor_y,
                 editor_w,
                 editor_h,
-                PANEL_BORDER_COLOR,
+                if editor_ring {
+                    PANE_FOCUS_BORDER_COLOR
+                } else {
+                    PANEL_BORDER_COLOR
+                },
                 SHELL_RADIUS * s,
             );
             sidebar_verts += push_rquad(
@@ -2970,6 +3266,59 @@ impl Renderer {
                 EDITOR_PANEL_COLOR,
                 (SHELL_RADIUS * s - border).max(1.0),
             );
+            // Tiled terminal pane cards: same border+fill language as the
+            // editor; the focused pane wears the accent ring. Cursor blocks
+            // draw here (pre-text) so glyphs stay legible over them.
+            let (pcell_w, pline_px, ppad) = (self.cell_w(), self.line_px(), self.pad_px());
+            for i in 0..self.term_panes.len() {
+                let (px, py, pw, ph) = self.pane_card_px(self.term_panes[i].rect);
+                let p = &self.term_panes[i];
+                let ring = if p.focused {
+                    PANE_FOCUS_BORDER_COLOR
+                } else {
+                    PANEL_BORDER_COLOR
+                };
+                sidebar_verts += push_rquad(
+                    &mut self.sidebar_bytes,
+                    fw,
+                    fh,
+                    px,
+                    py,
+                    pw,
+                    ph,
+                    ring,
+                    SHELL_RADIUS * s,
+                );
+                sidebar_verts += push_rquad(
+                    &mut self.sidebar_bytes,
+                    fw,
+                    fh,
+                    px + border,
+                    py + border,
+                    (pw - border * 2.0).max(1.0),
+                    (ph - border * 2.0).max(1.0),
+                    TERM_BG_COLOR,
+                    (SHELL_RADIUS * s - border).max(1.0),
+                );
+                // Snapshot cursor tuple is (row, col) — terminal.rs:styled_content.
+                if let Some((line, col)) = p.cursor {
+                    let cx0 = px + ppad + col as f32 * pcell_w;
+                    let cy0 = py + ppad + line as f32 * pline_px;
+                    if cx0 + pcell_w <= px + pw && cy0 + pline_px <= py + ph {
+                        sidebar_verts += push_rquad(
+                            &mut self.sidebar_bytes,
+                            fw,
+                            fh,
+                            cx0,
+                            cy0,
+                            pcell_w,
+                            pline_px,
+                            TERM_CURSOR_COLOR,
+                            2.0 * s,
+                        );
+                    }
+                }
+            }
             // Hovered action: a rounded pill wash sized from the REAL glyph
             // extents (pixel-exact; no column arithmetic).
             if let Some(hrow) = self.tabstrip_hover {
@@ -3085,7 +3434,7 @@ impl Renderer {
         if self.context_active {
             let s = self.scale_factor as f32;
             let pad_y = 5.0 * s;
-            let row_h = self.line_px() * 1.35;
+            let row_h = self.line_px();
             let menu_h = self.context_rows as f32 * row_h + pad_y * 2.0;
             sidebar_verts += push_rquad(
                 &mut self.sidebar_bytes,

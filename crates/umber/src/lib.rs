@@ -9,6 +9,7 @@ pub mod agent_rpc;
 pub mod agents;
 pub mod git;
 pub mod lsp;
+pub mod panes;
 pub mod remote;
 pub mod search;
 pub mod terminal;
