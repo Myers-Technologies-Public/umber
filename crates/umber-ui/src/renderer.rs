@@ -468,6 +468,8 @@ pub struct Renderer {
     hover_word_buffer: Buffer,
     /// Corner wordmark, shaped once at construction/scale change.
     wordmark_buffer: Buffer,
+    /// Tiny uppercase section header above the file tabs (T3-style).
+    sidebar_header_buffer: Buffer,
     hover_word_text: String,
     hover_word: Option<(usize, usize)>,
     hover_line: Option<usize>,
@@ -652,6 +654,15 @@ impl Renderer {
             None,
         );
         wordmark_buffer.shape_until_scroll(&mut font_system, false);
+        let mut sidebar_header_buffer = Buffer::new(&mut font_system, metrics);
+        sidebar_header_buffer.set_wrap(Wrap::None);
+        sidebar_header_buffer.set_text(
+            "OPEN EDITORS",
+            &Attrs::new().family(Family::Monospace),
+            Shaping::Advanced,
+            None,
+        );
+        sidebar_header_buffer.shape_until_scroll(&mut font_system, false);
 
         // The cursor is a single glyph, shaped once here and re-shaped only on a
         // scale change.
@@ -776,6 +787,7 @@ impl Renderer {
             selection: Vec::new(),
             hover_word_buffer,
             wordmark_buffer,
+            sidebar_header_buffer,
             hover_word_text: String::new(),
             hover_word: None,
             hover_line: None,
@@ -954,7 +966,8 @@ impl Renderer {
     /// strip line, aligned with the document top (keeps the window corner
     /// clean instead of crowding a tab against it).
     fn sidebar_top(&self) -> f32 {
-        self.doc_top() + self.line_px() * 0.2
+        // Below the section header row.
+        self.doc_top() + self.line_px() * 1.5
     }
 
     /// Sidebar tab index at physical `(x, y)`, or `None`. Tabs stack from the
@@ -1050,10 +1063,16 @@ impl Renderer {
         let fh = self.surface_config.height as f32;
         let pad = self.pad_px();
         let line_px = self.line_px();
-        let px = (self.overlay_content_left() - pad * 1.5).max(0.0);
-        let py = (self.overlay_top() - line_px * 0.5).max(0.0);
-        let pw = (self.overlay_content_width() + pad * 3.0).min(fw - px);
-        let ph = (fh - py - pad).max(0.0);
+        let px = (self.overlay_content_left() - pad * 2.0).max(0.0);
+        let py = (self.overlay_top() - line_px * 0.6).max(0.0);
+        let pw = (self.overlay_content_width() + pad * 4.0).min(fw - px);
+        // T3-style floating card: the panel height fits its content (header +
+        // rows + hint) instead of running to the bottom of the window.
+        let content_bottom =
+            self.overlay_rows_top() + self.overlay_row_count as f32 * line_px + line_px * 1.6;
+        let ph = (content_bottom - py + pad)
+            .min(fh - py - pad)
+            .max(line_px * 2.0);
         (px, py, pw, ph)
     }
 
@@ -1469,7 +1488,7 @@ impl Renderer {
     /// Y of the first overlay list row (below the header, if any).
     fn overlay_rows_top(&self) -> f32 {
         if self.overlay_has_input || self.overlay_has_title {
-            self.overlay_top() + self.line_px() * 1.6
+            self.overlay_top() + self.line_px() * 1.9
         } else {
             self.overlay_top()
         }
@@ -1752,7 +1771,20 @@ impl Renderer {
                 if self.stats_prefix.is_empty() {
                     lat
                 } else {
-                    format!("{}    {}", self.stats_prefix, lat)
+                    // Right-align the latency segment across the banner (T3-
+                    // style decluttered bar: identity left, status right).
+                    // Monospace makes this a column count.
+                    let cols = ((self.surface_config.width as f32
+                        - self.left_edge()
+                        - self.pad_px() * 2.0)
+                        / self.cell_w())
+                    .floor() as usize;
+                    let used = self.stats_prefix.chars().count() + lat.chars().count();
+                    if cols > used + 2 {
+                        format!("{}{}{}", self.stats_prefix, " ".repeat(cols - used), lat)
+                    } else {
+                        format!("{}    {}", self.stats_prefix, lat)
+                    }
                 }
             };
             self.stats_buffer.set_text(
@@ -1798,6 +1830,21 @@ impl Renderer {
                     bottom: h,
                 },
                 default_color: WORDMARK_COLOR,
+                custom_glyphs: &[],
+            });
+            // Tiny uppercase section header above the file tabs.
+            areas.push(TextArea {
+                buffer: &self.sidebar_header_buffer,
+                left: pad * 1.1,
+                top: doc_top + line_px * 0.2,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: 0,
+                    top: 0,
+                    right: self.sidebar_w() as i32,
+                    bottom: h,
+                },
+                default_color: GUTTER_COLOR,
                 custom_glyphs: &[],
             });
         }
@@ -1973,7 +2020,9 @@ impl Renderer {
             let ov_top = self.overlay_top();
             let ov_rows_top = self.overlay_rows_top();
             let right_x = ov_left + ov_w * self.overlay_split_frac;
-            let hint_y = self.surface_config.height as f32 - self.pad_px() - line_px;
+            // Hint docks to the bottom of the floating card, not the window.
+            let (_, card_y, _, card_h) = self.overlay_panel_bounds();
+            let hint_y = card_y + card_h - line_px * 1.3;
             let full = TextBounds {
                 left: 0,
                 top: 0,
@@ -2277,10 +2326,7 @@ impl Renderer {
             );
             // Opaque content panel behind the whole page (title/input, rows,
             // hint) so overlay text never fights the editor text behind it.
-            let panel_x = (ov_left - pad * 1.5).max(0.0);
-            let panel_y = (ov_top - line_px * 0.5).max(0.0);
-            let panel_w = (ov_w + pad * 3.0).min(fw - panel_x);
-            let panel_h = (fh - panel_y - pad).max(0.0);
+            let (panel_x, panel_y, panel_w, panel_h) = self.overlay_panel_bounds();
             ov_verts += push_quad(
                 &mut self.quad_bytes,
                 fw,
