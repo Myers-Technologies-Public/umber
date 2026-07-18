@@ -1075,9 +1075,12 @@ impl Renderer {
 
     /// Terminal grid size `(cols, lines)` for PTY sizing.
     pub fn term_grid_size(&self) -> (usize, usize) {
-        let cols = ((self.surface_config.width as f32 - self.pad_px() * 2.0) / self.cell_w())
-            .floor()
-            .max(1.0) as usize;
+        // Width available to the grid = window minus the sidebar + padding,
+        // or long lines wrap/clip at the right edge.
+        let cols = ((self.surface_config.width as f32 - self.left_edge() - self.pad_px())
+            / self.cell_w())
+        .floor()
+        .max(1.0) as usize;
         let lines = ((self.term_split_h() - self.pad_px() * 2.0) / self.line_px())
             .floor()
             .max(1.0) as usize;
@@ -1324,7 +1327,7 @@ impl Renderer {
             Shaping::Advanced,
             None,
         );
-        let w = (self.surface_config.width as f32 - self.pad_px() * 2.0).max(1.0);
+        let w = (self.surface_config.width as f32 - self.left_edge() - self.pad_px()).max(1.0);
         let h = (self.term_split_h() - self.pad_px()).max(1.0);
         self.term_buffer.set_size(Some(w), Some(h));
         self.term_buffer
@@ -2119,17 +2122,9 @@ impl Renderer {
         if term_open {
             let s = self.scale_factor as f32;
             let border_h = (1.0 * s).max(1.0);
-            // Panel background first (text draws over it), then border/cursor.
-            term_verts += push_quad(
-                &mut self.quad_bytes,
-                fw,
-                fh,
-                0.0,
-                term_top,
-                fw,
-                (fh - term_top).max(0.0),
-                TERM_BG_COLOR,
-            );
+            // Border + cursor only — the panel BACKGROUND is drawn in the
+            // pre-text chrome range (drawing it here, after the text pass,
+            // painted over the grid glyphs: the missing-terminal-text bug).
             term_verts += push_quad(
                 &mut self.quad_bytes,
                 fw,
@@ -2146,7 +2141,8 @@ impl Renderer {
             );
             if !self.overlay_active {
                 if let Some((row, col)) = self.term_cursor {
-                    let x = pad + col as f32 * cell_w;
+                    // Grid origin = the content left edge (past the sidebar).
+                    let x = left + col as f32 * cell_w;
                     let y = term_top + pad + row as f32 * line_px;
                     if y + line_px <= fh {
                         term_verts += push_quad(
@@ -2330,6 +2326,21 @@ impl Renderer {
                     TABSTRIP_ACTIVE_COLOR,
                 );
             }
+        }
+        // Terminal panel background — BEHIND the text pass so the grid
+        // glyphs render on top of it.
+        if self.term_open {
+            let t_top = self.term_top();
+            sidebar_verts += push_quad(
+                &mut self.sidebar_bytes,
+                fw,
+                fh,
+                0.0,
+                t_top,
+                fw,
+                (fh - t_top).max(0.0),
+                TERM_BG_COLOR,
+            );
         }
         if sidebar_verts > 0 {
             self.queue
