@@ -117,6 +117,28 @@ fn ansi_color_sequences_parse_without_panic() {
         wait_for(|| grid_contains(&session, "UMBER_RED")),
         "colored text never appeared (or the parser panicked)"
     );
+    let snapshot = session.styled_content();
+    let red = snapshot
+        .text
+        .find("UMBER_RED")
+        .expect("red text in snapshot");
+    let red_span = snapshot
+        .spans
+        .iter()
+        .find(|span| span.start <= red && span.end >= red + "UMBER_RED".len())
+        .expect("ANSI red foreground span");
+    assert_eq!(red_span.rgb, [205, 92, 72]);
+    let blue = snapshot
+        .text
+        .find("BLUE_BG")
+        .expect("bold text in snapshot");
+    assert!(
+        snapshot
+            .spans
+            .iter()
+            .any(|span| span.start <= blue && span.end >= blue + "BLUE_BG".len() && span.bold),
+        "bold flag should survive the terminal snapshot"
+    );
 }
 
 #[test]

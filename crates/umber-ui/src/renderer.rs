@@ -16,7 +16,10 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Wrap};
+use cosmic_text::{
+    Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style as FontStyle, SwashCache,
+    Weight, Wrap,
+};
 use glyphon::{Cache, Resolution, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport};
 use umber_syntax::{Lang, Style as SynStyle, SyntaxSet};
 use winit::event_loop::ActiveEventLoop;
@@ -104,12 +107,21 @@ const CURRENT_LINE_COLOR: [f32; 4] = [0.95, 0.90, 0.80, 0.045];
 /// Per-tab vertical pitch as a multiple of the line height.
 const SIDEBAR_TAB_PITCH: f32 = 1.4;
 /// Expanded activity-bar width (icons + text labels).
-const SIDEBAR_W_EXPANDED: f32 = 168.0;
+const SIDEBAR_W_EXPANDED: f32 = 208.0;
 /// Tab labels shown when expanded (aligned to the glyph rows).
 const SIDEBAR_LABELS: &str = "Palette\nFind\nAgents\nTerminal\nSettings";
-const SIDEBAR_HOVER_COLOR: [f32; 4] = [1.0, 1.0, 0.96, 0.045];
-/// The draggable sidebar|content separator line.
-const SIDEBAR_SEAM_COLOR: [f32; 4] = [0.45, 0.42, 0.36, 0.45];
+const SIDEBAR_HOVER_COLOR: [f32; 4] = [1.0, 0.96, 0.88, 0.075];
+const SIDEBAR_ACTIVE_CARD_COLOR: [f32; 4] = [0.095, 0.055, 0.035, 0.72];
+/// Floating-shell surfaces. These deliberately create a new silhouette rather
+/// than recoloring the old full-bleed columns.
+const SHELL_GAP: f32 = 8.0;
+const SHELL_RADIUS: f32 = 12.0;
+// Quad colors are linear (the swapchain is sRGB), hence the deliberately
+// small values: these display as warm near-black rather than middle grey.
+const SIDEBAR_PANEL_COLOR: [f32; 4] = [0.020, 0.017, 0.014, 1.0];
+const TOP_DOCK_COLOR: [f32; 4] = [0.026, 0.022, 0.018, 0.99];
+const EDITOR_PANEL_COLOR: [f32; 4] = [0.014, 0.012, 0.010, 1.0];
+const PANEL_BORDER_COLOR: [f32; 4] = [0.095, 0.070, 0.050, 1.0];
 
 /// Warm syntax palette (tree-sitter styles -> colors).
 fn syntax_color(style: SynStyle) -> Color {
@@ -140,14 +152,14 @@ const TABSTRIP_TEXT_COLOR: Color = Color::rgb(168, 161, 148);
 /// the modal; the box sits behind the palette input; the highlight marks the
 /// selected row (subtle grey-blue, not the rust accent).
 const OVERLAY_DIM_COLOR: [f32; 4] = [0.030, 0.027, 0.024, 0.72];
-const OVERLAY_BOX_COLOR: [f32; 4] = [0.150, 0.138, 0.122, 0.95];
+const OVERLAY_BOX_COLOR: [f32; 4] = [0.045, 0.038, 0.030, 0.98];
 const OVERLAY_HL_COLOR: [f32; 4] = [0.757, 0.373, 0.235, 0.30];
 /// Opaque panel behind overlay page content — without it the page text sits
 /// directly on the dimmed editor and is hard to read (user-reported).
-const OVERLAY_PANEL_COLOR: [f32; 4] = [0.105, 0.096, 0.086, 0.98];
+const OVERLAY_PANEL_COLOR: [f32; 4] = [0.024, 0.020, 0.016, 0.99];
 /// Terminal panel background: a shade darker than the editor clear color so
 /// the panel reads as a distinct surface.
-const TERM_BG_COLOR: [f32; 4] = [0.045, 0.041, 0.037, 1.0];
+const TERM_BG_COLOR: [f32; 4] = [0.010, 0.009, 0.008, 1.0];
 
 /// Overlay text colors. Title uses the Crail rust accent (Claude Code
 /// palette); input is bright; hint is dim. Row column colors are supplied
@@ -269,6 +281,16 @@ pub struct SelSpan {
     pub line: usize,
     pub start_col: usize,
     pub end_col: Option<usize>,
+}
+
+/// UI-neutral rich-text span for a terminal snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalTextSpan {
+    pub start: usize,
+    pub end: usize,
+    pub rgb: [u8; 3],
+    pub bold: bool,
+    pub italic: bool,
 }
 
 /// Physical-pixel scrollbar rectangles, shared by the renderer's draw path and
@@ -561,6 +583,7 @@ pub struct Renderer {
     /// User drag-resize height fraction override (else `TERM_SPLIT_FRAC`).
     term_split_frac_override: Option<f32>,
     term_text: String,
+    term_spans: Vec<TerminalTextSpan>,
     term_cursor: Option<(usize, usize)>,
     term_buffer: Buffer,
     sidebar_enabled: bool,
@@ -914,6 +937,7 @@ impl Renderer {
             term_maximized: false,
             term_split_frac_override: None,
             term_text: String::new(),
+            term_spans: Vec::new(),
             term_cursor: None,
             term_buffer,
             sidebar_enabled: true,
@@ -1023,7 +1047,7 @@ impl Renderer {
     /// Whether physical x is on the draggable sidebar separator (±5px).
     pub fn sidebar_edge_hit(&self, x: f32) -> bool {
         let w = self.sidebar_w();
-        w > 0.0 && (x - w).abs() <= 5.0 * self.scale_factor as f32
+        w > 0.0 && (x - w).abs() <= 7.0 * self.scale_factor as f32
     }
 
     /// Mark the separator hot (hover/drag); returns true when changed.
@@ -1090,11 +1114,10 @@ impl Renderer {
         }
     }
 
-    /// Left content edge: past the activity bar, plus window padding. Banner,
-    /// gutter, and terminal all originate here so the sidebar shift is applied
-    /// in exactly one place.
+    /// Left content edge: past the floating sidebar and the shell gutter.
+    /// Gutter, document, terminal, and hit-testing share this origin.
     pub fn left_edge(&self) -> f32 {
-        self.sidebar_w() + self.pad_px()
+        self.sidebar_w() + SHELL_GAP * self.scale_factor as f32 + self.pad_px()
     }
 
     /// Y where the sidebar file-tab list begins: below the banner + activity
@@ -1128,15 +1151,14 @@ impl Renderer {
         self.left_edge() + self.gutter_width()
     }
 
-    /// Y of the document top: below the stats banner.
+    /// Y of the inset editor canvas, below the floating command dock.
     pub fn doc_top(&self) -> f32 {
-        self.tabstrip_top() + self.tabstrip_h().max(self.line_px() * 1.3) + self.pad_px() * 0.5
+        self.tabstrip_top() + self.tabstrip_h().max(self.line_px() * 1.3) + self.pad_px()
     }
 
-    /// Y of the action strip — now the topmost row (the old file-info banner
-    /// is gone; the filename lives in the sidebar tab).
+    /// Y of the floating action dock.
     pub fn tabstrip_top(&self) -> f32 {
-        self.pad_px() * 0.5
+        SHELL_GAP * self.scale_factor as f32
     }
 
     /// Tab strip height (0 when no tabs are set).
@@ -1255,8 +1277,10 @@ impl Renderer {
 
     /// Document shaping box in physical pixels (width and visible height).
     fn doc_size(&self) -> (f32, f32) {
-        let w = (self.surface_config.width as f32 - self.text_left() - self.pad_px()).max(1.0);
-        let h = (self.doc_bottom() - self.doc_top() - self.pad_px()).max(1.0);
+        let inset = SHELL_GAP * self.scale_factor as f32;
+        let w =
+            (self.surface_config.width as f32 - self.text_left() - self.pad_px() - inset).max(1.0);
+        let h = (self.doc_bottom() - self.doc_top() - self.pad_px() - inset).max(1.0);
         (w, h)
     }
 
@@ -1268,7 +1292,7 @@ impl Renderer {
         if self.term_open {
             self.term_top()
         } else {
-            self.surface_config.height as f32
+            self.surface_config.height as f32 - SHELL_GAP * self.scale_factor as f32
         }
     }
 
@@ -1341,7 +1365,8 @@ impl Renderer {
         }
         let s = self.scale_factor as f32;
         let track_w = SCROLLBAR_W * s;
-        let track_x = self.surface_config.width as f32 - track_w - SCROLLBAR_MARGIN * s;
+        let track_x =
+            self.surface_config.width as f32 - track_w - SCROLLBAR_MARGIN * s - SHELL_GAP * s;
         let track_top = self.doc_top();
         let track_h = (self.doc_bottom() - track_top).max(1.0);
         let min_thumb = (SCROLLBAR_MIN_THUMB * s).min(track_h);
@@ -1572,26 +1597,65 @@ impl Renderer {
         }
     }
 
-    /// Replace the terminal grid snapshot + cursor cell. Reshapes only when
-    /// the snapshot text actually changed (the coalesced-wakeup path).
-    pub fn set_terminal_text(&mut self, text: &str, cursor: Option<(usize, usize)>) {
+    /// Replace the terminal grid snapshot using ANSI-derived rich spans.
+    pub fn set_terminal_styled(
+        &mut self,
+        text: &str,
+        cursor: Option<(usize, usize)>,
+        spans: &[TerminalTextSpan],
+    ) {
         self.term_cursor = cursor;
-        if self.term_text == text {
+        if self.term_text == text && self.term_spans == spans {
             return;
         }
         self.term_text.clear();
         self.term_text.push_str(text);
-        self.term_buffer.set_text(
-            text,
-            &Attrs::new().family(Family::Monospace),
-            Shaping::Advanced,
-            None,
-        );
+        self.term_spans.clear();
+        self.term_spans.extend_from_slice(spans);
+        let default_attrs = Attrs::new().family(Family::Monospace);
+        if spans.is_empty() {
+            self.term_buffer
+                .set_text(text, &default_attrs, Shaping::Advanced, None);
+        } else {
+            let mut rich: Vec<(&str, Attrs)> = Vec::with_capacity(spans.len() * 2 + 1);
+            let mut pos = 0;
+            for span in spans {
+                if span.start > pos {
+                    if let Some(segment) = text.get(pos..span.start) {
+                        rich.push((segment, default_attrs.clone()));
+                    }
+                }
+                if let Some(segment) = text.get(span.start..span.end) {
+                    let mut attrs = default_attrs.clone().color(Color::rgb(
+                        span.rgb[0],
+                        span.rgb[1],
+                        span.rgb[2],
+                    ));
+                    if span.bold {
+                        attrs = attrs.weight(Weight::BOLD);
+                    }
+                    if span.italic {
+                        attrs = attrs.style(FontStyle::Italic);
+                    }
+                    rich.push((segment, attrs));
+                }
+                pos = span.end;
+            }
+            if let Some(segment) = text.get(pos..) {
+                rich.push((segment, default_attrs.clone()));
+            }
+            self.term_buffer
+                .set_rich_text(rich, &default_attrs, Shaping::Advanced, None);
+        }
         let w = (self.surface_config.width as f32 - self.left_edge() - self.pad_px()).max(1.0);
         let h = (self.term_split_h() - self.pad_px()).max(1.0);
         self.term_buffer.set_size(Some(w), Some(h));
         self.term_buffer
             .shape_until_scroll(&mut self.font_system, false);
+    }
+
+    pub fn set_terminal_text(&mut self, text: &str, cursor: Option<(usize, usize)>) {
+        self.set_terminal_styled(text, cursor, &[]);
     }
 
     pub fn terminal_open(&self) -> bool {
@@ -1665,12 +1729,17 @@ impl Renderer {
 
     /// Left x of the overlay content box (physical px).
     fn overlay_content_left(&self) -> f32 {
-        self.pad_px() * 3.0
+        let fw = self.surface_config.width as f32;
+        ((fw - self.overlay_content_width()) * 0.5).max(self.pad_px() * 3.0)
     }
 
-    /// Width of the overlay content box (physical px).
+    /// Width of the overlay content box (physical px). Pages are centered and
+    /// max-width rather than stretching edge-to-edge like the old sheets.
     fn overlay_content_width(&self) -> f32 {
-        (self.surface_config.width as f32 - self.overlay_content_left() * 2.0).max(1.0)
+        let fw = self.surface_config.width as f32;
+        (fw - self.pad_px() * 6.0)
+            .min(820.0 * self.scale_factor as f32)
+            .max(1.0)
     }
 
     /// Y of the overlay header line (title or input).
@@ -1829,8 +1898,9 @@ impl Renderer {
         // Force the strip to re-shape + re-measure at the new metrics.
         self.tabstrip_text.clear();
         let term_text = std::mem::take(&mut self.term_text);
+        let term_spans = std::mem::take(&mut self.term_spans);
         let term_cursor = self.term_cursor;
-        self.set_terminal_text(&term_text, term_cursor);
+        self.set_terminal_styled(&term_text, term_cursor, &term_spans);
         self.stats_buffer.set_wrap(Wrap::None);
         self.doc_buffer = Buffer::new(&mut self.font_system, metrics);
         self.doc_buffer.set_wrap(Wrap::None);
@@ -1969,7 +2039,7 @@ impl Renderer {
         // first so unchanged frames allocate nothing.
         let lat_n = self.latency.count();
         if self.banner_dirty || (self.latency_hud && lat_n != self.last_lat_n) {
-            let stats = if !self.latency_hud {
+            let mut stats = if !self.latency_hud {
                 // Latency HUD off (config `latency_hud`): prefix only.
                 self.stats_prefix.clone()
             } else {
@@ -1985,6 +2055,21 @@ impl Renderer {
                     format!("{}  \u{00b7}  {}", self.stats_prefix, lat)
                 }
             };
+            // Never let status text collide with command labels. On compact
+            // windows retain the useful Ln/Col prefix and omit latency detail.
+            let actions_right = self.left_edge()
+                + self.pad_px() * 0.5
+                + self.tab_layout_px.last().map_or(0.0, |(_, end)| *end)
+                + self.pad_px() * 2.0;
+            let available_chars = ((self.surface_config.width as f32
+                - self.pad_px()
+                - actions_right)
+                / self.cell_w())
+            .floor()
+            .max(0.0) as usize;
+            if stats.chars().count() > available_chars && !self.stats_prefix.is_empty() {
+                stats = self.stats_prefix.clone();
+            }
             self.stats_buffer.set_text(
                 &stats,
                 &Attrs::new().family(Family::Monospace),
@@ -2019,8 +2104,8 @@ impl Renderer {
             // "umber" wordmark in the corner block above the file tabs.
             areas.push(TextArea {
                 buffer: &self.wordmark_buffer,
-                left: pad * 1.1,
-                top: pad,
+                left: SHELL_GAP * self.scale_factor as f32 + pad,
+                top: SHELL_GAP * self.scale_factor as f32 + pad * 0.55,
                 scale: 1.0,
                 bounds: TextBounds {
                     left: 0,
@@ -2034,7 +2119,7 @@ impl Renderer {
             // Tiny uppercase section header above the file tabs.
             areas.push(TextArea {
                 buffer: &self.sidebar_header_buffer,
-                left: pad * 1.1,
+                left: SHELL_GAP * self.scale_factor as f32 + pad,
                 top: doc_top + line_px * 0.2,
                 scale: 1.0,
                 bounds: TextBounds {
@@ -2051,7 +2136,7 @@ impl Renderer {
             // Left file-tab list: one open editor tab per row (dynamic labels).
             areas.push(TextArea {
                 buffer: &self.sidebar_labels_buffer,
-                left: pad * 1.1,
+                left: SHELL_GAP * self.scale_factor as f32 + pad,
                 top: self.sidebar_top(),
                 scale: 1.0,
                 bounds: TextBounds {
@@ -2316,22 +2401,23 @@ impl Renderer {
         // background + border + cursor (3) always fit the vertex buffer.
         // the scrollbar's two quads plus the gutter separator rule and its
         // hovered-line segment always fit the vertex buffer.
-        let sel_right_edge = fw - pad;
+        let shell_gap = SHELL_GAP * self.scale_factor as f32;
+        let sel_right_edge = fw - pad - shell_gap;
         let mut sel_verts: u32 = 0;
         if !self.overlay_active {
             // Current-line highlight first (selection draws over it): a faint
             // full-width wash behind the cursor's line.
             if let Some((line, _)) = self.cursor {
                 let y = doc_top + line as f32 * line_px;
-                let sb_w = self.sidebar_w();
+                let panel_left = left - pad;
                 if y + line_px <= doc_bottom {
                     sel_verts += push_quad(
                         &mut self.quad_bytes,
                         fw,
                         fh,
-                        sb_w,
+                        panel_left,
                         y,
-                        (fw - sb_w).max(0.0),
+                        (fw - panel_left - shell_gap).max(0.0),
                         line_px,
                         CURRENT_LINE_COLOR,
                     );
@@ -2445,7 +2531,7 @@ impl Renderer {
         if !self.overlay_active && self.gutter_enabled {
             let s = self.scale_factor as f32;
             let mark_w = (3.0 * s).max(1.0);
-            let mark_x = self.sidebar_w() + self.pad_px() * 0.4;
+            let mark_x = self.left_edge() - self.pad_px() * 0.6;
             for (line, color) in self.gutter_marks.iter().take(GIT_MARK_MAX) {
                 let y = doc_top + *line as f32 * line_px;
                 if y >= doc_bottom {
@@ -2474,13 +2560,14 @@ impl Renderer {
             // Border + cursor only — the panel BACKGROUND is drawn in the
             // pre-text chrome range (drawing it here, after the text pass,
             // painted over the grid glyphs: the missing-terminal-text bug).
+            let panel_left = left - pad;
             term_verts += push_quad(
                 &mut self.quad_bytes,
                 fw,
                 fh,
-                0.0,
+                panel_left,
                 term_top,
-                fw,
+                (fw - panel_left - shell_gap).max(0.0),
                 border_h,
                 if self.term_focused {
                     TERM_BORDER_FOCUS_COLOR
@@ -2531,6 +2618,7 @@ impl Renderer {
             // Opaque content panel behind the whole page (title/input, rows,
             // hint) so overlay text never fights the editor text behind it.
             let (panel_x, panel_y, panel_w, panel_h) = self.overlay_panel_bounds();
+            let ov_border = self.scale_factor as f32;
             ov_verts += push_rquad(
                 &mut self.quad_bytes,
                 fw,
@@ -2539,8 +2627,19 @@ impl Renderer {
                 panel_y,
                 panel_w,
                 panel_h,
+                PANEL_BORDER_COLOR,
+                12.0 * self.scale_factor as f32,
+            );
+            ov_verts += push_rquad(
+                &mut self.quad_bytes,
+                fw,
+                fh,
+                panel_x + ov_border,
+                panel_y + ov_border,
+                (panel_w - ov_border * 2.0).max(1.0),
+                (panel_h - ov_border * 2.0).max(1.0),
                 OVERLAY_PANEL_COLOR,
-                10.0 * self.scale_factor as f32,
+                (12.0 * self.scale_factor as f32 - ov_border).max(1.0),
             );
             if self.overlay_has_input {
                 ov_verts += push_rquad(
@@ -2590,18 +2689,45 @@ impl Renderer {
             let sb_top = self.sidebar_top();
             let pitch = self.line_px() * SIDEBAR_TAB_PITCH;
             let s = self.scale_factor as f32;
+            let gap = SHELL_GAP * s;
             let hover = self.sidebar_hover;
             let active = self.sidebar_active;
-            let _ = sw;
+            // The sidebar is now an inset floating panel, visibly detached from
+            // the window and editor rather than a full-height flat column.
+            // Outer border, then a one-pixel inset fill: unlike alpha-washing
+            // the whole panel, this leaves an actual hairline edge.
+            sidebar_verts += push_rquad(
+                &mut self.sidebar_bytes,
+                fw,
+                fh,
+                gap,
+                gap,
+                (sw - gap).max(1.0),
+                (fh - gap * 2.0).max(1.0),
+                PANEL_BORDER_COLOR,
+                SHELL_RADIUS * s,
+            );
+            let border = s.max(1.0);
+            sidebar_verts += push_rquad(
+                &mut self.sidebar_bytes,
+                fw,
+                fh,
+                gap + border,
+                gap + border,
+                (sw - gap - border * 2.0).max(1.0),
+                (fh - gap * 2.0 - border * 2.0).max(1.0),
+                SIDEBAR_PANEL_COLOR,
+                (SHELL_RADIUS * s - border).max(1.0),
+            );
             if let Some(hrow) = hover {
                 let s2 = self.scale_factor as f32;
                 sidebar_verts += push_rquad(
                     &mut self.sidebar_bytes,
                     fw,
                     fh,
-                    3.0 * s2,
+                    gap + 5.0 * s2,
                     sb_top + hrow as f32 * pitch + 1.0 * s2,
-                    sw - 8.0 * s2,
+                    sw - gap - 12.0 * s2,
                     pitch - 2.0 * s2,
                     SIDEBAR_HOVER_COLOR,
                     6.0 * s2,
@@ -2609,15 +2735,28 @@ impl Renderer {
             }
             if let Some(arow) = active {
                 let ay = sb_top + arow as f32 * pitch;
-                sidebar_verts += push_quad(
+                // Active file is a compact card with a rust status rail.
+                sidebar_verts += push_rquad(
                     &mut self.sidebar_bytes,
                     fw,
                     fh,
-                    0.0,
-                    ay,
+                    gap + 5.0 * s,
+                    ay + 1.0 * s,
+                    sw - gap - 12.0 * s,
+                    pitch - 2.0 * s,
+                    SIDEBAR_ACTIVE_CARD_COLOR,
+                    6.0 * s,
+                );
+                sidebar_verts += push_rquad(
+                    &mut self.sidebar_bytes,
+                    fw,
+                    fh,
+                    gap + 5.0 * s,
+                    ay + 4.0 * s,
                     (3.0 * s).max(2.0),
-                    pitch,
+                    (pitch - 8.0 * s).max(2.0),
                     SIDEBAR_ACTIVE_COLOR,
+                    2.0 * s,
                 );
             }
         }
@@ -2636,6 +2775,66 @@ impl Renderer {
                 .unwrap_or((0, 0));
             let _ = cw;
             let s = self.scale_factor as f32;
+            let gap = SHELL_GAP * s;
+            let sidebar_w = self.sidebar_w();
+            let editor_x = le - self.pad_px();
+            let editor_y = self.doc_top() - self.pad_px() * 0.45;
+            let editor_bottom = if self.term_open {
+                self.term_top() - gap
+            } else {
+                fh - gap
+            };
+            let border = s.max(1.0);
+            let dock_x = sidebar_w + gap;
+            let dock_w = (fw - sidebar_w - gap * 2.0).max(1.0);
+            // Floating command/status dock: bordered outer shape + inset fill.
+            sidebar_verts += push_rquad(
+                &mut self.sidebar_bytes,
+                fw,
+                fh,
+                dock_x,
+                gap,
+                dock_w,
+                ts_h,
+                PANEL_BORDER_COLOR,
+                SHELL_RADIUS * s,
+            );
+            sidebar_verts += push_rquad(
+                &mut self.sidebar_bytes,
+                fw,
+                fh,
+                dock_x + border,
+                gap + border,
+                (dock_w - border * 2.0).max(1.0),
+                (ts_h - border * 2.0).max(1.0),
+                TOP_DOCK_COLOR,
+                (SHELL_RADIUS * s - border).max(1.0),
+            );
+            // Inset editor canvas below the dock, with its own hairline edge.
+            let editor_w = (fw - editor_x - gap).max(1.0);
+            let editor_h = (editor_bottom - editor_y).max(1.0);
+            sidebar_verts += push_rquad(
+                &mut self.sidebar_bytes,
+                fw,
+                fh,
+                editor_x,
+                editor_y,
+                editor_w,
+                editor_h,
+                PANEL_BORDER_COLOR,
+                SHELL_RADIUS * s,
+            );
+            sidebar_verts += push_rquad(
+                &mut self.sidebar_bytes,
+                fw,
+                fh,
+                editor_x + border,
+                editor_y + border,
+                (editor_w - border * 2.0).max(1.0),
+                (editor_h - border * 2.0).max(1.0),
+                EDITOR_PANEL_COLOR,
+                (SHELL_RADIUS * s - border).max(1.0),
+            );
             // Hovered action: a rounded pill wash sized from the REAL glyph
             // extents (pixel-exact; no column arithmetic).
             if let Some(hrow) = self.tabstrip_hover {
@@ -2677,25 +2876,22 @@ impl Renderer {
             }
             let _ = (astart, aend);
         }
-        // Draggable sidebar separator line (hot = rust while hovered/dragged).
+        // Draggable sidebar affordance appears only while hot/dragging; the
+        // permanent full-height seam is gone because the panel now floats.
         {
             let sbw = self.sidebar_w();
-            if sbw > 0.0 {
-                let s1 = (1.0 * self.scale_factor as f32).max(1.0);
-                let (wdt, color) = if self.sidebar_edge_hot {
-                    (s1 * 2.0, SIDEBAR_ACTIVE_COLOR)
-                } else {
-                    (s1, SIDEBAR_SEAM_COLOR)
-                };
-                sidebar_verts += push_quad(
+            if sbw > 0.0 && self.sidebar_edge_hot {
+                let s = self.scale_factor as f32;
+                sidebar_verts += push_rquad(
                     &mut self.sidebar_bytes,
                     fw,
                     fh,
-                    sbw - wdt,
-                    0.0,
-                    wdt,
-                    fh,
-                    color,
+                    sbw - 2.0 * s,
+                    fh * 0.38,
+                    3.0 * s,
+                    fh * 0.24,
+                    SIDEBAR_ACTIVE_COLOR,
+                    2.0 * s,
                 );
             }
         }
@@ -2703,15 +2899,33 @@ impl Renderer {
         // glyphs render on top of it.
         if self.term_open {
             let t_top = self.term_top();
-            sidebar_verts += push_quad(
+            let s = self.scale_factor as f32;
+            let gap = SHELL_GAP * s;
+            let tx = left - pad;
+            let tw = (fw - tx - gap).max(1.0);
+            let th = (fh - t_top - gap).max(1.0);
+            let border = s.max(1.0);
+            sidebar_verts += push_rquad(
                 &mut self.sidebar_bytes,
                 fw,
                 fh,
-                0.0,
+                tx,
                 t_top,
+                tw,
+                th,
+                PANEL_BORDER_COLOR,
+                SHELL_RADIUS * s,
+            );
+            sidebar_verts += push_rquad(
+                &mut self.sidebar_bytes,
                 fw,
-                (fh - t_top).max(0.0),
+                fh,
+                tx + border,
+                t_top + border,
+                (tw - border * 2.0).max(1.0),
+                (th - border * 2.0).max(1.0),
                 TERM_BG_COLOR,
+                (SHELL_RADIUS * s - border).max(1.0),
             );
         }
         if sidebar_verts > 0 {

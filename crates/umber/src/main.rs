@@ -26,8 +26,8 @@ use umber_host::{HostCommand, Manifest, ModuleHost};
 use umber_kernel::{Command, CommandRegistry, Config, FeatureRegistry};
 use umber_text::TextBuffer;
 use umber_ui::{
-    OverlaySpec, Renderer, ScrollbarInfo, SelSpan, GIT_ADDED_COLOR, GIT_DELETED_COLOR,
-    GIT_MODIFIED_COLOR,
+    OverlaySpec, Renderer, ScrollbarInfo, SelSpan, TerminalTextSpan, GIT_ADDED_COLOR,
+    GIT_DELETED_COLOR, GIT_MODIFIED_COLOR,
 };
 
 use winit::application::ApplicationHandler;
@@ -3604,9 +3604,20 @@ impl ApplicationHandler<UserEvent> for App {
                 // take_dirty BEFORE content(): the coalescing contract — any
                 // parser progress after the clear re-arms a fresh wakeup.
                 if session.take_dirty() {
-                    let (text, cursor) = session.content();
+                    let snapshot = session.styled_content();
+                    let spans: Vec<TerminalTextSpan> = snapshot
+                        .spans
+                        .iter()
+                        .map(|span| TerminalTextSpan {
+                            start: span.start,
+                            end: span.end,
+                            rgb: span.rgb,
+                            bold: span.bold,
+                            italic: span.italic,
+                        })
+                        .collect();
                     if let Some(renderer) = self.renderer.as_mut() {
-                        renderer.set_terminal_text(&text, cursor);
+                        renderer.set_terminal_styled(&snapshot.text, snapshot.cursor, &spans);
                         if renderer.terminal_open() {
                             renderer.window().request_redraw();
                         }

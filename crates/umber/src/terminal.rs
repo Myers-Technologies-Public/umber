@@ -14,9 +14,9 @@
 //! grid: any parser progress that lands after the clear re-arms a fresh
 //! wakeup, so no update can be lost between clear and read.
 //!
-//! Fidelity shipped at P3: plain text grid + cursor position. Per-cell
-//! color/bold/italic and Title/Clipboard/ColorRequest events are TODO(P3) —
-//! see the `_ => {}` arm in [`EventProxy::send_event`].
+//! Fidelity: visible text, cursor position, ANSI foreground colors, bold,
+//! italic, and dim attributes. Cell backgrounds and Title/Clipboard events
+//! remain separate follow-ups.
 
 use std::borrow::Cow;
 use std::io;
@@ -27,8 +27,10 @@ use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop as PtyEventLoop, EventLoopSender, Msg, State};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
+use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config as TermConfig, Term};
 use alacritty_terminal::tty::{self, Options as PtyOptions, Pty, Shell};
+use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 
 /// Grid dimensions for `Term` construction/resize. alacritty's own `TermSize`
 /// helper lives in its `term::test` module, so we carry this trivial impl
@@ -106,6 +108,121 @@ impl<N: TermNotifier> EventListener for EventProxy<N> {
             _ => {}
         }
     }
+}
+
+/// Rich-text style over a UTF-8 byte range in a terminal snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalSpan {
+    pub start: usize,
+    pub end: usize,
+    pub rgb: [u8; 3],
+    pub bold: bool,
+    pub italic: bool,
+}
+
+/// Visible terminal snapshot, including styling retained from ANSI cells.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalSnapshot {
+    pub text: String,
+    pub cursor: Option<(usize, usize)>,
+    pub spans: Vec<TerminalSpan>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CellStyle {
+    rgb: [u8; 3],
+    bold: bool,
+    italic: bool,
+}
+
+fn indexed_rgb(index: u8) -> [u8; 3] {
+    const ANSI: [[u8; 3]; 16] = [
+        [35, 31, 28],
+        [205, 92, 72],
+        [139, 168, 116],
+        [220, 174, 92],
+        [112, 145, 190],
+        [184, 128, 170],
+        [105, 170, 176],
+        [218, 211, 199],
+        [112, 104, 94],
+        [231, 116, 82],
+        [164, 190, 130],
+        [238, 194, 108],
+        [135, 164, 208],
+        [204, 148, 192],
+        [126, 190, 194],
+        [242, 236, 224],
+    ];
+    match index {
+        0..=15 => ANSI[index as usize],
+        16..=231 => {
+            let n = index - 16;
+            let level = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+            [level(n / 36), level((n / 6) % 6), level(n % 6)]
+        }
+        _ => {
+            let v = 8 + (index - 232) * 10;
+            [v, v, v]
+        }
+    }
+}
+
+fn named_index(named: NamedColor) -> Option<u8> {
+    use NamedColor::*;
+    Some(match named {
+        Black => 0,
+        Red => 1,
+        Green => 2,
+        Yellow => 3,
+        Blue => 4,
+        Magenta => 5,
+        Cyan => 6,
+        White => 7,
+        BrightBlack => 8,
+        BrightRed => 9,
+        BrightGreen => 10,
+        BrightYellow => 11,
+        BrightBlue => 12,
+        BrightMagenta => 13,
+        BrightCyan => 14,
+        BrightWhite => 15,
+        DimBlack => 0,
+        DimRed => 1,
+        DimGreen => 2,
+        DimYellow => 3,
+        DimBlue => 4,
+        DimMagenta => 5,
+        DimCyan => 6,
+        DimWhite => 7,
+        _ => return None,
+    })
+}
+
+fn fallback_named(named: NamedColor) -> [u8; 3] {
+    match named {
+        NamedColor::Foreground | NamedColor::BrightForeground => [220, 214, 201],
+        NamedColor::DimForeground => [145, 137, 124],
+        NamedColor::Background | NamedColor::Cursor => [20, 17, 14],
+        _ => named_index(named)
+            .map(indexed_rgb)
+            .unwrap_or([220, 214, 201]),
+    }
+}
+
+fn resolve_color(color: Color, colors: &alacritty_terminal::term::color::Colors) -> [u8; 3] {
+    let rgb = match color {
+        Color::Spec(rgb) => rgb,
+        Color::Indexed(index) => colors[index as usize].unwrap_or_else(|| {
+            let [r, g, b] = indexed_rgb(index);
+            Rgb { r, g, b }
+        }),
+        Color::Named(named) => colors[named].unwrap_or_else(|| {
+            let [r, g, b] = fallback_named(named);
+            Rgb { r, g, b }
+        }),
+    };
+    [rgb.r, rgb.g, rgb.b]
 }
 
 /// A live terminal: shell child, PTY reader thread, shared parsed grid.
@@ -224,23 +341,41 @@ impl<N: TermNotifier> TerminalSession<N> {
         self.exited.load(Ordering::Acquire)
     }
 
-    /// Snapshot the visible grid as trimmed lines joined by `\n`, plus the
-    /// cursor `(row, col)` when it is inside the viewport. Allocates — called
-    /// only on coalesced wakeups, never per frame.
-    pub fn content(&self) -> (String, Option<(usize, usize)>) {
+    /// Snapshot the visible grid as trimmed lines joined by `\n`, retaining
+    /// ANSI foreground and font attributes as flat UTF-8 byte spans.
+    pub fn styled_content(&self) -> TerminalSnapshot {
         let term = self.term.lock();
         let lines = term.screen_lines();
         let cols = term.columns();
         let content = term.renderable_content();
         let offset = content.display_offset as i32;
+        let colors = content.colors;
 
-        let mut rows: Vec<String> = vec![String::with_capacity(cols); lines];
+        let default = CellStyle {
+            rgb: [220, 214, 201],
+            bold: false,
+            italic: false,
+        };
+        let mut rows: Vec<Vec<(char, CellStyle)>> = vec![Vec::with_capacity(cols); lines];
         for indexed in content.display_iter {
             let row = indexed.point.line.0 + offset;
             if row < 0 || row as usize >= lines {
                 continue;
             }
-            rows[row as usize].push(indexed.c);
+            let cell = indexed.cell;
+            let inverse = cell.flags.contains(Flags::INVERSE);
+            let mut rgb = resolve_color(if inverse { cell.bg } else { cell.fg }, colors);
+            if cell.flags.contains(Flags::DIM) {
+                rgb = rgb.map(|v| ((v as u16 * 2) / 3) as u8);
+            }
+            rows[row as usize].push((
+                indexed.c,
+                CellStyle {
+                    rgb,
+                    bold: cell.flags.contains(Flags::BOLD),
+                    italic: cell.flags.contains(Flags::ITALIC),
+                },
+            ));
         }
         let cursor_row = content.cursor.point.line.0 + offset;
         let cursor = if cursor_row >= 0 && (cursor_row as usize) < lines {
@@ -250,13 +385,52 @@ impl<N: TermNotifier> TerminalSession<N> {
         };
 
         let mut text = String::new();
+        let mut spans: Vec<TerminalSpan> = Vec::new();
         for (i, row) in rows.iter().enumerate() {
             if i > 0 {
                 text.push('\n');
             }
-            text.push_str(row.trim_end());
+            let used = row
+                .iter()
+                .rposition(|(c, _)| *c != ' ')
+                .map_or(0, |n| n + 1);
+            for &(ch, style) in &row[..used] {
+                let start = text.len();
+                text.push(ch);
+                let end = text.len();
+                if let Some(last) = spans.last_mut() {
+                    if last.end == start
+                        && last.rgb == style.rgb
+                        && last.bold == style.bold
+                        && last.italic == style.italic
+                    {
+                        last.end = end;
+                        continue;
+                    }
+                }
+                spans.push(TerminalSpan {
+                    start,
+                    end,
+                    rgb: style.rgb,
+                    bold: style.bold,
+                    italic: style.italic,
+                });
+            }
+            if used == 0 && i + 1 == lines {
+                let _ = default;
+            }
         }
-        (text, cursor)
+        TerminalSnapshot {
+            text,
+            cursor,
+            spans,
+        }
+    }
+
+    /// Compatibility helper used by plain-text consumers and existing tests.
+    pub fn content(&self) -> (String, Option<(usize, usize)>) {
+        let snapshot = self.styled_content();
+        (snapshot.text, snapshot.cursor)
     }
 
     /// Stop the reader loop and reap the shell child. Joining the IO thread is
