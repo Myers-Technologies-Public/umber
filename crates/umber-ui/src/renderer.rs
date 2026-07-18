@@ -545,6 +545,9 @@ pub struct Renderer {
     /// Non-modal pointer context menu. It uses the normal text renderer so it
     /// can coexist with the editor without changing the app's `View`.
     context_buffer: Buffer,
+    /// Centered "open a file" hint for an empty untitled editor.
+    empty_hint_buffer: Buffer,
+    empty_hint: bool,
     context_active: bool,
     context_x: f32,
     context_y: f32,
@@ -815,6 +818,8 @@ impl Renderer {
         overlay_hint.set_wrap(Wrap::None);
         let mut context_buffer = Buffer::new(&mut font_system, metrics);
         context_buffer.set_wrap(Wrap::None);
+        let mut empty_hint_buffer = Buffer::new(&mut font_system, metrics);
+        empty_hint_buffer.set_wrap(Wrap::None);
 
         // The hovered-word overlay buffer: like the cursor glyph, shaped only
         // when the hovered word changes (never per mouse move).
@@ -967,6 +972,8 @@ impl Renderer {
             overlay_title,
             overlay_hint,
             context_buffer,
+            empty_hint_buffer,
+            empty_hint: false,
             context_active: false,
             context_x: 0.0,
             context_y: 0.0,
@@ -1636,6 +1643,18 @@ impl Renderer {
         self.doc_text.clear();
         self.doc_text.push_str(text);
         let default_attrs = Attrs::new().family(Family::Monospace);
+        // Vendored-cosmic quirk: `set_text("")` leaves the PREVIOUS layout
+        // intact (stale document ghosting on fresh empty tabs). Shape a lone
+        // space instead — renders nothing, and this buffer is display-only.
+        if text.is_empty() {
+            self.doc_buffer
+                .set_text(" ", &default_attrs, Shaping::Advanced, None);
+            let (w, h) = self.doc_size();
+            self.doc_buffer.set_size(Some(w), Some(h));
+            self.doc_buffer
+                .shape_until_scroll(&mut self.font_system, false);
+            return;
+        }
         // Syntax highlighting: tree-sitter spans over the visible window,
         // rendered as cosmic rich text. Empty spans (plain text, unknown
         // language, parse failure) fall through to the plain path.
@@ -1682,7 +1701,11 @@ impl Renderer {
             .and_then(|e| umber_syntax::lang_for_ext(&e));
         if lang != self.doc_lang {
             self.doc_lang = lang;
+            // Invalidate the reshape cache with a sentinel no real document
+            // equals — clearing to "" collided with genuinely empty docs
+            // (set_document("") early-returned and ghosted the old layout).
             self.doc_text.clear();
+            self.doc_text.push('\u{0}');
         }
     }
 
@@ -1731,7 +1754,11 @@ impl Renderer {
         if digits_changed {
             let (dw, dh) = self.doc_size();
             self.doc_buffer.set_size(Some(dw), Some(dh));
+            // Sentinel, not "": plain clear collides with genuinely empty
+            // documents (set_document("") would early-return and ghost the
+            // previous layout — the same bug as set_language's cache clear).
             self.doc_text.clear();
+            self.doc_text.push('\u{0}');
         }
     }
 
@@ -2102,6 +2129,18 @@ impl Renderer {
         }
         self.doc_panes[idx].text.clear();
         self.doc_panes[idx].text.push_str(text);
+        // Same empty-text quirk as set_document: shape a lone space.
+        if text.is_empty() {
+            let default_attrs = Attrs::new().family(Family::Monospace);
+            self.doc_panes[idx]
+                .buffer
+                .set_text(" ", &default_attrs, Shaping::Advanced, None);
+            self.doc_panes[idx]
+                .buffer
+                .shape_until_scroll(&mut self.font_system, false);
+            self.window.request_redraw();
+            return;
+        }
         let lang = ext
             .map(|e| e.to_ascii_lowercase())
             .and_then(|e| umber_syntax::lang_for_ext(&e));
@@ -2143,6 +2182,27 @@ impl Renderer {
         self.doc_panes[idx]
             .buffer
             .shape_until_scroll(&mut self.font_system, false);
+        self.window.request_redraw();
+    }
+
+    /// Show/hide the centered "open a file" hint for empty untitled tabs.
+    pub fn set_empty_hint(&mut self, on: bool) {
+        if self.empty_hint == on {
+            return;
+        }
+        self.empty_hint = on;
+        if on {
+            self.empty_hint_buffer.set_text(
+                "\u{2295}  Open a file \u{2014} click here or Ctrl+P  \u{00b7}  Ctrl+N new tab",
+                &Attrs::new().family(Family::Monospace),
+                Shaping::Advanced,
+                None,
+            );
+            self.empty_hint_buffer
+                .set_size(Some(2000.0), Some(self.line_px() * 2.0));
+            self.empty_hint_buffer
+                .shape_until_scroll(&mut self.font_system, false);
+        }
         self.window.request_redraw();
     }
 
@@ -2736,6 +2796,25 @@ impl Renderer {
             default_color: Color::rgb(232, 226, 213),
             custom_glyphs: &[],
         });
+        // Empty untitled tab: a centered, muted call-to-action in the canvas.
+        if self.empty_hint && !self.overlay_active {
+            let (ex, ey, ew, eh) = self.editor_card_rect();
+            let wpx = 57.0 * cell_w;
+            areas.push(TextArea {
+                buffer: &self.empty_hint_buffer,
+                left: ex + ((ew - wpx) * 0.5).max(0.0),
+                top: ey + eh * 0.42,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: ex as i32,
+                    top: ey as i32,
+                    right: (ex + ew) as i32,
+                    bottom: (ey + eh) as i32,
+                },
+                default_color: Color::rgb(148, 141, 128),
+                custom_glyphs: &[],
+            });
+        }
         // Terminal panel grid (P3), clipped to the panel region below the
         // document. Drawn like the doc: under the modal dim when one is up.
         if term_open {

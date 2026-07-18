@@ -89,6 +89,8 @@ impl AgentNotifier for UmberNotifier {
 enum View {
     Editor,
     Palette,
+    /// Fuzzy file picker (Ctrl+P): open a workspace file.
+    OpenFile,
     Settings,
     Modules,
     /// QoL (P3b): all commands + chords, read-only.
@@ -211,6 +213,8 @@ fn build_command_registry() -> CommandRegistry {
             "Ctrl+Shift+F",
         ),
         ("view.toggle.terminal", "View: Toggle Terminal Feature", ""),
+        ("file.new", "File: New Tab", "Ctrl+N"),
+        ("file.open", "File: Open File\u{2026}", "Ctrl+P"),
         ("pane.splitLeft", "Pane: Split Left", ""),
         ("pane.splitRight", "Pane: Split Right", "Ctrl+Shift+O"),
         ("pane.splitUp", "Pane: Split Up", ""),
@@ -446,6 +450,9 @@ fn main() -> ExitCode {
         ssh_input: String::new(),
         ssh_filtered: Vec::new(),
         ssh_sel: 0,
+        openfile_query: String::new(),
+        openfile_sel: 0,
+        openfile_results: Vec::new(),
         terminal: None,
         term_focused: false,
         term_resizing: false,
@@ -650,6 +657,10 @@ struct App {
     ssh_input: String,
     ssh_filtered: Vec<usize>,
     ssh_sel: usize,
+    /// File picker (Ctrl+P): query, selection, filtered results.
+    openfile_query: String,
+    openfile_sel: usize,
+    openfile_results: Vec<std::path::PathBuf>,
 
     // --- P3: embedded terminal ---
     /// Live terminal session; spawned on first open, killed on feature
@@ -1504,9 +1515,14 @@ impl App {
         let x = self.pointer.0 as f32;
         let y = self.pointer.1 as f32;
         if tab >= self.docs.len() {
-            self.context_target = Some(ContextTarget::Terminal);
-            if let Some(r) = self.renderer.as_mut() {
-                r.set_context_menu(x, y, &["Close Terminal"]);
+            if self.terminal.is_some() && tab == self.docs.len() {
+                self.context_target = Some(ContextTarget::Terminal);
+                if let Some(r) = self.renderer.as_mut() {
+                    r.set_context_menu(x, y, &["Close Terminal"]);
+                }
+            } else {
+                // The "+ New Tab" row has no context actions.
+                self.dismiss_context_menu();
             }
         } else {
             self.context_target = Some(ContextTarget::Document(tab));
@@ -1861,6 +1877,43 @@ impl App {
                     )),
                 })
             }
+            View::OpenFile => {
+                let cap = self
+                    .renderer
+                    .as_ref()
+                    .map(|r| r.overlay_row_capacity())
+                    .unwrap_or(1);
+                let n = self.openfile_results.len();
+                let sel = if n == 0 {
+                    0
+                } else {
+                    self.openfile_sel.min(n - 1)
+                };
+                let start = if sel < cap { 0 } else { sel + 1 - cap };
+                let end = (start + cap).min(n);
+                let root = std::env::current_dir().unwrap_or_default();
+                let mut rows = Vec::with_capacity(end - start);
+                for p in &self.openfile_results[start..end] {
+                    let rel = p
+                        .strip_prefix(&root)
+                        .unwrap_or(p)
+                        .to_string_lossy()
+                        .into_owned();
+                    rows.push((rel, String::new()));
+                }
+                Some(OverlaySpec {
+                    title: None,
+                    input: Some(format!("open> {}", self.openfile_query)),
+                    rows,
+                    left_color: [225, 225, 230],
+                    right_color: [135, 135, 150],
+                    split_frac: 0.9,
+                    selected: if n == 0 { None } else { Some(sel - start) },
+                    hint: Some(format!(
+                        "{n} files  \u{2014}  \u{2191}\u{2193} select \u{2022} Enter open \u{2022} Esc close"
+                    )),
+                })
+            }
             View::Help => {
                 let cap = self
                     .renderer
@@ -2151,6 +2204,124 @@ impl App {
     }
 
     /// Open the command palette (Ctrl+Shift+P, D6).
+    /// Ctrl+P / "File: Open File…": fuzzy file picker over the workspace.
+    fn open_file_picker(&mut self) {
+        self.clear_hover();
+        self.view = View::OpenFile;
+        self.openfile_query.clear();
+        self.refresh_openfile_results();
+        self.refresh_overlay();
+    }
+
+    fn refresh_openfile_results(&mut self) {
+        let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        self.openfile_results = search::list_files(&root, &self.openfile_query, 300);
+        self.openfile_sel = 0;
+    }
+
+    fn openfile_confirm(&mut self) {
+        let Some(path) = self.openfile_results.get(self.openfile_sel).cloned() else {
+            return;
+        };
+        self.view = View::Editor;
+        self.close_overlay();
+        self.open_into_current_or_new(&path);
+    }
+
+    /// Open `path` into the active tab when it is an empty untitled scratch
+    /// (the "+ New Tab" flow), else into its own tab.
+    fn open_into_current_or_new(&mut self, path: &std::path::Path) {
+        let untitled_empty = self.buffer.len_chars() == 0
+            && self.buffer.path().is_none()
+            && self.remote_file.is_none();
+        if untitled_empty && self.find_tab_by_path(path).is_none() {
+            match TextBuffer::from_path(path) {
+                Ok(b) => {
+                    self.buffer = b;
+                    self.cursor_char = 0;
+                    self.goal_col = 0;
+                    self.selection_anchor = None;
+                    self.first_visible_line = 0;
+                    self.selecting = false;
+                    self.refresh_git();
+                    self.apply_view(true);
+                }
+                Err(err) => eprintln!("umber: cannot open {path:?}: {err}"),
+            }
+        } else {
+            self.open_path_in_tab(path);
+            self.apply_view(true);
+        }
+        if let Some(r) = self.renderer.as_ref() {
+            r.window().request_redraw();
+        }
+    }
+
+    /// Ctrl+N / the sidebar "+ New Tab" row: a fresh untitled scratch tab.
+    fn new_tab(&mut self) {
+        if self.term_tab_active {
+            self.deactivate_terminal_tab();
+        }
+        self.stash_active();
+        self.docs.push(Document::husk());
+        self.active_doc = self.docs.len() - 1;
+        self.buffer = TextBuffer::empty();
+        self.cursor_char = 0;
+        self.goal_col = 0;
+        self.selection_anchor = None;
+        self.first_visible_line = 0;
+        if let Some(mut ws) = self.remote.take() {
+            ws.shutdown();
+        }
+        self.remote_file = None;
+        self.selecting = false;
+        self.refresh_git();
+        self.apply_view(true);
+        if let Some(r) = self.renderer.as_ref() {
+            r.window().request_redraw();
+        }
+    }
+
+    fn openfile_key(&mut self, event: KeyEvent) {
+        if event.state != ElementState::Pressed {
+            return;
+        }
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.view = View::Editor;
+                self.close_overlay();
+            }
+            Key::Named(NamedKey::Enter) => self.openfile_confirm(),
+            Key::Named(NamedKey::ArrowDown) => {
+                let n = self.openfile_results.len();
+                if n > 0 {
+                    self.openfile_sel = (self.openfile_sel + 1).min(n - 1);
+                    self.refresh_overlay();
+                }
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                self.openfile_sel = self.openfile_sel.saturating_sub(1);
+                self.refresh_overlay();
+            }
+            Key::Named(NamedKey::Backspace) => {
+                self.openfile_query.pop();
+                self.refresh_openfile_results();
+                self.refresh_overlay();
+            }
+            Key::Named(NamedKey::Space) => {
+                self.openfile_query.push(' ');
+                self.refresh_openfile_results();
+                self.refresh_overlay();
+            }
+            Key::Character(c) if !self.modifiers.control_key() => {
+                self.openfile_query.push_str(c);
+                self.refresh_openfile_results();
+                self.refresh_overlay();
+            }
+            _ => {}
+        }
+    }
+
     fn open_palette(&mut self) {
         // A modal is opening: drop any editor hover highlight.
         self.clear_hover();
@@ -2646,6 +2817,16 @@ impl App {
                     self.refresh_overlay();
                 }
             }
+            View::OpenFile => {
+                let n = self.openfile_results.len();
+                if windowed_start(self.openfile_sel, n, cap) == 0
+                    && row < n
+                    && self.openfile_sel != row
+                {
+                    self.openfile_sel = row;
+                    self.refresh_overlay();
+                }
+            }
             _ => {}
         }
     }
@@ -2688,6 +2869,9 @@ impl App {
             View::AgentThread => {
                 let n = self.agent_thread.len();
                 self.agent_thread_scroll = bump(self.agent_thread_scroll, n, down, mag)
+            }
+            View::OpenFile => {
+                self.openfile_sel = bump(self.openfile_sel, self.openfile_results.len(), down, mag)
             }
             _ => return,
         }
@@ -3461,17 +3645,25 @@ impl App {
                 name
             });
         }
-        // The terminal (when spawned) appears as the last tab in the list.
+        // The terminal (when spawned) appears as the last tab in the list,
+        // then the always-present "+ New Tab" affordance.
         if self.terminal.is_some() {
             labels.push("\u{25b8} Terminal".to_string());
         }
+        labels.push("+  New Tab".to_string());
         let active = if self.term_tab_active {
             self.docs.len()
         } else {
             self.active_doc
         };
+        let empty_hint = self.view == View::Editor
+            && !self.term_tab_active
+            && self.buffer.len_chars() == 0
+            && self.buffer.path().is_none()
+            && self.remote_file.is_none();
         if let Some(r) = self.renderer.as_mut() {
             r.set_sidebar_tabs(&labels, active);
+            r.set_empty_hint(empty_hint);
         }
         // Document tiles track their docs (cached: unchanged windows free).
         if !self.pane_tree.is_single() {
@@ -3572,6 +3764,25 @@ impl App {
                     let id = self.palette_items[self.palette_filtered[abs]].id.clone();
                     self.view = View::Editor;
                     self.execute_command(&id, event_loop);
+                }
+            }
+            View::OpenFile => {
+                let cap = self
+                    .renderer
+                    .as_ref()
+                    .map(|r| r.overlay_row_capacity())
+                    .unwrap_or(1);
+                let n = self.openfile_results.len();
+                let sel = if n == 0 {
+                    0
+                } else {
+                    self.openfile_sel.min(n - 1)
+                };
+                let start = if sel < cap { 0 } else { sel + 1 - cap };
+                let abs = start + row;
+                if abs < n {
+                    self.openfile_sel = abs;
+                    self.openfile_confirm();
                 }
             }
             View::Search => {
@@ -3891,6 +4102,16 @@ impl App {
             "terminal.toggle" => {
                 self.close_overlay();
                 self.terminal_toggle();
+                return;
+            }
+            "file.new" => {
+                self.close_overlay();
+                self.new_tab();
+                return;
+            }
+            "file.open" => {
+                self.close_overlay();
+                self.open_file_picker();
                 return;
             }
             "pane.splitLeft" => {
@@ -4467,11 +4688,11 @@ impl ApplicationHandler<UserEvent> for App {
                     if let Some(i) = self.renderer.as_ref().and_then(|r| {
                         r.sidebar_tab_at(self.pointer.0 as f32, self.pointer.1 as f32)
                     }) {
-                        if i >= self.docs.len() {
-                            // Terminal tab: middle-click kills the shell.
-                            self.kill_terminal();
-                        } else {
+                        if i < self.docs.len() {
                             self.close_tab(i);
+                        } else if self.terminal.is_some() && i == self.docs.len() {
+                            // Terminal tab: middle-click kills its shell.
+                            self.kill_terminal();
                         }
                     }
                     return;
@@ -4498,6 +4719,14 @@ impl ApplicationHandler<UserEvent> for App {
                                     self.term_focused = false;
                                     self.sync_panes();
                                 }
+                            }
+                        } else {
+                            // Never left the slop: a plain tab click.
+                            if self.term_tab_active {
+                                self.deactivate_terminal_tab();
+                            }
+                            if doc_idx < self.docs.len() {
+                                self.switch_tab(doc_idx);
                             }
                         }
                     }
@@ -4565,6 +4794,23 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                         }
                     }
+                    // Empty untitled tab: clicking the canvas opens the picker.
+                    if self.view == View::Editor
+                        && !self.term_focused
+                        && !self.term_tab_active
+                        && self.buffer.len_chars() == 0
+                        && self.buffer.path().is_none()
+                        && self.remote_file.is_none()
+                    {
+                        if let Some(r) = self.renderer.as_ref() {
+                            let (ex, ey, ew, eh) = r.editor_card_rect();
+                            let (px, py) = (self.pointer.0 as f32, self.pointer.1 as f32);
+                            if px >= ex && px < ex + ew && py >= ey && py < ey + eh {
+                                self.open_file_picker();
+                                return;
+                            }
+                        }
+                    }
                     // Left bar = open file tabs: click switches.
                     if let Some(tab) = self.renderer.as_ref().and_then(|r| {
                         r.sidebar_tab_at(self.pointer.0 as f32, self.pointer.1 as f32)
@@ -4572,18 +4818,17 @@ impl ApplicationHandler<UserEvent> for App {
                         if self.view != View::Editor {
                             self.close_overlay();
                         }
-                        if tab >= self.docs.len() {
-                            // Last row = the terminal tab.
+                        let term_row = self.terminal.is_some();
+                        if term_row && tab == self.docs.len() {
                             self.activate_terminal_tab();
+                        } else if tab >= self.docs.len() {
+                            // Trailing "+ New Tab" row.
+                            self.new_tab();
                         } else {
-                            if self.term_tab_active {
-                                self.deactivate_terminal_tab();
-                            }
-                            // Arm drag-to-dock: past the slop this press
-                            // becomes a tile drag instead of a plain switch.
+                            // Arm drag-to-dock; the switch happens on RELEASE
+                            // so a drag is a drag, not an open.
                             self.tab_drag =
                                 Some((tab, (self.pointer.0, self.pointer.1), false, None));
-                            self.switch_tab(tab);
                         }
                         return;
                     }
@@ -4815,6 +5060,10 @@ impl ApplicationHandler<UserEvent> for App {
                         self.palette_key(event, event_loop);
                         return;
                     }
+                    View::OpenFile => {
+                        self.openfile_key(event);
+                        return;
+                    }
                     View::Help => {
                         self.help_key(event);
                         return;
@@ -4901,6 +5150,14 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             "e" if shift => {
                                 self.split_pane(SplitDir::Vertical, false);
+                                return;
+                            }
+                            "p" => {
+                                self.open_file_picker();
+                                return;
+                            }
+                            "n" => {
+                                self.new_tab();
                                 return;
                             }
                             "," => {

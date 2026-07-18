@@ -39,6 +39,74 @@ pub fn search_dir(root: &Path, query: &str, limit: usize) -> Vec<Match> {
     out
 }
 
+/// List workspace files (same skip rules as the content walk), filtered by
+/// a case-insensitive subsequence match on the root-relative path — the
+/// fuzzy-finder behind the file picker. Empty filter = first `limit` files.
+pub fn list_files(root: &Path, filter: &str, limit: usize) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let needle = filter.to_lowercase();
+    walk_list(root, root, &needle, limit, &mut out);
+    out
+}
+
+fn walk_list(
+    root: &Path,
+    dir: &Path,
+    needle: &str,
+    limit: usize,
+    out: &mut Vec<std::path::PathBuf>,
+) {
+    if out.len() >= limit {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut items: Vec<_> = entries.flatten().collect();
+    items.sort_by_key(|e| e.file_name());
+    for entry in items {
+        if out.len() >= limit {
+            return;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let path = entry.path();
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_dir {
+            if name.starts_with('.') || SKIP_DIRS.contains(&name.as_ref()) {
+                continue;
+            }
+            walk_list(root, &path, needle, limit, out);
+        } else {
+            if name.starts_with('.') {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_lowercase();
+            if needle.is_empty() || subseq_match(&rel, needle) {
+                out.push(path);
+            }
+        }
+    }
+}
+
+/// `needle`'s chars appear in order (not necessarily adjacent) in `hay`.
+fn subseq_match(hay: &str, needle: &str) -> bool {
+    let mut hay_chars = hay.chars();
+    'outer: for nc in needle.chars() {
+        for hc in hay_chars.by_ref() {
+            if hc == nc {
+                continue 'outer;
+            }
+        }
+        return false;
+    }
+    true
+}
+
 fn walk(dir: &Path, needle: &str, limit: usize, out: &mut Vec<Match>) {
     if out.len() >= limit {
         return;
@@ -165,5 +233,27 @@ mod tests {
         let d = tmp("empty");
         fs::write(d.join("a.txt"), "content\n").unwrap();
         assert!(search_dir(&d, "", 100).is_empty());
+    }
+
+    #[test]
+    fn subseq_match_is_ordered_fuzzy() {
+        assert!(subseq_match("crates/umber/src/main.rs", "umain"));
+        assert!(subseq_match("crates/umber/src/main.rs", "c/u/s/m.rs"));
+        assert!(!subseq_match("crates/umber/src/main.rs", "mainz"));
+        assert!(subseq_match("anything", ""));
+    }
+
+    #[test]
+    fn list_files_filters_and_skips() {
+        let d = tmp("list");
+        fs::write(d.join("alpha.rs"), "").unwrap();
+        fs::write(d.join("beta.txt"), "").unwrap();
+        fs::create_dir_all(d.join("target")).unwrap();
+        fs::write(d.join("target/skip.rs"), "").unwrap();
+        let all = list_files(&d, "", 100);
+        assert_eq!(all.len(), 2);
+        let rs = list_files(&d, "alph.rs", 100);
+        assert_eq!(rs.len(), 1);
+        assert!(rs[0].ends_with("alpha.rs"));
     }
 }
