@@ -33,3 +33,21 @@ a silent edit.
   - SDK events relevant to a dashboard: `agent_start`/`agent_end`,
     `turn_start`/`turn_end`, `tool_execution_*`, `message_update`,
     `queue_update` (steering/follow-up = "awaiting instruction" signals).
+
+## 2026-07-18 — Ghostty-style tiling + context menus
+- **Pane tree lives in the app (`umber::panes`), not the renderer.** Binary
+  split tree with normalized rects; renderer only receives laid-out pane
+  rects/dividers (`set_panes`) and owns per-tile buffers. Editor geometry
+  accessors (`editor_card_rect` → `left_edge`/`doc_top`/`doc_size`) switch on
+  the pane rect, so all caret/selection/scrollbar math followed for free.
+- **Tiles spawn at their real grid.** Split the tree → sync the renderer →
+  read `term_pane_grid` → spawn the PTY at that size. Spawn-then-resize
+  garbled the first paint. Spawn failure rolls the split back.
+- **Context menus composite post-text.** Card quads ride a vertex range past
+  `ctx_quad_start`, labels ride the overlay text renderer — pre-text drawing
+  let terminal glyphs paint over the menu.
+- **One row pitch.** Context-menu labels, hover pill, hit-test, and card
+  height all use `line_px()`; a 1.35× hit pitch made a "Close Pane" click
+  execute "Split Down".
+- Split chords (Ctrl+Shift+O/E) stay live under terminal focus, or a tiled
+  shell could never be split again.
