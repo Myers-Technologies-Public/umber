@@ -100,7 +100,6 @@ const TERM_TEXT_COLOR: Color = Color::rgb(220, 214, 201);
 
 /// Left activity/tab bar (P5 QoL). Width in logical px; vertical tab glyphs
 /// give a mouse backup for the palette/search/agents/terminal/settings views.
-const SIDEBAR_W: f32 = 40.0;
 /// Wordmark in the sidebar corner block (Crail rust).
 const WORDMARK_COLOR: Color = Color::rgb(193, 95, 60);
 /// Current-line highlight behind the cursor's line — a faint warm wash.
@@ -112,6 +111,8 @@ const SIDEBAR_W_EXPANDED: f32 = 168.0;
 /// Tab labels shown when expanded (aligned to the glyph rows).
 const SIDEBAR_LABELS: &str = "Palette\nFind\nAgents\nTerminal\nSettings";
 const SIDEBAR_HOVER_COLOR: [f32; 4] = [1.0, 1.0, 0.96, 0.045];
+/// The draggable sidebar|content separator line.
+const SIDEBAR_SEAM_COLOR: [f32; 4] = [0.45, 0.42, 0.36, 0.45];
 /// Left accent bar marking the active tab (Crail rust).
 const SIDEBAR_ACTIVE_COLOR: [f32; 4] = [0.757, 0.373, 0.235, 1.0];
 const SIDEBAR_LABEL_COLOR: Color = Color::rgb(168, 161, 148);
@@ -513,6 +514,11 @@ pub struct Renderer {
     /// Cached joined tab-label text + row count for the left file-tab list.
     sidebar_tabs_text: String,
     sidebar_tab_count: usize,
+    /// User-dragged sidebar width (logical px) and separator hot state.
+    sidebar_width_override: Option<f32>,
+    sidebar_edge_hot: bool,
+    /// Real monospace advance measured from a shaped probe.
+    cell_w_measured: f32,
     /// Open-document tab strip: shaped label row + per-tab char-column ranges
     /// for hit-testing + the active tab index.
     tabstrip_buffer: Buffer,
@@ -605,6 +611,24 @@ impl Renderer {
         let mut stats_buffer = Buffer::new(&mut font_system, metrics);
         let mut term_buffer = Buffer::new(&mut font_system, metrics);
         term_buffer.set_wrap(Wrap::None);
+        // Measure the font's true monospace advance from a 10-char probe so
+        // all column math (strip highlights, click mapping, cursor) is exact.
+        let mut probe = Buffer::new(&mut font_system, metrics);
+        probe.set_wrap(Wrap::None);
+        probe.set_text(
+            "0000000000",
+            &Attrs::new().family(Family::Monospace),
+            Shaping::Advanced,
+            None,
+        );
+        probe.set_size(Some(10000.0), Some(BASE_LINE * scale_factor as f32 * 2.0));
+        probe.shape_until_scroll(&mut font_system, false);
+        let cell_w_measured = probe
+            .layout_runs()
+            .next()
+            .map(|r| r.line_w / 10.0)
+            .unwrap_or(BASE_FONT * scale_factor as f32 * MONO_ADVANCE_RATIO);
+
         let sidebar_metrics = Metrics::new(
             BASE_FONT * scale_factor as f32,
             BASE_LINE * scale_factor as f32 * SIDEBAR_TAB_PITCH,
@@ -811,6 +835,9 @@ impl Renderer {
             sidebar_labels_buffer,
             sidebar_tabs_text: String::new(),
             sidebar_tab_count: 0,
+            sidebar_width_override: None,
+            sidebar_edge_hot: false,
+            cell_w_measured,
             tabstrip_buffer,
             tabstrip_text: String::new(),
             tab_layout: Vec::new(),
@@ -851,7 +878,10 @@ impl Renderer {
     }
 
     pub fn cell_w(&self) -> f32 {
-        self.font_px() * MONO_ADVANCE_RATIO
+        // Measured from a shaped probe (not the MONO_ADVANCE_RATIO estimate):
+        // the estimate drifts a few px over tens of columns, which put the
+        // strip highlight visibly off its label (user-reported).
+        self.cell_w_measured
     }
 
     /// Width in px reserved for the gutter's digits (no trailing gap). Taken as
@@ -889,15 +919,36 @@ impl Renderer {
 
     /// Width of the left activity bar in physical px (0 when disabled).
     pub fn sidebar_w(&self) -> f32 {
-        if !self.sidebar_enabled {
+        // Collapsed = fully hidden (Ctrl+B); expanded width is user-draggable
+        // via the separator (override), else the default.
+        if !self.sidebar_enabled || !self.sidebar_expanded {
             return 0.0;
         }
-        let base = if self.sidebar_expanded {
-            SIDEBAR_W_EXPANDED
-        } else {
-            SIDEBAR_W
-        };
+        let base = self.sidebar_width_override.unwrap_or(SIDEBAR_W_EXPANDED);
         base * self.scale_factor as f32
+    }
+
+    /// Drag-resize the sidebar to physical x (clamped 110..420 logical px).
+    pub fn set_sidebar_width_px(&mut self, physical_x: f32) {
+        let logical = (physical_x / self.scale_factor as f32).clamp(110.0, 420.0);
+        self.sidebar_width_override = Some(logical);
+        self.reflow_terminal_geometry();
+        self.banner_dirty = true;
+    }
+
+    /// Whether physical x is on the draggable sidebar separator (±5px).
+    pub fn sidebar_edge_hit(&self, x: f32) -> bool {
+        let w = self.sidebar_w();
+        w > 0.0 && (x - w).abs() <= 5.0 * self.scale_factor as f32
+    }
+
+    /// Mark the separator hot (hover/drag); returns true when changed.
+    pub fn set_sidebar_edge_hot(&mut self, hot: bool) -> bool {
+        if self.sidebar_edge_hot == hot {
+            return false;
+        }
+        self.sidebar_edge_hot = hot;
+        true
     }
 
     pub fn sidebar_expanded(&self) -> bool {
@@ -1617,6 +1668,22 @@ impl Renderer {
         );
         self.wordmark_buffer
             .shape_until_scroll(&mut self.font_system, false);
+        // Re-measure the advance at the new metrics.
+        let mut probe = Buffer::new(&mut self.font_system, metrics);
+        probe.set_wrap(Wrap::None);
+        probe.set_text(
+            "0000000000",
+            &Attrs::new().family(Family::Monospace),
+            Shaping::Advanced,
+            None,
+        );
+        probe.set_size(Some(10000.0), Some(self.line_px() * 2.0));
+        probe.shape_until_scroll(&mut self.font_system, false);
+        self.cell_w_measured = probe
+            .layout_runs()
+            .next()
+            .map(|r| r.line_w / 10.0)
+            .unwrap_or(self.font_px() * MONO_ADVANCE_RATIO);
         let term_text = std::mem::take(&mut self.term_text);
         let term_cursor = self.term_cursor;
         self.set_terminal_text(&term_text, term_cursor);
@@ -2378,7 +2445,7 @@ impl Renderer {
         // Left tab-bar background quad (own buffer, drawn behind the glyphs).
         let mut sidebar_verts: u32 = 0;
         self.sidebar_bytes.clear();
-        if self.sidebar_enabled {
+        if self.sidebar_enabled && self.sidebar_w() > 0.0 {
             let sw = self.sidebar_w();
             let sb_top = self.sidebar_top();
             let pitch = self.line_px() * SIDEBAR_TAB_PITCH;
@@ -2459,6 +2526,28 @@ impl Renderer {
                     aw,
                     uh,
                     TABSTRIP_ACTIVE_COLOR,
+                );
+            }
+        }
+        // Draggable sidebar separator line (hot = rust while hovered/dragged).
+        {
+            let sbw = self.sidebar_w();
+            if sbw > 0.0 {
+                let s1 = (1.0 * self.scale_factor as f32).max(1.0);
+                let (wdt, color) = if self.sidebar_edge_hot {
+                    (s1 * 2.0, SIDEBAR_ACTIVE_COLOR)
+                } else {
+                    (s1, SIDEBAR_SEAM_COLOR)
+                };
+                sidebar_verts += push_quad(
+                    &mut self.sidebar_bytes,
+                    fw,
+                    fh,
+                    sbw - wdt,
+                    0.0,
+                    wdt,
+                    fh,
+                    color,
                 );
             }
         }

@@ -382,6 +382,7 @@ fn main() -> ExitCode {
         terminal: None,
         term_focused: false,
         term_resizing: false,
+        sidebar_resizing: false,
         term_tab_active: false,
         last_click_at: None,
         last_click_pos: None,
@@ -578,6 +579,8 @@ struct App {
     term_focused: bool,
     /// Dragging the terminal's top border to resize the split.
     term_resizing: bool,
+    /// Dragging the sidebar separator to resize it.
+    sidebar_resizing: bool,
     /// The terminal content-tab is active (terminal fills the content area).
     term_tab_active: bool,
     /// Double-click tracking for word-select.
@@ -3413,6 +3416,31 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.pointer = (position.x, position.y);
+                // Sidebar separator: dragging resizes; hovering swaps in a
+                // col-resize cursor and lights the line.
+                if self.sidebar_resizing {
+                    if let Some(r) = self.renderer.as_mut() {
+                        r.set_sidebar_width_px(position.x as f32);
+                        r.window().request_redraw();
+                    }
+                    self.apply_view(false);
+                    return;
+                }
+                let edge_hot = self
+                    .renderer
+                    .as_ref()
+                    .map(|r| r.sidebar_edge_hit(position.x as f32))
+                    .unwrap_or(false);
+                if let Some(r) = self.renderer.as_mut() {
+                    if r.set_sidebar_edge_hot(edge_hot) {
+                        r.window().set_cursor(if edge_hot {
+                            winit::window::CursorIcon::ColResize
+                        } else {
+                            winit::window::CursorIcon::Default
+                        });
+                        r.window().request_redraw();
+                    }
+                }
                 // Sidebar hover highlight (redraw only on change).
                 if let Some(r) = self.renderer.as_mut() {
                     let tab = r.sidebar_tab_at(position.x as f32, position.y as f32);
@@ -3497,7 +3525,21 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 // Left tab bar: works from any view (mouse backup for the
                 // palette / find / agents / terminal / settings commands).
+                if state == ElementState::Released {
+                    // End a separator drag no matter which view is up.
+                    self.sidebar_resizing = false;
+                }
                 if state == ElementState::Pressed {
+                    // Grab the sidebar separator to resize it.
+                    if self
+                        .renderer
+                        .as_ref()
+                        .map(|r| r.sidebar_edge_hit(self.pointer.0 as f32))
+                        .unwrap_or(false)
+                    {
+                        self.sidebar_resizing = true;
+                        return;
+                    }
                     // Left bar = open file tabs: click switches.
                     if let Some(tab) = self.renderer.as_ref().and_then(|r| {
                         r.sidebar_tab_at(self.pointer.0 as f32, self.pointer.1 as f32)
