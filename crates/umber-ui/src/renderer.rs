@@ -101,12 +101,7 @@ const TERM_TEXT_COLOR: Color = Color::rgb(210, 210, 215);
 /// Left activity/tab bar (P5 QoL). Width in logical px; vertical tab glyphs
 /// give a mouse backup for the palette/search/agents/terminal/settings views.
 const SIDEBAR_W: f32 = 40.0;
-/// Tabs, top to bottom: palette, find, agents, terminal, settings.
-const SIDEBAR_GLYPHS: &str = "\u{2630}\n\u{2315}\n\u{25c8}\n\u{25b8}\n\u{2699}";
-/// Number of tabs (drives hit-testing).
-pub const SIDEBAR_TABS: usize = 5;
 const SIDEBAR_BG_COLOR: [f32; 4] = [0.085, 0.085, 0.105, 1.0];
-const SIDEBAR_GLYPH_COLOR: Color = Color::rgb(150, 150, 168);
 /// Per-tab vertical pitch as a multiple of the line height.
 const SIDEBAR_TAB_PITCH: f32 = 1.4;
 /// Expanded activity-bar width (icons + text labels).
@@ -503,8 +498,6 @@ pub struct Renderer {
     term_text: String,
     term_cursor: Option<(usize, usize)>,
     term_buffer: Buffer,
-    /// Left tab-bar glyph column, shaped once (rebuilt on scale change).
-    sidebar_buffer: Buffer,
     sidebar_enabled: bool,
     /// Expanded (icons + labels) vs collapsed (icons only).
     sidebar_expanded: bool,
@@ -513,6 +506,9 @@ pub struct Renderer {
     sidebar_active: Option<usize>,
     /// Text labels column, shown when expanded.
     sidebar_labels_buffer: Buffer,
+    /// Cached joined tab-label text + row count for the left file-tab list.
+    sidebar_tabs_text: String,
+    sidebar_tab_count: usize,
     /// Open-document tab strip: shaped label row + per-tab char-column ranges
     /// for hit-testing + the active tab index.
     tabstrip_buffer: Buffer,
@@ -607,15 +603,7 @@ impl Renderer {
             BASE_FONT * scale_factor as f32,
             BASE_LINE * scale_factor as f32 * SIDEBAR_TAB_PITCH,
         );
-        let mut sidebar_buffer = Buffer::new(&mut font_system, sidebar_metrics);
-        sidebar_buffer.set_wrap(Wrap::None);
-        sidebar_buffer.set_text(
-            SIDEBAR_GLYPHS,
-            &Attrs::new().family(Family::Monospace),
-            Shaping::Advanced,
-            None,
-        );
-        sidebar_buffer.shape_until_scroll(&mut font_system, false);
+
         let mut sidebar_labels_buffer = Buffer::new(&mut font_system, sidebar_metrics);
         sidebar_labels_buffer.set_wrap(Wrap::None);
         sidebar_labels_buffer.set_text(
@@ -788,12 +776,13 @@ impl Renderer {
             term_text: String::new(),
             term_cursor: None,
             term_buffer,
-            sidebar_buffer,
             sidebar_enabled: true,
             sidebar_expanded: true,
             sidebar_hover: None,
             sidebar_active: None,
             sidebar_labels_buffer,
+            sidebar_tabs_text: String::new(),
+            sidebar_tab_count: 0,
             tabstrip_buffer,
             tabstrip_text: String::new(),
             tab_layout: Vec::new(),
@@ -910,6 +899,33 @@ impl Renderer {
         self.sidebar_active = active;
     }
 
+    /// Set the left file-tab list: one label per open tab + the active index.
+    /// Reshapes only when the label text changes.
+    pub fn set_sidebar_tabs(&mut self, labels: &[String], active: usize) {
+        self.sidebar_tab_count = labels.len();
+        self.sidebar_active = if labels.is_empty() {
+            None
+        } else {
+            Some(active.min(labels.len() - 1))
+        };
+        let text = labels.join("\n");
+        if self.sidebar_tabs_text != text {
+            self.sidebar_tabs_text.clear();
+            self.sidebar_tabs_text.push_str(&text);
+            self.sidebar_labels_buffer.set_text(
+                &text,
+                &Attrs::new().family(Family::Monospace),
+                Shaping::Advanced,
+                None,
+            );
+            let w = self.sidebar_w().max(1.0);
+            let hgt = self.surface_config.height as f32;
+            self.sidebar_labels_buffer.set_size(Some(w), Some(hgt));
+            self.sidebar_labels_buffer
+                .shape_until_scroll(&mut self.font_system, false);
+        }
+    }
+
     /// Left content edge: past the activity bar, plus window padding. Banner,
     /// gutter, and terminal all originate here so the sidebar shift is applied
     /// in exactly one place.
@@ -929,7 +945,7 @@ impl Renderer {
         }
         let pitch = self.line_px() * SIDEBAR_TAB_PITCH;
         let row = ((y - top) / pitch).floor() as usize;
-        if row < SIDEBAR_TABS {
+        if row < self.sidebar_tab_count {
             Some(row)
         } else {
             None
@@ -1707,12 +1723,11 @@ impl Renderer {
         let h = self.surface_config.height as i32;
 
         let mut areas: Vec<TextArea> = Vec::with_capacity(8);
-        if self.sidebar_enabled {
-            // Left tab bar: a vertical glyph column (palette/find/agents/
-            // terminal/settings), a mouse backup for the keyboard commands.
+        if self.sidebar_enabled && self.sidebar_tab_count > 0 {
+            // Left file-tab list: one open editor tab per row (dynamic labels).
             areas.push(TextArea {
-                buffer: &self.sidebar_buffer,
-                left: pad * 0.5,
+                buffer: &self.sidebar_labels_buffer,
+                left: pad * 0.6,
                 top: pad + line_px * 0.3,
                 scale: 1.0,
                 bounds: TextBounds {
@@ -1721,25 +1736,9 @@ impl Renderer {
                     right: self.sidebar_w() as i32,
                     bottom: h,
                 },
-                default_color: SIDEBAR_GLYPH_COLOR,
+                default_color: SIDEBAR_LABEL_COLOR,
                 custom_glyphs: &[],
             });
-            if self.sidebar_expanded {
-                areas.push(TextArea {
-                    buffer: &self.sidebar_labels_buffer,
-                    left: pad * 0.5 + cell_w * 2.2,
-                    top: pad + line_px * 0.3,
-                    scale: 1.0,
-                    bounds: TextBounds {
-                        left: 0,
-                        top: 0,
-                        right: self.sidebar_w() as i32,
-                        bottom: h,
-                    },
-                    default_color: SIDEBAR_LABEL_COLOR,
-                    custom_glyphs: &[],
-                });
-            }
         }
         areas.push(TextArea {
             buffer: &self.stats_buffer,

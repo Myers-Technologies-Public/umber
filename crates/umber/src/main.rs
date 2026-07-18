@@ -742,7 +742,6 @@ impl App {
             renderer.set_stats_prefix(prefix);
         }
         self.sel_spans = spans;
-        self.sync_sidebar_active();
     }
 
     /// Adjust the scroll offset by `delta` lines, clamped to the buffer.
@@ -1577,7 +1576,7 @@ impl App {
     /// (or clear it in the editor), then request a redraw. All modal text is
     /// shaped here (the state-change path), never in `render`.
     fn refresh_overlay(&mut self) {
-        self.sync_sidebar_active();
+        self.sync_activity_strip();
         let spec = self.build_overlay_spec();
         if let Some(r) = self.renderer.as_mut() {
             r.set_overlay(spec);
@@ -2643,22 +2642,29 @@ impl App {
         }
         let active = self.active_doc;
         if let Some(r) = self.renderer.as_mut() {
-            r.set_tabs(&labels, active);
+            r.set_sidebar_tabs(&labels, active);
         }
+        self.sync_activity_strip();
     }
 
-    /// Mark the activity-bar tab matching the current view (accent bar).
-    fn sync_sidebar_active(&mut self) {
+    /// Feed the TOP activity strip (Palette/Find/Agents/Terminal/Settings)
+    /// and tint the action matching the current view. `usize::MAX` = none
+    /// (the renderer's active lookup is range-checked).
+    fn sync_activity_strip(&mut self) {
+        let labels: Vec<String> = ["Palette", "Find", "Agents", "Terminal", "Settings"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let active = match self.view {
-            View::Palette => Some(0),
-            View::Search => Some(1),
-            View::Agents | View::AgentPrompt => Some(2),
-            View::Settings => Some(4),
-            View::Editor if self.term_focused => Some(3),
-            _ => None,
+            View::Palette => 0,
+            View::Search => 1,
+            View::Agents | View::AgentPrompt => 2,
+            View::Editor if self.term_focused => 3,
+            View::Settings => 4,
+            _ => usize::MAX,
         };
         if let Some(r) = self.renderer.as_mut() {
-            r.set_sidebar_active(active);
+            r.set_tabs(&labels, active);
         }
     }
 
@@ -3287,13 +3293,11 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
-                // Middle-click a tab in the strip closes it.
+                // Middle-click a file tab (left bar) closes it.
                 if button == MouseButton::Middle && state == ElementState::Pressed {
-                    if let Some(i) = self
-                        .renderer
-                        .as_ref()
-                        .and_then(|r| r.tabstrip_at(self.pointer.0 as f32, self.pointer.1 as f32))
-                    {
+                    if let Some(i) = self.renderer.as_ref().and_then(|r| {
+                        r.sidebar_tab_at(self.pointer.0 as f32, self.pointer.1 as f32)
+                    }) {
                         self.close_tab(i);
                     }
                     return;
@@ -3304,20 +3308,24 @@ impl ApplicationHandler<UserEvent> for App {
                 // Left tab bar: works from any view (mouse backup for the
                 // palette / find / agents / terminal / settings commands).
                 if state == ElementState::Pressed {
+                    // Left bar = open file tabs: click switches.
                     if let Some(tab) = self.renderer.as_ref().and_then(|r| {
                         r.sidebar_tab_at(self.pointer.0 as f32, self.pointer.1 as f32)
                     }) {
-                        self.sidebar_tab_activate(tab);
+                        if self.view != View::Editor {
+                            self.close_overlay();
+                        }
+                        self.switch_tab(tab);
                         return;
                     }
-                    // Open-document tab strip click -> switch tab.
-                    if self.view == View::Editor {
-                        if let Some(i) = self.renderer.as_ref().and_then(|r| {
-                            r.tabstrip_at(self.pointer.0 as f32, self.pointer.1 as f32)
-                        }) {
-                            self.switch_tab(i);
-                            return;
-                        }
+                    // Top strip = activity actions: click activates.
+                    if let Some(i) = self
+                        .renderer
+                        .as_ref()
+                        .and_then(|r| r.tabstrip_at(self.pointer.0 as f32, self.pointer.1 as f32))
+                    {
+                        self.sidebar_tab_activate(i);
+                        return;
                     }
                 }
                 // Overlay pages: a left click selects a list row, and clicking
