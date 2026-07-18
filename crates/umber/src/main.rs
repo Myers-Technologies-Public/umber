@@ -809,7 +809,18 @@ impl App {
             }
         }
 
+        // Language for syntax highlighting: local file ext, else remote ext.
+        let ext = self
+            .buffer
+            .path()
+            .and_then(|p| p.extension().map(|e| e.to_string_lossy().into_owned()))
+            .or_else(|| {
+                self.remote_file
+                    .as_ref()
+                    .and_then(|rf| rf.rsplit('.').next().map(|e| e.to_string()))
+            });
         if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_language(ext.as_deref());
             renderer.set_gutter(&numbers, digits);
             renderer.set_document(&text);
             renderer.set_cursor(cursor);

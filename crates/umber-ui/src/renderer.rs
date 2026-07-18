@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Wrap};
 use glyphon::{Cache, Resolution, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport};
+use umber_syntax::{Lang, Style as SynStyle, SyntaxSet};
 use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
 
@@ -109,6 +110,20 @@ const SIDEBAR_LABELS: &str = "Palette\nFind\nAgents\nTerminal\nSettings";
 const SIDEBAR_HOVER_COLOR: [f32; 4] = [1.0, 1.0, 0.96, 0.045];
 /// The draggable sidebar|content separator line.
 const SIDEBAR_SEAM_COLOR: [f32; 4] = [0.45, 0.42, 0.36, 0.45];
+
+/// Warm syntax palette (tree-sitter styles -> colors).
+fn syntax_color(style: SynStyle) -> Color {
+    match style {
+        SynStyle::Keyword => Color::rgb(216, 110, 72),
+        SynStyle::Function => Color::rgb(222, 178, 106),
+        SynStyle::Type => Color::rgb(205, 170, 130),
+        SynStyle::String => Color::rgb(164, 180, 120),
+        SynStyle::Number => Color::rgb(203, 144, 169),
+        SynStyle::Comment => Color::rgb(122, 115, 102),
+        SynStyle::Property => Color::rgb(186, 156, 189),
+        SynStyle::Punct => Color::rgb(168, 160, 146),
+    }
+}
 /// Left accent bar marking the active tab (Crail rust).
 const SIDEBAR_ACTIVE_COLOR: [f32; 4] = [0.757, 0.373, 0.235, 1.0];
 const SIDEBAR_LABEL_COLOR: Color = Color::rgb(168, 161, 148);
@@ -579,6 +594,9 @@ pub struct Renderer {
     /// The last document window text, kept so a scale change can re-shape it
     /// without the caller re-supplying it.
     doc_text: String,
+    /// Highlighter + the active document language (None = plain text).
+    syntax: SyntaxSet,
+    doc_lang: Option<Lang>,
     /// The file-info half of the banner (the latency half is appended live).
     stats_prefix: String,
     /// Banner rebuild flag + last latency sample count. The banner string is
@@ -915,6 +933,8 @@ impl Renderer {
             tab_active: 0,
             tabstrip_hover: None,
             doc_text: String::new(),
+            syntax: SyntaxSet::new(),
+            doc_lang: None,
             stats_prefix: String::new(),
             banner_dirty: true,
             last_lat_n: 0,
@@ -1352,16 +1372,55 @@ impl Renderer {
         }
         self.doc_text.clear();
         self.doc_text.push_str(text);
-        self.doc_buffer.set_text(
-            text,
-            &Attrs::new().family(Family::Monospace),
-            Shaping::Advanced,
-            None,
-        );
+        let default_attrs = Attrs::new().family(Family::Monospace);
+        // Syntax highlighting: tree-sitter spans over the visible window,
+        // rendered as cosmic rich text. Empty spans (plain text, unknown
+        // language, parse failure) fall through to the plain path.
+        let mut highlighted = false;
+        if let Some(lang) = self.doc_lang {
+            let spans = self.syntax.highlight(lang, text);
+            if !spans.is_empty() {
+                let mut rich: Vec<(&str, Attrs)> = Vec::with_capacity(spans.len() * 2 + 1);
+                let mut pos = 0usize;
+                for sp in &spans {
+                    if sp.start > pos {
+                        if let Some(seg) = text.get(pos..sp.start) {
+                            rich.push((seg, default_attrs.clone()));
+                        }
+                    }
+                    if let Some(seg) = text.get(sp.start..sp.end) {
+                        rich.push((seg, default_attrs.clone().color(syntax_color(sp.style))));
+                    }
+                    pos = sp.end;
+                }
+                if let Some(seg) = text.get(pos..) {
+                    rich.push((seg, default_attrs.clone()));
+                }
+                self.doc_buffer
+                    .set_rich_text(rich, &default_attrs, Shaping::Advanced, None);
+                highlighted = true;
+            }
+        }
+        if !highlighted {
+            self.doc_buffer
+                .set_text(text, &default_attrs, Shaping::Advanced, None);
+        }
         let (w, h) = self.doc_size();
         self.doc_buffer.set_size(Some(w), Some(h));
         self.doc_buffer
             .shape_until_scroll(&mut self.font_system, false);
+    }
+
+    /// Set the document language from a file extension (None = plain text).
+    /// A change forces the next `set_document` to re-shape + re-highlight.
+    pub fn set_language(&mut self, ext: Option<&str>) {
+        let lang = ext
+            .map(|e| e.to_ascii_lowercase())
+            .and_then(|e| umber_syntax::lang_for_ext(&e));
+        if lang != self.doc_lang {
+            self.doc_lang = lang;
+            self.doc_text.clear();
+        }
     }
 
     /// Replace the shaped line-number gutter for the visible window. `numbers`

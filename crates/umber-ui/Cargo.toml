@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+umber-syntax = { workspace = true }
 glyphon.workspace = true
 wgpu.workspace = true
 winit.workspace = true
