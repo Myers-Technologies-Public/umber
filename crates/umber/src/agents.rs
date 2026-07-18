@@ -278,6 +278,93 @@ pub fn parse_session(text: &str, path: &Path) -> Option<SessionSummary> {
     })
 }
 
+/// Flatten a pi message `content` field to plain text: either a bare string
+/// or an array of blocks with `text` fields (RESEARCH-pi.md §2.2).
+fn flatten_content(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
+    }
+}
+
+/// Extract the conversation on the ACTIVE branch as `(role, text)` pairs in
+/// chronological order (`you` / `agent`), keeping the last `max_messages`.
+/// Tool results and bookkeeping entries are skipped; branch semantics match
+/// [`parse_session`] (walk the parent chain of the last appended entry).
+pub fn session_transcript(text: &str, max_messages: usize) -> Vec<(String, String)> {
+    let mut lines = text.lines();
+    let Some(first) = lines.next() else {
+        return Vec::new();
+    };
+    let Ok(header) = serde_json::from_str::<Value>(first) else {
+        return Vec::new();
+    };
+    if header.get("type").and_then(Value::as_str) != Some("session") {
+        return Vec::new();
+    }
+
+    let mut entries: HashMap<String, (Option<String>, Option<(String, String)>)> = HashMap::new();
+    let mut last_id: Option<String> = None;
+    for line in lines {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(id) = v.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let parent = v
+            .get("parentId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let msg = if v.get("type").and_then(Value::as_str) == Some("message") {
+            let m = v.get("message");
+            let role = m.and_then(|m| m.get("role")).and_then(Value::as_str);
+            match role {
+                Some("user") => m
+                    .and_then(|m| m.get("content"))
+                    .map(|c| ("you".to_string(), flatten_content(c))),
+                Some("assistant") => m
+                    .and_then(|m| m.get("content"))
+                    .map(|c| ("agent".to_string(), flatten_content(c))),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        entries.insert(id.to_string(), (parent, msg));
+        last_id = Some(id.to_string());
+    }
+
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut cursor = last_id;
+    let mut hops = 0usize;
+    while let Some(id) = cursor {
+        let Some((parent, msg)) = entries.get(&id) else {
+            break;
+        };
+        hops += 1;
+        if hops > entries.len() + 1 {
+            break;
+        }
+        if let Some((role, text)) = msg {
+            if !text.trim().is_empty() {
+                out.push((role.clone(), text.clone()));
+            }
+        }
+        cursor = parent.clone();
+    }
+    out.reverse(); // walked leaf->root; present chronologically
+    if out.len() > max_messages {
+        out.drain(..out.len() - max_messages);
+    }
+    out
+}
+
 /// Compact age for dashboard rows: `95` -> `"1m ago"`.
 pub fn fmt_age(secs: u64) -> String {
     if secs == u64::MAX {
@@ -380,6 +467,24 @@ mod tests {
         ]
         .join("\n");
         assert!(parse_session(&text, Path::new("/tmp/x")).is_some());
+    }
+
+    #[test]
+    fn transcript_follows_active_branch_in_order() {
+        let text = [
+            HEADER.to_string(),
+            user("bbbbbbbb", None),
+            assistant("c1c1c1c1", "bbbbbbbb", 9999), // abandoned sibling
+            assistant("c2c2c2c2", "bbbbbbbb", 100),
+        ]
+        .join("\n");
+        let t = session_transcript(&text, 10);
+        assert_eq!(t.len(), 1); // user "hi" has content; assistants have empty content blocks
+        assert_eq!(t[0].0, "you");
+        assert_eq!(t[0].1, "hi");
+        // Cap keeps the LAST messages.
+        let t2 = session_transcript(&text, 0);
+        assert!(t2.is_empty());
     }
 
     #[test]

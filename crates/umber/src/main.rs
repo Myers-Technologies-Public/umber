@@ -99,6 +99,8 @@ enum View {
     Agents,
     /// P4 slice 2: type a prompt to send to the live attached agent.
     AgentPrompt,
+    /// Full-thread viewer for a selected agent/session (scrollable).
+    AgentThread,
     /// P3b-deep: enter an SSH host for a remote workspace.
     RemoteHost,
     /// P3b-deep: enter a remote file path to open over the workspace.
@@ -251,6 +253,51 @@ fn ssh_config_hosts() -> Vec<String> {
     }
 }
 
+/// What each visible row on the Agents page IS (parallel to the row list),
+/// so clicks and Enter know their target.
+#[derive(Clone, Copy, PartialEq)]
+enum AgentsRow {
+    /// Section header / informational — not actionable.
+    Header,
+    /// The live attached agent (opens its streaming thread).
+    Live,
+    /// `agents_sessions[i]` (opens its transcript).
+    Session(usize),
+    /// The History expander toggle.
+    Expander,
+}
+
+/// Word-wrap one transcript message into display rows: `you ▸` / `  ●`
+/// prefix on the first line, indent on continuations, blank spacer after.
+fn wrap_message(rows: &mut Vec<(String, String)>, speaker: &str, text: &str) {
+    const WIDTH: usize = 100;
+    let prefix = if speaker == "you" {
+        "you \u{25b8} "
+    } else {
+        "  \u{25cf} "
+    };
+    let indent = "      ";
+    let mut line = String::new();
+    let mut first = true;
+    for word in text.split_whitespace() {
+        if !line.is_empty() && line.chars().count() + word.chars().count() + 1 > WIDTH {
+            let lead = if first { prefix } else { indent };
+            rows.push((format!("{lead}{line}"), String::new()));
+            first = false;
+            line.clear();
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        let lead = if first { prefix } else { indent };
+        rows.push((format!("{lead}{line}"), String::new()));
+    }
+    rows.push((String::new(), String::new()));
+}
+
 /// First visible row of a windowed overlay list for a given selection (the
 /// selection is kept at the window's bottom edge once the list scrolls).
 fn windowed_start(sel: usize, n: usize, cap: usize) -> usize {
@@ -365,6 +412,10 @@ fn main() -> ExitCode {
         agents_scroll: 0,
         agent_proc: None,
         agent_prompt: String::new(),
+        agents_expanded: false,
+        agent_thread: Vec::new(),
+        agent_thread_title: String::new(),
+        agent_thread_scroll: 0,
         remote: None,
         remote_file: None,
         remote_host_input: String::new(),
@@ -540,6 +591,12 @@ struct App {
     agent_proc: Option<AgentProcess>,
     /// In-progress prompt text for the live agent.
     agent_prompt: String,
+    /// History section expanded on the Agents page.
+    agents_expanded: bool,
+    /// Loaded thread rows + title + scroll for the thread viewer.
+    agent_thread: Vec<(String, String)>,
+    agent_thread_title: String,
+    agent_thread_scroll: usize,
 
     // --- P3b-deep: remote workspace over umberd/SSH ---
     /// Connected remote workspace; when set, the buffer is remote-backed and
@@ -1733,64 +1790,59 @@ impl App {
                     .as_ref()
                     .map(|r| r.overlay_row_capacity())
                     .unwrap_or(1);
-                let n = self.agents_sessions.len();
-                let start = self.agents_scroll.min(n.saturating_sub(1));
+                let (all_rows, model) = self.agents_row_model();
+                let n = all_rows.len();
+                let sel = if n == 0 {
+                    0
+                } else {
+                    self.agents_scroll.min(n - 1)
+                };
+                let start = windowed_start(sel, n, cap);
                 let end = (start + cap).min(n);
-                let home = std::env::var("HOME").unwrap_or_default();
-                let mut rows = self.agent_live_rows();
-                if rows.is_empty() && n == 0 {
-                    rows.push((
-                        "No agents yet \u{2014} press n to launch pi here".to_string(),
-                        String::new(),
-                    ));
-                }
-                rows.extend(self.agents_sessions[start..end].iter().map(|s| {
-                    let cwd = if !home.is_empty() && s.cwd.starts_with(&home) {
-                        format!("~{}", &s.cwd[home.len()..])
-                    } else {
-                        s.cwd.clone()
-                    };
-                    // "2026-07-15T22:33:12.865Z" -> "07-15 22:33"
-                    let when: String = s
-                        .last_active
-                        .chars()
-                        .skip(5)
-                        .take(11)
-                        .map(|c| if c == 'T' { ' ' } else { c })
-                        .collect();
-                    let marker = if s.age_secs < 120 {
-                        "\u{25cf} active"
-                    } else {
-                        "idle"
-                    };
-                    let _ = when;
-                    (
-                        format!("{}  \u{2014}  {}", s.model, cwd),
-                        format!(
-                            "{marker} \u{2022} {} \u{2022} {} tok \u{2022} {} msgs",
-                            agents::fmt_age(s.age_secs),
-                            agents::fmt_tokens(s.tokens_total),
-                            s.messages,
-                        ),
-                    )
-                }));
-                let attached = self.agent_proc.is_some();
+                let selected = if n == 0 || matches!(model.get(sel), Some(AgentsRow::Header)) {
+                    None
+                } else {
+                    Some(sel - start)
+                };
                 Some(OverlaySpec {
-                    title: Some("pi Agents \u{2014} \u{25cf} running \u{00b7} \u{25c9} needs response \u{00b7} recent".to_string()),
+                    title: Some("Agents".to_string()),
                     input: None,
-                    rows,
+                    rows: all_rows[start..end].to_vec(),
                     left_color: [225, 225, 230],
                     right_color: [200, 170, 110],
                     split_frac: 0.52,
+                    selected,
+                    hint: Some(
+                        "click/Enter open thread \u{2022} h history \u{2022} n new \u{2022} p prompt \u{2022} a abort \u{2022} k kill \u{2022} r refresh \u{2022} Esc"
+                            .to_string(),
+                    ),
+                })
+            }
+            View::AgentThread => {
+                let cap = self
+                    .renderer
+                    .as_ref()
+                    .map(|r| r.overlay_row_capacity())
+                    .unwrap_or(1);
+                let n = self.agent_thread.len();
+                let sel = if n == 0 {
+                    0
+                } else {
+                    self.agent_thread_scroll.min(n - 1)
+                };
+                let start = windowed_start(sel, n, cap);
+                let end = (start + cap).min(n);
+                Some(OverlaySpec {
+                    title: Some(self.agent_thread_title.clone()),
+                    input: None,
+                    rows: self.agent_thread[start..end].to_vec(),
+                    left_color: [225, 225, 230],
+                    right_color: [150, 143, 130],
+                    split_frac: 0.85,
                     selected: None,
-                    hint: Some(if attached {
-                        "p prompt \u{2022} a abort \u{2022} k kill \u{2022} r refresh \u{2022} \u{2191}\u{2193} \u{2022} Esc"
-                            .to_string()
-                    } else {
-                        format!(
-                            "{n} sessions \u{2014} n new live agent \u{2022} r refresh \u{2022} \u{2191}\u{2193} \u{2022} Esc"
-                        )
-                    }),
+                    hint: Some(
+                        "\u{2191}\u{2193}/wheel scroll \u{2022} Esc back to agents".to_string(),
+                    ),
                 })
             }
             View::AgentPrompt => Some(OverlaySpec {
@@ -2011,22 +2063,224 @@ impl App {
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
     }
 
+    /// One dashboard row for `agents_sessions[i]`.
+    fn agents_session_row(&self, i: usize) -> (String, String) {
+        let s = &self.agents_sessions[i];
+        let home = std::env::var("HOME").unwrap_or_default();
+        let cwd = if !home.is_empty() && s.cwd.starts_with(&home) {
+            format!("~{}", &s.cwd[home.len()..])
+        } else {
+            s.cwd.clone()
+        };
+        let marker = if s.age_secs < 120 {
+            "\u{25cf} active"
+        } else {
+            "idle"
+        };
+        (
+            format!("{}  \u{2014}  {}", s.model, cwd),
+            format!(
+                "{marker} \u{2022} {} \u{2022} {} tok \u{2022} {} msgs",
+                agents::fmt_age(s.age_secs),
+                agents::fmt_tokens(s.tokens_total),
+                s.messages,
+            ),
+        )
+    }
+
+    /// The Agents page rows + a parallel action map: LIVE section, ACTIVE
+    /// sessions (<2m), then a collapsed-by-default History expander.
+    fn agents_row_model(&self) -> (Vec<(String, String)>, Vec<AgentsRow>) {
+        let mut rows = Vec::new();
+        let mut model = Vec::new();
+        if self.agent_proc.is_some() {
+            rows.push(("LIVE".to_string(), String::new()));
+            model.push(AgentsRow::Header);
+            for r in self.agent_live_rows() {
+                rows.push(r);
+                model.push(AgentsRow::Live);
+            }
+        }
+        let active: Vec<usize> = (0..self.agents_sessions.len())
+            .filter(|&i| self.agents_sessions[i].age_secs < 120)
+            .collect();
+        let hist: Vec<usize> = (0..self.agents_sessions.len())
+            .filter(|&i| self.agents_sessions[i].age_secs >= 120)
+            .collect();
+        if !active.is_empty() {
+            rows.push(("ACTIVE".to_string(), String::new()));
+            model.push(AgentsRow::Header);
+            for &i in &active {
+                rows.push(self.agents_session_row(i));
+                model.push(AgentsRow::Session(i));
+            }
+        }
+        if self.agent_proc.is_none() && active.is_empty() && hist.is_empty() {
+            rows.push((
+                "No agents yet \u{2014} press n to launch pi here".to_string(),
+                String::new(),
+            ));
+            model.push(AgentsRow::Header);
+        }
+        if !hist.is_empty() {
+            let arrow = if self.agents_expanded {
+                "\u{25be}"
+            } else {
+                "\u{25b8}"
+            };
+            rows.push((format!("{arrow} History ({})", hist.len()), String::new()));
+            model.push(AgentsRow::Expander);
+            if self.agents_expanded {
+                for &i in &hist {
+                    rows.push(self.agents_session_row(i));
+                    model.push(AgentsRow::Session(i));
+                }
+            }
+        }
+        (rows, model)
+    }
+
+    /// Move the Agents selection by `delta`, skipping headers.
+    fn agents_move_sel(&mut self, delta: i64) {
+        let (rows, model) = self.agents_row_model();
+        let n = rows.len();
+        if n == 0 {
+            return;
+        }
+        let step = if delta >= 0 { 1i64 } else { -1i64 };
+        let mut sel = self.agents_scroll.min(n - 1) as i64;
+        let mut remaining = delta.abs();
+        while remaining > 0 {
+            let next = sel + step;
+            if next < 0 || next >= n as i64 {
+                break;
+            }
+            sel = next;
+            if !matches!(model[sel as usize], AgentsRow::Header) {
+                remaining -= 1;
+            }
+        }
+        while matches!(model.get(sel as usize), Some(AgentsRow::Header)) && sel + 1 < n as i64 {
+            sel += 1;
+        }
+        self.agents_scroll = sel as usize;
+        self.refresh_overlay();
+    }
+
+    /// Activate the Agents row at `idx` (open thread / toggle history).
+    fn agents_activate(&mut self, idx: usize) {
+        let (_, model) = self.agents_row_model();
+        match model.get(idx) {
+            Some(AgentsRow::Live) => self.open_agent_thread_live(),
+            Some(AgentsRow::Session(i)) => self.open_agent_thread_session(*i),
+            Some(AgentsRow::Expander) => {
+                self.agents_expanded = !self.agents_expanded;
+                self.refresh_overlay();
+            }
+            _ => {}
+        }
+    }
+
+    /// Open the transcript viewer for `agents_sessions[i]` (active branch,
+    /// chronological, scrolled to the latest).
+    fn open_agent_thread_session(&mut self, i: usize) {
+        let Some(s) = self.agents_sessions.get(i) else {
+            return;
+        };
+        let title = format!(
+            "{} \u{2014} {} \u{00b7} {}",
+            s.model,
+            s.cwd,
+            agents::fmt_age(s.age_secs)
+        );
+        let mut rows = Vec::new();
+        match std::fs::read_to_string(&s.path) {
+            Ok(text) => {
+                for (role, msg) in agents::session_transcript(&text, 80) {
+                    wrap_message(&mut rows, &role, &msg);
+                }
+            }
+            Err(err) => rows.push((format!("cannot read session: {err}"), String::new())),
+        }
+        if rows.is_empty() {
+            rows.push((
+                "(no conversation on the active branch)".to_string(),
+                String::new(),
+            ));
+        }
+        self.agent_thread = rows;
+        self.agent_thread_title = title;
+        self.agent_thread_scroll = self.agent_thread.len().saturating_sub(1);
+        self.view = View::AgentThread;
+        self.refresh_overlay();
+    }
+
+    /// Open the live agent's current thread (state + streamed output tail).
+    fn open_agent_thread_live(&mut self) {
+        let Some(proc) = self.agent_proc.as_ref() else {
+            return;
+        };
+        let mut rows = self.agent_live_rows();
+        rows.push((String::new(), String::new()));
+        let tail = proc.state.output_tail();
+        for l in tail.lines() {
+            rows.push((l.chars().take(140).collect(), String::new()));
+        }
+        self.agent_thread = rows;
+        self.agent_thread_title = "Live agent \u{2014} current thread".to_string();
+        self.agent_thread_scroll = self.agent_thread.len().saturating_sub(1);
+        self.view = View::AgentThread;
+        self.refresh_overlay();
+    }
+
+    /// Thread viewer keys: scroll + Esc back to the dashboard.
+    fn agent_thread_key(&mut self, event: KeyEvent) {
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.view = View::Agents;
+                self.refresh_overlay();
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                let n = self.agent_thread.len();
+                self.agent_thread_scroll = (self.agent_thread_scroll + 1).min(n.saturating_sub(1));
+                self.refresh_overlay();
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                self.agent_thread_scroll = self.agent_thread_scroll.saturating_sub(1);
+                self.refresh_overlay();
+            }
+            Key::Named(NamedKey::PageDown) => {
+                let n = self.agent_thread.len();
+                self.agent_thread_scroll = (self.agent_thread_scroll + 10).min(n.saturating_sub(1));
+                self.refresh_overlay();
+            }
+            Key::Named(NamedKey::PageUp) => {
+                self.agent_thread_scroll = self.agent_thread_scroll.saturating_sub(10);
+                self.refresh_overlay();
+            }
+            _ => {}
+        }
+    }
+
     fn agents_key(&mut self, event: KeyEvent) {
         match &event.logical_key {
             Key::Named(NamedKey::Escape) => self.close_overlay(),
-            Key::Named(NamedKey::ArrowDown) | Key::Named(NamedKey::PageDown) => {
-                let n = self.agents_sessions.len();
-                self.agents_scroll = (self.agents_scroll + 1).min(n.saturating_sub(1));
-                self.refresh_overlay();
+            Key::Named(NamedKey::ArrowDown) => self.agents_move_sel(1),
+            Key::Named(NamedKey::ArrowUp) => self.agents_move_sel(-1),
+            Key::Named(NamedKey::PageDown) => self.agents_move_sel(5),
+            Key::Named(NamedKey::PageUp) => self.agents_move_sel(-5),
+            Key::Named(NamedKey::Enter) => {
+                let sel = self.agents_scroll;
+                self.agents_activate(sel);
             }
-            Key::Named(NamedKey::ArrowUp) | Key::Named(NamedKey::PageUp) => {
-                self.agents_scroll = self.agents_scroll.saturating_sub(1);
+            Key::Character(c) if c.as_str() == "h" => {
+                self.agents_expanded = !self.agents_expanded;
                 self.refresh_overlay();
             }
             Key::Character(c) if c.as_str() == "r" => {
                 let scroll = self.agents_scroll;
                 self.open_agents();
-                self.agents_scroll = scroll.min(self.agents_sessions.len().saturating_sub(1));
+                self.agents_scroll = scroll;
                 self.refresh_overlay();
             }
             // n: spawn a live pi agent in the working dir (P4 slice 2).
@@ -2218,6 +2472,18 @@ impl App {
                     self.refresh_overlay();
                 }
             }
+            View::Agents => {
+                let (rows, model) = self.agents_row_model();
+                let n = rows.len();
+                if windowed_start(self.agents_scroll.min(n.saturating_sub(1)), n, cap) == 0
+                    && row < n
+                    && self.agents_scroll != row
+                    && !matches!(model.get(row), Some(AgentsRow::Header) | None)
+                {
+                    self.agents_scroll = row;
+                    self.refresh_overlay();
+                }
+            }
             View::SshPicker => {
                 let n = self.ssh_filtered.len();
                 if windowed_start(self.ssh_sel, n, cap) == 0 && row < n && self.ssh_sel != row {
@@ -2261,7 +2527,12 @@ impl App {
                 self.help_scroll = bump(self.help_scroll, self.palette_items.len(), down, mag)
             }
             View::Agents => {
-                self.agents_scroll = bump(self.agents_scroll, self.agents_sessions.len(), down, mag)
+                let n = self.agents_row_model().0.len();
+                self.agents_scroll = bump(self.agents_scroll, n, down, mag)
+            }
+            View::AgentThread => {
+                let n = self.agent_thread.len();
+                self.agent_thread_scroll = bump(self.agent_thread_scroll, n, down, mag)
             }
             _ => return,
         }
@@ -2822,7 +3093,7 @@ impl App {
         let active = match self.view {
             View::Palette => 0,
             View::Search => 1,
-            View::Agents | View::AgentPrompt => 2,
+            View::Agents | View::AgentPrompt | View::AgentThread => 2,
             View::Editor if self.term_focused => 3,
             View::Settings => 4,
             _ => usize::MAX,
@@ -2905,6 +3176,19 @@ impl App {
                 if abs < n {
                     self.search_sel = abs;
                     self.open_search_result();
+                }
+            }
+            View::Agents => {
+                let cap = self
+                    .renderer
+                    .as_ref()
+                    .map(|r| r.overlay_row_capacity())
+                    .unwrap_or(1);
+                let n = self.agents_row_model().0.len();
+                let abs = windowed_start(self.agents_scroll.min(n.saturating_sub(1)), n, cap) + row;
+                if abs < n {
+                    self.agents_scroll = abs;
+                    self.agents_activate(abs);
                 }
             }
             View::SshPicker => {
@@ -3786,6 +4070,10 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     View::AgentPrompt => {
                         self.agent_prompt_key(event);
+                        return;
+                    }
+                    View::AgentThread => {
+                        self.agent_thread_key(event);
                         return;
                     }
                     View::RemoteHost => {
