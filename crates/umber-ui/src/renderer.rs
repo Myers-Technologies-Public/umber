@@ -101,7 +101,14 @@ const TERM_TEXT_COLOR: Color = Color::rgb(210, 210, 215);
 /// Left activity/tab bar (P5 QoL). Width in logical px; vertical tab glyphs
 /// give a mouse backup for the palette/search/agents/terminal/settings views.
 const SIDEBAR_W: f32 = 40.0;
-const SIDEBAR_BG_COLOR: [f32; 4] = [0.085, 0.085, 0.105, 1.0];
+const SIDEBAR_BG_COLOR: [f32; 4] = [0.098, 0.098, 0.120, 1.0];
+/// Banner (top status row) background — same chrome family as the sidebar so
+/// the editor canvas reads as the darkest, focused surface.
+const BANNER_BG_COLOR: [f32; 4] = [0.098, 0.098, 0.120, 1.0];
+/// Wordmark in the sidebar corner block (Crail rust).
+const WORDMARK_COLOR: Color = Color::rgb(230, 180, 120);
+/// Current-line highlight behind the cursor's line (modern-editor cue).
+const CURRENT_LINE_COLOR: [f32; 4] = [0.55, 0.55, 0.65, 0.06];
 /// Per-tab vertical pitch as a multiple of the line height.
 const SIDEBAR_TAB_PITCH: f32 = 1.4;
 /// Expanded activity-bar width (icons + text labels).
@@ -116,14 +123,14 @@ const SEAM_COLOR: [f32; 4] = [0.28, 0.28, 0.34, 0.75];
 const SIDEBAR_ACTIVE_COLOR: [f32; 4] = [0.902, 0.706, 0.471, 0.95];
 /// Faint full-row tint behind the active tab so the whole item reads as
 /// selected (not just the edge bar).
-const SIDEBAR_ACTIVE_BG_COLOR: [f32; 4] = [0.902, 0.706, 0.471, 0.09];
+const SIDEBAR_ACTIVE_BG_COLOR: [f32; 4] = [0.902, 0.706, 0.471, 0.16];
 const SIDEBAR_LABEL_COLOR: Color = Color::rgb(198, 198, 212);
 
 /// Open-document tab strip (below the banner). Height multiple of line, bg,
 /// active-tab tint, and text color.
 const TABSTRIP_H_MULT: f32 = 1.3;
 const TABSTRIP_BG_COLOR: [f32; 4] = [0.10, 0.10, 0.125, 1.0];
-const TABSTRIP_ACTIVE_COLOR: [f32; 4] = [0.902, 0.706, 0.471, 0.14];
+const TABSTRIP_ACTIVE_COLOR: [f32; 4] = [0.902, 0.706, 0.471, 0.22];
 const TABSTRIP_TEXT_COLOR: Color = Color::rgb(205, 205, 218);
 
 /// Modal overlay palette (command palette / settings / modules). All
@@ -469,6 +476,8 @@ pub struct Renderer {
     /// hovered. `hover_line` is the window-relative line whose separator segment
     /// is highlighted (set for both word and empty-space hover).
     hover_word_buffer: Buffer,
+    /// Corner wordmark, shaped once at construction/scale change.
+    wordmark_buffer: Buffer,
     hover_word_text: String,
     hover_word: Option<(usize, usize)>,
     hover_line: Option<usize>,
@@ -641,6 +650,17 @@ impl Renderer {
         let mut hover_word_buffer = Buffer::new(&mut font_system, metrics);
         hover_word_buffer.set_wrap(Wrap::None);
 
+        // "umber" wordmark for the sidebar corner block, shaped once.
+        let mut wordmark_buffer = Buffer::new(&mut font_system, metrics);
+        wordmark_buffer.set_wrap(Wrap::None);
+        wordmark_buffer.set_text(
+            "\u{2618} umber",
+            &Attrs::new().family(Family::Monospace),
+            Shaping::Advanced,
+            None,
+        );
+        wordmark_buffer.shape_until_scroll(&mut font_system, false);
+
         // The cursor is a single glyph, shaped once here and re-shaped only on a
         // scale change.
         let mut cursor_buffer = Buffer::new(&mut font_system, metrics);
@@ -763,6 +783,7 @@ impl Renderer {
             scrollbar: None,
             selection: Vec::new(),
             hover_word_buffer,
+            wordmark_buffer,
             hover_word_text: String::new(),
             hover_word: None,
             hover_line: None,
@@ -1550,6 +1571,16 @@ impl Renderer {
         self.stats_buffer = Buffer::new(&mut self.font_system, metrics);
         self.term_buffer = Buffer::new(&mut self.font_system, metrics);
         self.term_buffer.set_wrap(Wrap::None);
+        self.wordmark_buffer = Buffer::new(&mut self.font_system, metrics);
+        self.wordmark_buffer.set_wrap(Wrap::None);
+        self.wordmark_buffer.set_text(
+            "\u{2618} umber",
+            &Attrs::new().family(Family::Monospace),
+            Shaping::Advanced,
+            None,
+        );
+        self.wordmark_buffer
+            .shape_until_scroll(&mut self.font_system, false);
         let term_text = std::mem::take(&mut self.term_text);
         let term_cursor = self.term_cursor;
         self.set_terminal_text(&term_text, term_cursor);
@@ -1736,6 +1767,23 @@ impl Renderer {
         let h = self.surface_config.height as i32;
 
         let mut areas: Vec<TextArea> = Vec::with_capacity(8);
+        if self.sidebar_enabled {
+            // "umber" wordmark in the corner block above the file tabs.
+            areas.push(TextArea {
+                buffer: &self.wordmark_buffer,
+                left: pad * 1.1,
+                top: pad,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: 0,
+                    top: 0,
+                    right: self.sidebar_w() as i32,
+                    bottom: h,
+                },
+                default_color: WORDMARK_COLOR,
+                custom_glyphs: &[],
+            });
+        }
         if self.sidebar_enabled && self.sidebar_tab_count > 0 {
             // Left file-tab list: one open editor tab per row (dynamic labels).
             areas.push(TextArea {
@@ -1991,7 +2039,10 @@ impl Renderer {
         self.quad_bytes.clear();
 
         // Selection: one quad per visible highlighted line, using the same
-        // `col * cell_w` arithmetic as the caret. Clamped to `QUAD_MAX - 7` so
+        // `col * cell_w` arithmetic as the caret. Clamped to `QUAD_MAX - 8` so
+        // the current-line wash (1), scrollbar (2), separator rule + hover
+        // segment (2), and terminal border + cursor (2) always fit.
+        // (Superseded older comment:) so
         // the scrollbar (2), separator rule + hover segment (2), and terminal
         // background + border + cursor (3) always fit the vertex buffer.
         // the scrollbar's two quads plus the gutter separator rule and its
@@ -1999,7 +2050,25 @@ impl Renderer {
         let sel_right_edge = fw - pad;
         let mut sel_verts: u32 = 0;
         if !self.overlay_active {
-            for span in self.selection.iter().take(QUAD_MAX - 7) {
+            // Current-line highlight first (selection draws over it): a faint
+            // full-width wash behind the cursor's line.
+            if let Some((line, _)) = self.cursor {
+                let y = doc_top + line as f32 * line_px;
+                let sb_w = self.sidebar_w();
+                if y + line_px <= doc_bottom {
+                    sel_verts += push_quad(
+                        &mut self.quad_bytes,
+                        fw,
+                        fh,
+                        sb_w,
+                        y,
+                        (fw - sb_w).max(0.0),
+                        line_px,
+                        CURRENT_LINE_COLOR,
+                    );
+                }
+            }
+            for span in self.selection.iter().take(QUAD_MAX - 8) {
                 let y = doc_top + span.line as f32 * line_px;
                 if y >= fh {
                     continue;
@@ -2337,6 +2406,21 @@ impl Renderer {
                 );
             }
         }
+        // Banner background: full-width chrome band above the activity strip.
+        {
+            let sw_edge = self.sidebar_w();
+            let ts_top = self.tabstrip_top();
+            sidebar_verts += push_quad(
+                &mut self.sidebar_bytes,
+                fw,
+                fh,
+                sw_edge,
+                0.0,
+                (fw - sw_edge).max(0.0),
+                ts_top,
+                BANNER_BG_COLOR,
+            );
+        }
         // Seam lines: sidebar|content vertical, and horizontal under the
         // activity strip — subtle 1px region separators.
         {
@@ -2425,9 +2509,9 @@ impl Renderer {
                     ops: Operations {
                         // Umber-dark background (D5 minimalist chrome).
                         load: LoadOp::Clear(wgpu::Color {
-                            r: 0.06,
-                            g: 0.06,
-                            b: 0.07,
+                            r: 0.048,
+                            g: 0.048,
+                            b: 0.058,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
