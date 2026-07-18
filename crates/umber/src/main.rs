@@ -676,13 +676,10 @@ impl App {
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "*scratch*".to_string()),
         };
-        let mut prefix = format!(
-            "\u{2699}  umber \u{2014} {dirty}{name} \u{2014} {} lines, {} bytes \u{2014} Ln {}, Col {}",
-            self.buffer.len_lines(),
-            self.buffer.len_bytes(),
-            cl + 1,
-            col + 1,
-        );
+        // Minimal status: position only — the filename + dirty dot live in
+        // the sidebar tab, the remote host in the tab label.
+        let _ = (dirty, name);
+        let mut prefix = format!("Ln {}, Col {}", cl + 1, col + 1);
         // Append the last module status line, if any (simplest honest surface
         // for module text output \u{2014} the editor status banner).
         if let Some(status) = &self.module_status {
@@ -1190,8 +1187,19 @@ impl App {
         } else {
             self.docs[i].buffer.path()
         };
-        path.and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-            .unwrap_or_else(|| "*scratch*".to_string())
+        if let Some(name) =
+            path.and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        {
+            return name;
+        }
+        // Remote-backed active buffer: show the remote file (marked).
+        if i == self.active_doc {
+            if let Some(rf) = &self.remote_file {
+                let base = rf.rsplit('/').next().unwrap_or(rf);
+                return format!("\u{21c5} {base}");
+            }
+        }
+        "*scratch*".to_string()
     }
 
     /// Index of an already-open tab for `path`, if any.
@@ -1730,6 +1738,12 @@ impl App {
                 let end = (start + cap).min(n);
                 let home = std::env::var("HOME").unwrap_or_default();
                 let mut rows = self.agent_live_rows();
+                if rows.is_empty() && n == 0 {
+                    rows.push((
+                        "No agents yet \u{2014} press n to launch pi here".to_string(),
+                        String::new(),
+                    ));
+                }
                 rows.extend(self.agents_sessions[start..end].iter().map(|s| {
                     let cwd = if !home.is_empty() && s.cwd.starts_with(&home) {
                         format!("~{}", &s.cwd[home.len()..])
@@ -1744,20 +1758,25 @@ impl App {
                         .take(11)
                         .map(|c| if c == 'T' { ' ' } else { c })
                         .collect();
+                    let marker = if s.age_secs < 120 {
+                        "\u{25cf} active"
+                    } else {
+                        "idle"
+                    };
+                    let _ = when;
                     (
                         format!("{}  \u{2014}  {}", s.model, cwd),
                         format!(
-                            "{} tok \u{2022} ctx {} \u{2022} {} msgs \u{2022} {}",
+                            "{marker} \u{2022} {} \u{2022} {} tok \u{2022} {} msgs",
+                            agents::fmt_age(s.age_secs),
                             agents::fmt_tokens(s.tokens_total),
-                            agents::fmt_tokens(s.context_tokens),
                             s.messages,
-                            when
                         ),
                     )
                 }));
                 let attached = self.agent_proc.is_some();
                 Some(OverlaySpec {
-                    title: Some("pi Agents \u{2014} live control + history".to_string()),
+                    title: Some("pi Agents \u{2014} \u{25cf} running \u{00b7} \u{25c9} needs response \u{00b7} recent".to_string()),
                     input: None,
                     rows,
                     left_color: [225, 225, 230],
@@ -2102,11 +2121,11 @@ impl App {
             return Vec::new();
         };
         let state = match proc.state.run_state() {
-            Some(AgentRunState::Starting) => "starting\u{2026}",
-            Some(AgentRunState::Running) => "\u{25cf} running",
-            Some(AgentRunState::AwaitingInstruction) => "awaiting instruction",
-            Some(AgentRunState::Queued) => "queued work",
-            Some(AgentRunState::Exited) => "exited",
+            Some(AgentRunState::Starting) => "\u{25cc} starting\u{2026}",
+            Some(AgentRunState::Running) => "\u{25cf} RUNNING",
+            Some(AgentRunState::AwaitingInstruction) => "\u{25c9} NEEDS RESPONSE \u{2014} press p",
+            Some(AgentRunState::Queued) => "\u{25d0} queued work",
+            Some(AgentRunState::Exited) => "\u{2715} exited",
             None => "?",
         };
         let tool = proc
@@ -3599,18 +3618,6 @@ impl ApplicationHandler<UserEvent> for App {
                         // A press changes the caret/selection context under the
                         // pointer: drop any hover highlight (redraws once).
                         self.clear_hover();
-                        // Settings gear (top-left of the banner): a mouse
-                        // backup for Ctrl+, — keyboard-first with mouse-click
-                        // fallbacks (original requirement 2).
-                        if let Some(r) = self.renderer.as_ref() {
-                            let (gx, gy, gw, gh) = r.gear_bounds();
-                            let px = self.pointer.0 as f32;
-                            let py = self.pointer.1 as f32;
-                            if px >= gx && px < gx + gw && py >= gy && py < gy + gh {
-                                self.open_settings();
-                                return;
-                            }
-                        }
                         // Terminal top border: start a drag-resize (a few px
                         // band around the border, when not maximized).
                         if let Some(r) = self.renderer.as_ref() {

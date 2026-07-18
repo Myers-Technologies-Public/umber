@@ -37,10 +37,6 @@ const PAD: f32 = 8.0;
 const BASE_FONT: f32 = 14.0;
 const BASE_LINE: f32 = 20.0;
 
-/// The stats banner occupies this many line-heights above the document (one
-/// line of text plus a little breathing room).
-const STATS_GAP: f32 = 1.6;
-
 /// Monospace advance as a fraction of the font size. The P0 cursor is placed
 /// arithmetically (column * advance) rather than by reading back cosmic-text's
 /// per-glyph layout; good enough for the spike, refined in P1 when the UI
@@ -590,6 +586,8 @@ pub struct Renderer {
     /// a new latency sample) — idle redraws allocate nothing.
     banner_dirty: bool,
     last_lat_n: u64,
+    /// Char count of the composed status string (for right-alignment).
+    last_status_chars: usize,
 
     /// Keystroke receipt timestamps awaiting the present that includes them.
     pending: Vec<Instant>,
@@ -920,6 +918,7 @@ impl Renderer {
             stats_prefix: String::new(),
             banner_dirty: true,
             last_lat_n: 0,
+            last_status_chars: 0,
             pending: Vec::new(),
             latency: LatencyRing::new(),
             window,
@@ -981,14 +980,6 @@ impl Renderer {
     /// Screen rect `(x, y, w, h)` of the settings gear glyph at the start of
     /// the top banner (D5: keyboard-first, mouse-hover backup). The bin
     /// hit-tests clicks against this to open settings.
-    pub fn gear_bounds(&self) -> (f32, f32, f32, f32) {
-        (
-            self.left_edge(),
-            self.pad_px(),
-            self.cell_w() * 2.5,
-            self.line_px(),
-        )
-    }
 
     /// Width of the left activity bar in physical px (0 when disabled).
     pub fn sidebar_w(&self) -> f32 {
@@ -1119,12 +1110,13 @@ impl Renderer {
 
     /// Y of the document top: below the stats banner.
     pub fn doc_top(&self) -> f32 {
-        self.pad_px() + self.line_px() * STATS_GAP + self.tabstrip_h()
+        self.tabstrip_top() + self.tabstrip_h().max(self.line_px() * 1.3) + self.pad_px() * 0.5
     }
 
-    /// Y of the tab strip (just below the banner).
+    /// Y of the action strip — now the topmost row (the old file-info banner
+    /// is gone; the filename lives in the sidebar tab).
     pub fn tabstrip_top(&self) -> f32 {
-        self.pad_px() + self.line_px() * STATS_GAP
+        self.pad_px() * 0.5
     }
 
     /// Tab strip height (0 when no tabs are set).
@@ -1931,20 +1923,7 @@ impl Renderer {
                 if self.stats_prefix.is_empty() {
                     lat
                 } else {
-                    // Right-align the latency segment across the banner (T3-
-                    // style decluttered bar: identity left, status right).
-                    // Monospace makes this a column count.
-                    let cols = ((self.surface_config.width as f32
-                        - self.left_edge()
-                        - self.pad_px() * 2.0)
-                        / self.cell_w())
-                    .floor() as usize;
-                    let used = self.stats_prefix.chars().count() + lat.chars().count();
-                    if cols > used + 2 {
-                        format!("{}{}{}", self.stats_prefix, " ".repeat(cols - used), lat)
-                    } else {
-                        format!("{}    {}", self.stats_prefix, lat)
-                    }
+                    format!("{}  \u{00b7}  {}", self.stats_prefix, lat)
                 }
             };
             self.stats_buffer.set_text(
@@ -1957,6 +1936,7 @@ impl Renderer {
             self.stats_buffer.set_size(Some(sw), Some(self.line_px()));
             self.stats_buffer
                 .shape_until_scroll(&mut self.font_system, false);
+            self.last_status_chars = stats.chars().count();
             self.last_lat_n = lat_n;
             self.banner_dirty = false;
         }
@@ -2025,22 +2005,26 @@ impl Renderer {
                 custom_glyphs: &[],
             });
         }
-        areas.push(TextArea {
-            buffer: &self.stats_buffer,
-            left,
-            top: pad,
-            scale: 1.0,
-            bounds: TextBounds {
-                left: 0,
-                top: 0,
-                right: w,
-                bottom: h,
-            },
-            default_color: Color::rgb(148, 141, 128),
-            custom_glyphs: &[],
-        });
+        // Status (Ln/Col · latency), right-aligned inside the strip row.
+        if self.last_status_chars > 0 {
+            let sw = self.last_status_chars as f32 * cell_w;
+            areas.push(TextArea {
+                buffer: &self.stats_buffer,
+                left: (w as f32 - pad - sw).max(left),
+                top: self.tabstrip_top() + line_px * 0.25,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: 0,
+                    top: 0,
+                    right: w,
+                    bottom: h,
+                },
+                default_color: Color::rgb(148, 141, 128),
+                custom_glyphs: &[],
+            });
+        }
         if !self.tab_layout.is_empty() {
-            let ts_top = pad + line_px * STATS_GAP;
+            let ts_top = self.tabstrip_top();
             areas.push(TextArea {
                 buffer: &self.tabstrip_buffer,
                 left: left + pad * 0.5,

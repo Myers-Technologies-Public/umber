@@ -38,6 +38,9 @@ pub struct SessionSummary {
     pub tokens_total: u64,
     /// The LAST assistant message's `totalTokens` (~ current context size).
     pub context_tokens: u64,
+    /// Seconds since the session file was last written (activity signal: a
+    /// recently-written JSONL means an agent is (or just was) running it).
+    pub age_secs: u64,
 }
 
 /// `~/.pi/agent/sessions`, or `None` when `$HOME` is unset.
@@ -76,12 +79,18 @@ pub fn discover_sessions(root: &Path, limit: usize) -> Vec<SessionSummary> {
         }
     }
     files.sort_by(|a, b| b.0.cmp(&a.0));
+    let now = std::time::SystemTime::now();
     files
         .into_iter()
         .take(limit)
-        .filter_map(|(_, p)| {
+        .filter_map(|(mtime, p)| {
             let text = std::fs::read_to_string(&p).ok()?;
-            parse_session(&text, &p)
+            let mut s = parse_session(&text, &p)?;
+            s.age_secs = now
+                .duration_since(mtime)
+                .map(|d| d.as_secs())
+                .unwrap_or(u64::MAX);
+            Some(s)
         })
         .collect()
 }
@@ -265,7 +274,23 @@ pub fn parse_session(text: &str, path: &Path) -> Option<SessionSummary> {
         model,
         tokens_total,
         context_tokens,
+        age_secs: u64::MAX,
     })
+}
+
+/// Compact age for dashboard rows: `95` -> `"1m ago"`.
+pub fn fmt_age(secs: u64) -> String {
+    if secs == u64::MAX {
+        "?".to_string()
+    } else if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
 }
 
 /// Compact token count for dashboard rows: `143586` -> `"143.6k"`.
