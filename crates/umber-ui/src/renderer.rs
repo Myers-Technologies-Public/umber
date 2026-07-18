@@ -163,30 +163,50 @@ const GIT_MARK_VERTS: usize = GIT_MARK_MAX * 6;
 pub const GIT_ADDED_COLOR: [f32; 4] = [0.44, 0.73, 0.42, 0.95];
 pub const GIT_MODIFIED_COLOR: [f32; 4] = [0.85, 0.65, 0.30, 0.95];
 pub const GIT_DELETED_COLOR: [f32; 4] = [0.80, 0.35, 0.35, 0.95];
-const QUAD_FLOATS_PER_VERT: usize = 6; // vec2 position + vec4 color
+// vec2 clip pos + vec4 color + vec2 pixel pos + vec2 rect center (px) +
+// vec2 rect half-size (px) + f32 corner radius (px).
+const QUAD_FLOATS_PER_VERT: usize = 13;
 
-/// Minimal solid-quad shader: clip-space position + per-vertex color, alpha
-/// blended over the text pass. glyphon cannot draw rectangles, so the overlay
-/// scrollbar rides this tiny pipeline.
+/// Rounded-rect SDF quad shader: each quad carries its rect + corner radius in
+/// pixel space; the fragment computes a signed distance for smooth rounded
+/// corners with a 1px anti-aliased edge (radius 0 = exact sharp rect).
 const QUAD_SHADER: &str = r#"
 struct VsIn {
     @location(0) pos: vec2<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) p: vec2<f32>,
+    @location(3) center: vec2<f32>,
+    @location(4) half_size: vec2<f32>,
+    @location(5) radius: f32,
 };
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) color: vec4<f32>,
+    @location(1) p: vec2<f32>,
+    @location(2) center: vec2<f32>,
+    @location(3) half_size: vec2<f32>,
+    @location(4) radius: f32,
 };
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
     var out: VsOut;
     out.clip = vec4<f32>(in.pos, 0.0, 1.0);
     out.color = in.color;
+    out.p = in.p;
+    out.center = in.center;
+    out.half_size = in.half_size;
+    out.radius = in.radius;
     return out;
 }
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    return in.color;
+    var a = in.color.a;
+    if (in.radius > 0.0) {
+        let q = abs(in.p - in.center) - (in.half_size - vec2<f32>(in.radius, in.radius));
+        let d = length(max(q, vec2<f32>(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - in.radius;
+        a = a * clamp(0.5 - d, 0.0, 1.0);
+    }
+    return vec4<f32>(in.color.rgb, a);
 }
 "#;
 
@@ -266,23 +286,52 @@ fn push_quad(
     h: f32,
     c: [f32; 4],
 ) -> u32 {
+    push_rquad(out, fw, fh, x, y, w, h, c, 0.0)
+}
+
+/// Rounded-rect quad: `radius` in px (0 = sharp). The rect + radius ride each
+/// vertex so one draw call mixes sharp and rounded shapes freely.
+#[allow(clippy::too_many_arguments)]
+fn push_rquad(
+    out: &mut Vec<u8>,
+    fw: f32,
+    fh: f32,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    c: [f32; 4],
+    radius: f32,
+) -> u32 {
     let x0 = x / fw * 2.0 - 1.0;
     let x1 = (x + w) / fw * 2.0 - 1.0;
     let y0 = 1.0 - y / fh * 2.0;
     let y1 = 1.0 - (y + h) / fh * 2.0;
-    let mut vert = |px: f32, py: f32| {
+    let cx = x + w * 0.5;
+    let cy = y + h * 0.5;
+    let hx = w * 0.5;
+    let hy = h * 0.5;
+    let r = radius.min(hx).min(hy).max(0.0);
+    let mut vert = |px: f32, py: f32, qx: f32, qy: f32| {
         out.extend_from_slice(&px.to_ne_bytes());
         out.extend_from_slice(&py.to_ne_bytes());
         for ch in c {
             out.extend_from_slice(&ch.to_ne_bytes());
         }
+        out.extend_from_slice(&qx.to_ne_bytes());
+        out.extend_from_slice(&qy.to_ne_bytes());
+        out.extend_from_slice(&cx.to_ne_bytes());
+        out.extend_from_slice(&cy.to_ne_bytes());
+        out.extend_from_slice(&hx.to_ne_bytes());
+        out.extend_from_slice(&hy.to_ne_bytes());
+        out.extend_from_slice(&r.to_ne_bytes());
     };
-    vert(x0, y0);
-    vert(x1, y0);
-    vert(x0, y1);
-    vert(x1, y0);
-    vert(x1, y1);
-    vert(x0, y1);
+    vert(x0, y0, x, y);
+    vert(x1, y0, x + w, y);
+    vert(x0, y1, x, y + h);
+    vert(x1, y0, x + w, y);
+    vert(x1, y1, x + w, y + h);
+    vert(x0, y1, x, y + h);
     6
 }
 
@@ -524,6 +573,9 @@ pub struct Renderer {
     tabstrip_buffer: Buffer,
     tabstrip_text: String,
     tab_layout: Vec<(usize, usize)>,
+    /// Pixel-exact label extents `(x0, x1)` read from the shaped glyphs —
+    /// column*advance arithmetic drifts, glyph positions cannot.
+    tab_layout_px: Vec<(f32, f32)>,
     tab_active: usize,
     /// Action under the pointer in the top strip (hover wash).
     tabstrip_hover: Option<usize>,
@@ -728,6 +780,26 @@ impl Renderer {
                             offset: 8,
                             shader_location: 1,
                         },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x2,
+                            offset: 24,
+                            shader_location: 2,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x2,
+                            offset: 32,
+                            shader_location: 3,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x2,
+                            offset: 40,
+                            shader_location: 4,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32,
+                            offset: 48,
+                            shader_location: 5,
+                        },
                     ],
                 })],
             },
@@ -841,6 +913,7 @@ impl Renderer {
             tabstrip_buffer,
             tabstrip_text: String::new(),
             tab_layout: Vec::new(),
+            tab_layout_px: Vec::new(),
             tab_active: 0,
             tabstrip_hover: None,
             doc_text: String::new(),
@@ -1094,6 +1167,26 @@ impl Renderer {
             self.tabstrip_buffer.set_size(Some(w), Some(self.line_px()));
             self.tabstrip_buffer
                 .shape_until_scroll(&mut self.font_system, false);
+            // Pixel-exact extents from the shaped glyphs (labels are ASCII so
+            // glyph byte indices == the char columns in tab_layout).
+            self.tab_layout_px.clear();
+            for &(cs, ce) in &self.tab_layout {
+                let mut x0 = f32::MAX;
+                let mut x1 = f32::MIN;
+                for run in self.tabstrip_buffer.layout_runs() {
+                    for g in run.glyphs.iter() {
+                        if g.start >= cs && g.end <= ce {
+                            x0 = x0.min(g.x);
+                            x1 = x1.max(g.x + g.w);
+                        }
+                    }
+                }
+                if x0 <= x1 {
+                    self.tab_layout_px.push((x0, x1));
+                } else {
+                    self.tab_layout_px.push((0.0, 0.0));
+                }
+            }
         }
     }
 
@@ -1137,13 +1230,11 @@ impl Renderer {
             return None;
         }
         let origin = self.left_edge() + self.pad_px() * 0.5;
-        if x < origin {
-            return None;
-        }
-        let col = ((x - origin) / self.cell_w()) as usize;
-        self.tab_layout
+        let rx = x - origin;
+        let slack = 4.0 * self.scale_factor as f32;
+        self.tab_layout_px
             .iter()
-            .position(|(s, e)| col >= *s && col < *e)
+            .position(|&(s, e)| e > s && rx >= s - slack && rx < e + slack)
     }
 
     fn metrics(&self) -> Metrics {
@@ -1684,6 +1775,8 @@ impl Renderer {
             .next()
             .map(|r| r.line_w / 10.0)
             .unwrap_or(self.font_px() * MONO_ADVANCE_RATIO);
+        // Force the strip to re-shape + re-measure at the new metrics.
+        self.tabstrip_text.clear();
         let term_text = std::mem::take(&mut self.term_text);
         let term_cursor = self.term_cursor;
         self.set_terminal_text(&term_text, term_cursor);
@@ -2247,7 +2340,7 @@ impl Renderer {
                 g.track_h,
                 TRACK_COLOR,
             );
-            bar_verts += push_quad(
+            bar_verts += push_rquad(
                 &mut self.quad_bytes,
                 fw,
                 fh,
@@ -2256,6 +2349,7 @@ impl Renderer {
                 g.track_w,
                 g.thumb_h,
                 THUMB_COLOR,
+                g.track_w * 0.5,
             );
         }
 
@@ -2394,7 +2488,7 @@ impl Renderer {
             // Opaque content panel behind the whole page (title/input, rows,
             // hint) so overlay text never fights the editor text behind it.
             let (panel_x, panel_y, panel_w, panel_h) = self.overlay_panel_bounds();
-            ov_verts += push_quad(
+            ov_verts += push_rquad(
                 &mut self.quad_bytes,
                 fw,
                 fh,
@@ -2403,9 +2497,10 @@ impl Renderer {
                 panel_w,
                 panel_h,
                 OVERLAY_PANEL_COLOR,
+                10.0 * self.scale_factor as f32,
             );
             if self.overlay_has_input {
-                ov_verts += push_quad(
+                ov_verts += push_rquad(
                     &mut self.quad_bytes,
                     fw,
                     fh,
@@ -2414,13 +2509,14 @@ impl Renderer {
                     ov_w + pad * 2.0,
                     line_px * 1.3,
                     OVERLAY_BOX_COLOR,
+                    6.0 * self.scale_factor as f32,
                 );
             }
             if let Some(sel) = self.overlay_selected {
                 if sel < self.overlay_row_count {
                     let hy = ov_rows_top + sel as f32 * line_px;
                     if hy < fh {
-                        ov_verts += push_quad(
+                        ov_verts += push_rquad(
                             &mut self.quad_bytes,
                             fw,
                             fh,
@@ -2429,6 +2525,7 @@ impl Renderer {
                             ov_w + pad,
                             line_px,
                             OVERLAY_HL_COLOR,
+                            5.0 * self.scale_factor as f32,
                         );
                     }
                 }
@@ -2454,15 +2551,17 @@ impl Renderer {
             let active = self.sidebar_active;
             let _ = sw;
             if let Some(hrow) = hover {
-                sidebar_verts += push_quad(
+                let s2 = self.scale_factor as f32;
+                sidebar_verts += push_rquad(
                     &mut self.sidebar_bytes,
                     fw,
                     fh,
-                    0.0,
-                    sb_top + hrow as f32 * pitch,
-                    sw,
-                    pitch,
+                    3.0 * s2,
+                    sb_top + hrow as f32 * pitch + 1.0 * s2,
+                    sw - 8.0 * s2,
+                    pitch - 2.0 * s2,
                     SIDEBAR_HOVER_COLOR,
+                    6.0 * s2,
                 );
             }
             if let Some(arow) = active {
@@ -2492,42 +2591,48 @@ impl Renderer {
                 .get(self.tab_active)
                 .copied()
                 .unwrap_or((0, 0));
-            // Hovered action: a faint wash behind the label.
+            let _ = cw;
+            let s = self.scale_factor as f32;
+            // Hovered action: a rounded pill wash sized from the REAL glyph
+            // extents (pixel-exact; no column arithmetic).
             if let Some(hrow) = self.tabstrip_hover {
-                if let Some(&(hs, he)) = self.tab_layout.get(hrow) {
-                    if he > hs {
-                        let hx = origin + hs as f32 * cw;
-                        let hw = (he - hs) as f32 * cw;
-                        sidebar_verts += push_quad(
+                if let Some(&(hx0, hx1)) = self.tab_layout_px.get(hrow) {
+                    if hx1 > hx0 {
+                        let padx = 7.0 * s;
+                        let pady = 3.0 * s;
+                        let hh = ts_h - pady * 2.0;
+                        sidebar_verts += push_rquad(
                             &mut self.sidebar_bytes,
                             fw,
                             fh,
-                            hx - cw * 0.5,
-                            ts_top,
-                            hw + cw,
-                            ts_h,
+                            origin + hx0 - padx,
+                            ts_top + pady,
+                            (hx1 - hx0) + padx * 2.0,
+                            hh,
                             SIDEBAR_HOVER_COLOR,
+                            hh * 0.5,
                         );
                     }
                 }
             }
-            // Active action: a thin rust underline beneath the label
-            // (minimalist — no tint blocks, no bands).
-            if aend > astart {
-                let ax = origin + astart as f32 * cw;
-                let aw = (aend - astart) as f32 * cw;
-                let uh = (2.0 * self.scale_factor as f32).max(2.0);
-                sidebar_verts += push_quad(
-                    &mut self.sidebar_bytes,
-                    fw,
-                    fh,
-                    ax,
-                    ts_top + ts_h - uh,
-                    aw,
-                    uh,
-                    TABSTRIP_ACTIVE_COLOR,
-                );
+            // Active action: a soft-capped rust underline, glyph-exact.
+            if let Some(&(ax0, ax1)) = self.tab_layout_px.get(self.tab_active) {
+                if ax1 > ax0 {
+                    let uh = (2.0 * s).max(2.0);
+                    sidebar_verts += push_rquad(
+                        &mut self.sidebar_bytes,
+                        fw,
+                        fh,
+                        origin + ax0,
+                        ts_top + ts_h - uh - 2.0 * s,
+                        ax1 - ax0,
+                        uh,
+                        TABSTRIP_ACTIVE_COLOR,
+                        uh * 0.5,
+                    );
+                }
             }
+            let _ = (astart, aend);
         }
         // Draggable sidebar separator line (hot = rust while hovered/dragged).
         {
