@@ -3102,10 +3102,16 @@ impl App {
     /// and tint the action matching the current view. `usize::MAX` = none
     /// (the renderer's active lookup is range-checked).
     fn sync_activity_strip(&mut self) {
-        let labels: Vec<String> = ["Palette", "Find", "Agents", "Terminal", "Settings"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let labels: Vec<String> = [
+            "⌘ Palette",
+            "⌕ Find",
+            "◉ Agents",
+            "▣ Terminal",
+            "⚙ Settings",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         let active = match self.view {
             View::Palette => 0,
             View::Search => 1,

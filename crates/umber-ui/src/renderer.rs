@@ -145,6 +145,7 @@ const SIDEBAR_LABEL_COLOR: Color = Color::rgb(168, 161, 148);
 const TABSTRIP_H_MULT: f32 = 1.3;
 /// Active action underline (Crail rust) — minimalist alternative to a tint.
 const TABSTRIP_ACTIVE_COLOR: [f32; 4] = [0.757, 0.373, 0.235, 0.9];
+const TOP_ACTIVE_PILL_COLOR: [f32; 4] = [0.125, 0.065, 0.038, 0.92];
 const TABSTRIP_TEXT_COLOR: Color = Color::rgb(168, 161, 148);
 
 /// Modal overlay palette (command palette / settings / modules). All
@@ -1177,16 +1178,15 @@ impl Renderer {
         let sep = "    ";
         let mut text = String::new();
         self.tab_layout.clear();
-        let mut col = 0usize;
         for (i, label) in labels.iter().enumerate() {
             if i > 0 {
                 text.push_str(sep);
-                col += sep.chars().count();
             }
-            let start = col;
+            // cosmic-text glyph ranges are UTF-8 byte offsets. Recording byte
+            // ranges keeps symbolic dock labels pixel-exact and clickable.
+            let start = text.len();
             text.push_str(label);
-            col += label.chars().count();
-            self.tab_layout.push((start, col));
+            self.tab_layout.push((start, text.len()));
         }
         if self.tabstrip_text != text {
             self.tabstrip_text.clear();
@@ -1201,8 +1201,8 @@ impl Renderer {
             self.tabstrip_buffer.set_size(Some(w), Some(self.line_px()));
             self.tabstrip_buffer
                 .shape_until_scroll(&mut self.font_system, false);
-            // Pixel-exact extents from the shaped glyphs (labels are ASCII so
-            // glyph byte indices == the char columns in tab_layout).
+            // Pixel-exact extents from shaped glyphs, matched by UTF-8 byte
+            // ranges stored in `tab_layout`.
             self.tab_layout_px.clear();
             for &(cs, ce) in &self.tab_layout {
                 let mut x0 = f32::MAX;
@@ -2867,16 +2867,31 @@ impl Renderer {
                     }
                 }
             }
-            // Active action: a soft-capped rust underline, glyph-exact.
+            // Active destination: a filled capsule plus a tiny rust baseline,
+            // visually stronger than the former underline-only state.
             if let Some(&(ax0, ax1)) = self.tab_layout_px.get(self.tab_active) {
                 if ax1 > ax0 {
+                    let padx = 7.0 * s;
+                    let pady = 3.0 * s;
+                    let ah = ts_h - pady * 2.0;
+                    sidebar_verts += push_rquad(
+                        &mut self.sidebar_bytes,
+                        fw,
+                        fh,
+                        origin + ax0 - padx,
+                        ts_top + pady,
+                        ax1 - ax0 + padx * 2.0,
+                        ah,
+                        TOP_ACTIVE_PILL_COLOR,
+                        ah * 0.5,
+                    );
                     let uh = (2.0 * s).max(2.0);
                     sidebar_verts += push_rquad(
                         &mut self.sidebar_bytes,
                         fw,
                         fh,
                         origin + ax0,
-                        ts_top + ts_h - uh - 2.0 * s,
+                        ts_top + ts_h - uh - 1.0 * s,
                         ax1 - ax0,
                         uh,
                         TABSTRIP_ACTIVE_COLOR,
