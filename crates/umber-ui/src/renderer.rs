@@ -108,19 +108,22 @@ const SIDEBAR_TAB_PITCH: f32 = 1.4;
 const SIDEBAR_W_EXPANDED: f32 = 168.0;
 /// Tab labels shown when expanded (aligned to the glyph rows).
 const SIDEBAR_LABELS: &str = "Palette\nFind\nAgents\nTerminal\nSettings";
-const SIDEBAR_HOVER_COLOR: [f32; 4] = [0.20, 0.20, 0.24, 1.0];
+const SIDEBAR_HOVER_COLOR: [f32; 4] = [0.55, 0.55, 0.62, 0.10];
+/// 1px seam lines separating chrome regions (sidebar | content, banner /
+/// strip / document).
+const SEAM_COLOR: [f32; 4] = [0.28, 0.28, 0.34, 0.75];
 /// Left accent bar marking the active tab (Crail rust).
 const SIDEBAR_ACTIVE_COLOR: [f32; 4] = [0.902, 0.706, 0.471, 0.95];
 /// Faint full-row tint behind the active tab so the whole item reads as
 /// selected (not just the edge bar).
-const SIDEBAR_ACTIVE_BG_COLOR: [f32; 4] = [0.902, 0.706, 0.471, 0.15];
+const SIDEBAR_ACTIVE_BG_COLOR: [f32; 4] = [0.902, 0.706, 0.471, 0.09];
 const SIDEBAR_LABEL_COLOR: Color = Color::rgb(198, 198, 212);
 
 /// Open-document tab strip (below the banner). Height multiple of line, bg,
 /// active-tab tint, and text color.
 const TABSTRIP_H_MULT: f32 = 1.3;
 const TABSTRIP_BG_COLOR: [f32; 4] = [0.10, 0.10, 0.125, 1.0];
-const TABSTRIP_ACTIVE_COLOR: [f32; 4] = [0.18, 0.18, 0.22, 1.0];
+const TABSTRIP_ACTIVE_COLOR: [f32; 4] = [0.902, 0.706, 0.471, 0.14];
 const TABSTRIP_TEXT_COLOR: Color = Color::rgb(205, 205, 218);
 
 /// Modal overlay palette (command palette / settings / modules). All
@@ -705,7 +708,7 @@ impl Renderer {
         });
         let sidebar_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("umber sidebar bg"),
-            size: (48 * QUAD_FLOATS_PER_VERT * 4) as wgpu::BufferAddress,
+            size: (96 * QUAD_FLOATS_PER_VERT * 4) as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -756,7 +759,7 @@ impl Renderer {
             git_bytes: Vec::with_capacity(GIT_MARK_VERTS * QUAD_FLOATS_PER_VERT * 4),
             gutter_marks: Vec::new(),
             sidebar_vbuf,
-            sidebar_bytes: Vec::with_capacity(48 * QUAD_FLOATS_PER_VERT * 4),
+            sidebar_bytes: Vec::with_capacity(96 * QUAD_FLOATS_PER_VERT * 4),
             scrollbar: None,
             selection: Vec::new(),
             hover_word_buffer,
@@ -933,13 +936,20 @@ impl Renderer {
         self.sidebar_w() + self.pad_px()
     }
 
+    /// Y where the sidebar file-tab list begins: below the banner + activity
+    /// strip line, aligned with the document top (keeps the window corner
+    /// clean instead of crowding a tab against it).
+    fn sidebar_top(&self) -> f32 {
+        self.doc_top() + self.line_px() * 0.2
+    }
+
     /// Sidebar tab index at physical `(x, y)`, or `None`. Tabs stack from the
     /// top at `SIDEBAR_TAB_PITCH` line-heights, matching the shaped column.
     pub fn sidebar_tab_at(&self, x: f32, y: f32) -> Option<usize> {
         if !self.sidebar_enabled || x < 0.0 || x > self.sidebar_w() {
             return None;
         }
-        let top = self.pad_px() + self.line_px() * 0.3;
+        let top = self.sidebar_top();
         if y < top {
             return None;
         }
@@ -1730,8 +1740,8 @@ impl Renderer {
             // Left file-tab list: one open editor tab per row (dynamic labels).
             areas.push(TextArea {
                 buffer: &self.sidebar_labels_buffer,
-                left: pad * 0.6,
-                top: pad + line_px * 0.3,
+                left: pad * 1.1,
+                top: self.sidebar_top(),
                 scale: 1.0,
                 bounds: TextBounds {
                     left: 0,
@@ -2238,7 +2248,7 @@ impl Renderer {
         self.sidebar_bytes.clear();
         if self.sidebar_enabled {
             let sw = self.sidebar_w();
-            let sb_top = self.pad_px() + self.line_px() * 0.3;
+            let sb_top = self.sidebar_top();
             let pitch = self.line_px() * SIDEBAR_TAB_PITCH;
             let s = self.scale_factor as f32;
             let hover = self.sidebar_hover;
@@ -2326,6 +2336,35 @@ impl Renderer {
                     TABSTRIP_ACTIVE_COLOR,
                 );
             }
+        }
+        // Seam lines: sidebar|content vertical, and horizontal under the
+        // activity strip — subtle 1px region separators.
+        {
+            let s = (1.0 * self.scale_factor as f32).max(1.0);
+            let sw_edge = self.sidebar_w();
+            if sw_edge > 0.0 {
+                sidebar_verts += push_quad(
+                    &mut self.sidebar_bytes,
+                    fw,
+                    fh,
+                    sw_edge - s,
+                    0.0,
+                    s,
+                    fh,
+                    SEAM_COLOR,
+                );
+            }
+            let seam_y = self.doc_top() - s;
+            sidebar_verts += push_quad(
+                &mut self.sidebar_bytes,
+                fw,
+                fh,
+                sw_edge,
+                seam_y,
+                (fw - sw_edge).max(0.0),
+                s,
+                SEAM_COLOR,
+            );
         }
         // Terminal panel background — BEHIND the text pass so the grid
         // glyphs render on top of it.
