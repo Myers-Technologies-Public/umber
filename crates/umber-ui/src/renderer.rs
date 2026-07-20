@@ -3167,10 +3167,17 @@ impl Renderer {
                     });
                 }
                 if self.overlay_has_input {
+                    // Sit the input BELOW the (1.4x) title when both are present
+                    // instead of drawing it on top of the title (unreadable).
+                    let input_top = if self.overlay_has_title {
+                        ov_top + line_px * 1.4
+                    } else {
+                        ov_top
+                    };
                     ov_areas.push(TextArea {
                         buffer: &self.overlay_input,
                         left: ov_left,
-                        top: ov_top,
+                        top: input_top,
                         scale: 1.0,
                         bounds: full,
                         default_color: ovf(OVERLAY_INPUT_COLOR),
