@@ -23,6 +23,7 @@ use umber::panes::{PaneContent, PaneTree, SplitDir};
 use umber::remote::RemoteWorkspace;
 use umber::search::{self, Match};
 use umber::terminal::{TermNotifier, TerminalSession};
+use std::collections::HashMap;
 use umber_host::{HostCommand, Manifest, ModuleHost};
 use umber_kernel::{Command, CommandRegistry, Config, FeatureRegistry};
 use umber_text::TextBuffer;
@@ -112,6 +113,8 @@ enum View {
     RemotePath,
     /// P5: project-wide text search.
     Search,
+    /// QoL: rename the focused pane (sets its island-badge label).
+    PaneRename,
 }
 
 /// What the pointer is hovering over in the document body, for hover
@@ -475,6 +478,9 @@ fn main() -> ExitCode {
         remote: None,
         remote_file: None,
         remote_host_input: String::new(),
+        rename_input: String::new(),
+        rename_target: None,
+        pane_names: HashMap::new(),
         remote_path_input: String::new(),
         git_status: std::collections::HashMap::new(),
         search_input: String::new(),
@@ -701,6 +707,12 @@ struct App {
     remote_file: Option<String>,
     /// In-progress host / path entry for the remote-open flow.
     remote_host_input: String,
+    /// Pane rename overlay: the in-progress typed name.
+    rename_input: String,
+    /// Pane targeted by the rename overlay.
+    rename_target: Option<u64>,
+    /// User-assigned pane names by stable pane id (island badges).
+    pane_names: HashMap<u64, String>,
     remote_path_input: String,
 
     // --- P5: git gutter status (line -> change) ---
@@ -1647,8 +1659,9 @@ impl App {
                 self.split_pane(dir, before);
             }
             (Some(ContextTarget::Pane(pid, _)), 4) => self.pane_paste(pid),
-            (Some(ContextTarget::Pane(pid, _)), 5) => self.pane_popout(pid, event_loop),
-            (Some(ContextTarget::Pane(pid, true)), 6) => self.close_pane(pid),
+            (Some(ContextTarget::Pane(pid, _)), 5) => self.open_pane_rename(pid),
+            (Some(ContextTarget::Pane(pid, _)), 6) => self.pane_popout(pid, event_loop),
+            (Some(ContextTarget::Pane(pid, true)), 7) => self.close_pane(pid),
             (Some(ContextTarget::TerminalView), row @ 0..=3) => {
                 let (dir, before) = match row {
                     0 => (SplitDir::Horizontal, true),
@@ -1725,6 +1738,54 @@ impl App {
 
     /// Handle the remote-host entry prompt: Enter connects, then asks for a
     /// path. Typed text or a selected ssh_config host both work.
+    /// Open the pane-rename overlay for `pane_id`, prefilled with its current
+    /// name (if any).
+    fn open_pane_rename(&mut self, pane_id: u64) {
+        self.dismiss_context_menu();
+        self.rename_target = Some(pane_id);
+        self.rename_input = self.pane_names.get(&pane_id).cloned().unwrap_or_default();
+        self.view = View::PaneRename;
+        self.refresh_overlay();
+    }
+
+    /// Handle the pane-rename prompt: Enter stores the name (empty clears it),
+    /// Esc cancels. Names may contain spaces.
+    fn rename_key(&mut self, event: KeyEvent) {
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => self.close_overlay(),
+            Key::Named(NamedKey::Enter) => {
+                if let Some(id) = self.rename_target.take() {
+                    let name = self.rename_input.trim().to_string();
+                    if name.is_empty() {
+                        self.pane_names.remove(&id);
+                    } else {
+                        self.pane_names.insert(id, name);
+                    }
+                    self.sync_panes();
+                }
+                self.close_overlay();
+            }
+            Key::Named(NamedKey::Backspace) => {
+                self.rename_input.pop();
+                self.refresh_overlay();
+            }
+            _ => {
+                if let Some(t) = &event.text {
+                    let mut changed = false;
+                    for ch in t.chars() {
+                        if !ch.is_control() {
+                            self.rename_input.push(ch);
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        self.refresh_overlay();
+                    }
+                }
+            }
+        }
+    }
+
     fn remote_host_key(&mut self, event: KeyEvent) {
         match &event.logical_key {
             Key::Named(NamedKey::Escape) => self.close_overlay(),
@@ -2184,6 +2245,18 @@ impl App {
                 split_frac: 0.62,
                 selected: None,
                 hint: Some("Enter send (steer if running) \u{2022} Esc back".to_string()),
+            }),
+            View::PaneRename => Some(OverlaySpec {
+                title: Some("Rename pane".to_string()),
+                input: Some(format!("name> {}", self.rename_input)),
+                rows: Vec::new(),
+                left_color: [225, 225, 230],
+                right_color: [135, 135, 150],
+                split_frac: 0.62,
+                selected: None,
+                hint: Some(
+                    "type a name \u{2022} Enter save (empty clears) \u{2022} Esc cancel".to_string(),
+                ),
             }),
             View::RemoteHost => {
                 let rows = self
@@ -3765,11 +3838,12 @@ impl App {
                         "Split Up",
                         "Split Down",
                         "Paste",
+                        "Rename Pane",
                         "Pop Out",
                         "Close Pane",
                     ],
                 );
-                r.set_context_separators(&[3, 5]);
+                r.set_context_separators(&[3, 6]);
             } else {
                 r.set_context_menu(
                     x,
@@ -3780,6 +3854,7 @@ impl App {
                         "Split Up",
                         "Split Down",
                         "Paste",
+                        "Rename Pane",
                         "Pop Out",
                     ],
                 );
@@ -5712,6 +5787,10 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     View::AgentThread => {
                         self.agent_thread_key(event);
+                        return;
+                    }
+                    View::PaneRename => {
+                        self.rename_key(event);
                         return;
                     }
                     View::RemoteHost => {
