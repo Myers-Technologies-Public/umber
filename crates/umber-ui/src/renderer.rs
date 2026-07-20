@@ -311,9 +311,13 @@ struct TermPaneView {
     buffer: Buffer,
     cursor: Option<(usize, usize)>,
     focused: bool,
+    /// Lines the viewport is scrolled up from the bottom (0 = at prompt).
+    display_offset: usize,
     /// Active drag-selection in cell coords: `(anchor (row,col), head (row,col))`,
-    /// head inclusive. `None` = no highlight. Survives content updates because
-    /// the struct is reused by id in `set_term_pane_content`.
+    /// head inclusive; rows are GRID rows (viewport_row + display_offset at
+    /// drag time), so the highlight follows the text as the pane scrolls.
+    /// `None` = no highlight. Survives content updates because the struct is
+    /// reused by id in `set_term_pane_content`.
     sel: Option<((usize, usize), (usize, usize))>,
     /// Focus-ring cross-fade progress (0=unfocused, 1=focused).
     focus_anim: f32,
@@ -2147,6 +2151,7 @@ impl Renderer {
                     buffer,
                     cursor: None,
                     focused,
+                    display_offset: 0,
                     sel: None,
                     focus_anim: if focused { 1.0 } else { 0.0 },
                 });
@@ -2257,7 +2262,10 @@ impl Renderer {
                 let cols = ((pw - ppad * 2.0) / cw).floor().max(1.0) as usize;
                 let rows = (((py + ph - ppad - ct) / lh).floor().max(1.0)) as usize;
                 let col = (((x - px - ppad) / cw).floor().max(0.0) as usize).min(cols - 1);
-                let row = (((y - ct) / lh).floor().max(0.0) as usize).min(rows - 1);
+                // Lift viewport row to a GRID row so the selection survives
+                // scroll (stored cell coords are grid-relative, see TermPaneView::sel).
+                let viewport_row = (((y - ct) / lh).floor().max(0.0) as usize).min(rows - 1);
+                let row = viewport_row + p.display_offset;
                 return Some((p.id, row, col));
             }
         }
@@ -2309,11 +2317,13 @@ impl Renderer {
         text: &str,
         cursor: Option<(usize, usize)>,
         spans: &[TerminalTextSpan],
+        display_offset: usize,
     ) {
         let Some(i) = self.term_panes.iter().position(|p| p.id == id) else {
             return;
         };
         self.term_panes[i].cursor = cursor;
+        self.term_panes[i].display_offset = display_offset;
         let default_attrs = Attrs::new().family(Family::Monospace);
         if spans.is_empty() {
             self.term_panes[i]
@@ -3818,11 +3828,18 @@ impl Renderer {
                 if let Some((a, b)) = p.sel {
                     let (start, end) = if (a.0, a.1) <= (b.0, b.1) { (a, b) } else { (b, a) };
                     let cols = ((pw - ppad * 2.0) / pcell_w).floor().max(1.0) as usize;
-                    for row in start.0..=end.0 {
-                        let c0 = if row == start.0 { start.1 } else { 0 };
-                        let c1 = if row == end.0 { end.1 } else { cols.saturating_sub(1) };
+                    let rows_visible = ((ph - ppad * 2.0) / pline_px).floor().max(1.0) as usize;
+                    for grid_row in start.0..=end.0 {
+                        // Map grid row -> current viewport row using the stored
+                        // display_offset; skip rows scrolled out of view.
+                        let view_row = grid_row.saturating_sub(p.display_offset);
+                        if view_row >= rows_visible {
+                            continue;
+                        }
+                        let c0 = if grid_row == start.0 { start.1 } else { 0 };
+                        let c1 = if grid_row == end.0 { end.1 } else { cols.saturating_sub(1) };
                         let x0 = px + ppad + c0 as f32 * pcell_w;
-                        let y0 = ct + row as f32 * pline_px;
+                        let y0 = ct + view_row as f32 * pline_px;
                         let max_w = (px + pw - border - x0).max(0.0);
                         let w = (((c1 + 1).saturating_sub(c0)) as f32 * pcell_w).min(max_w);
                         if w > 0.0 && y0 + pline_px <= py + ph - border {

@@ -126,6 +126,8 @@ pub struct TerminalSnapshot {
     pub text: String,
     pub cursor: Option<(usize, usize)>,
     pub spans: Vec<TerminalSpan>,
+    /// Lines the viewport is scrolled up from the bottom (0 = at the prompt).
+    pub display_offset: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -447,6 +449,7 @@ impl<N: TermNotifier> TerminalSession<N> {
             text,
             cursor,
             spans,
+            display_offset: content.display_offset,
         }
     }
 

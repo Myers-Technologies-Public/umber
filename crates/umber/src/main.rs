@@ -4750,7 +4750,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 italic: span.italic,
                             })
                             .collect();
-                        pane_updates.push((*tid, snapshot.text, snapshot.cursor, spans));
+                        pane_updates.push((*tid, snapshot.text, snapshot.cursor, spans, snapshot.display_offset));
                     }
                 }
                 if !pane_updates.is_empty() {
@@ -4778,8 +4778,8 @@ impl ApplicationHandler<UserEvent> for App {
                         })
                         .collect();
                     if let Some(renderer) = self.renderer.as_mut() {
-                        for (tid, text, cursor, spans) in &pane_updates {
-                            renderer.set_term_pane_content(*tid, text, *cursor, spans);
+                        for (tid, text, cursor, spans, off) in &pane_updates {
+                            renderer.set_term_pane_content(*tid, text, *cursor, spans, *off);
                             if let Some((_, ov)) = overlays.iter().find(|(t, _)| t == tid) {
                                 renderer.set_term_overlay(ov.clone());
                             }
@@ -5074,15 +5074,6 @@ impl ApplicationHandler<UserEvent> for App {
                         if let Some(s) = self.pane_session(tid) {
                             s.scroll(lines);
                         }
-                        // A scroll invalidates any drag-selection: the
-                        // selection is captured in viewport-relative rows, so
-                        // re-render would otherwise leave it pinned at the
-                        // old screen y. Drop it (matches every real terminal).
-                        self.term_sel = None;
-                        self.term_selecting = false;
-                        if let Some(r) = self.renderer.as_mut() {
-                            r.clear_term_selections();
-                        }
                         // Re-push the scrolled content so the term pane
                         // reshapes at its new viewport. The drag-selection is
                         // stored in CELL coords (row,col) on TermPaneView, so
@@ -5104,7 +5095,13 @@ impl ApplicationHandler<UserEvent> for App {
                                 })
                                 .collect();
                             if let Some(r) = self.renderer.as_mut() {
-                                r.set_term_pane_content(tid, &snap.text, snap.cursor, &spans);
+                                r.set_term_pane_content(
+                                    tid,
+                                    &snap.text,
+                                    snap.cursor,
+                                    &spans,
+                                    snap.display_offset,
+                                );
                             }
                         }
                         // While scrolled up, pin the live bottom rows (the
