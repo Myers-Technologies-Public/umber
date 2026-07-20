@@ -30,6 +30,7 @@ umber-syntax = { path = "crates/umber-syntax" }
 umber-kernel = { path = "crates/umber-kernel" }
 umber-host = { path = "crates/umber-host" }
 umber-proto = { path = "crates/umber-proto" }
+umber-update = { path = "crates/umber-update" }
 
 # P0 render-spike stack. Versions resolved against crates.io on 2026-07-16;
 # glyphon 0.12 is the cosmic-text -> wgpu bridge and pins the compatible

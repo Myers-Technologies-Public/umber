@@ -64,13 +64,17 @@ pub fn asset_names() -> (&'static str, &'static str) {
 
 fn http_get_string(url: &str) -> Res<String> {
     Ok(ureq::get(url)
+        .timeout(std::time::Duration::from_secs(5))
         .set("User-Agent", "umber-update")
         .call()?
         .into_string()?)
 }
 
 fn http_get_bytes(url: &str) -> Res<Vec<u8>> {
-    let resp = ureq::get(url).set("User-Agent", "umber-update").call()?;
+    let resp = ureq::get(url)
+        .timeout(std::time::Duration::from_secs(30))
+        .set("User-Agent", "umber-update")
+        .call()?;
     let mut buf = Vec::new();
     resp.into_reader().read_to_end(&mut buf)?;
     Ok(buf)

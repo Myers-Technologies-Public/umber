@@ -169,6 +169,8 @@ pub struct Config {
     pub latency_hud: bool,
     /// Enable the embedded terminal panel (P3).
     pub terminal: bool,
+    /// Check GitHub for a newer signed release on launch and self-update.
+    pub auto_update: bool,
 }
 
 impl Default for Config {
@@ -181,6 +183,7 @@ impl Default for Config {
             scrollbar: true,
             latency_hud: true,
             terminal: true,
+            auto_update: true,
         }
     }
 }
@@ -283,6 +286,11 @@ impl Config {
                         self.terminal = v;
                     }
                 }
+                "auto_update" => {
+                    if let Some(v) = parse_bool(value) {
+                        self.auto_update = v;
+                    }
+                }
                 _ => {}
             }
         }
@@ -299,7 +307,8 @@ impl Config {
              gutter = {}\n\
              scrollbar = {}\n\
              latency_hud = {}\n\
-             terminal = {}\n",
+             terminal = {}\n\
+             auto_update = {}\n",
             self.font_size,
             self.line_height,
             self.scrollbar_linger_ms,
@@ -307,6 +316,7 @@ impl Config {
             self.scrollbar,
             self.latency_hud,
             self.terminal,
+            self.auto_update,
         )
     }
 
@@ -403,6 +413,14 @@ impl FeatureRegistry {
                     removable: true,
                 },
                 Feature {
+                    id: "updater",
+                    name: "Auto-update",
+                    description: "Check GitHub for a newer signed release on launch",
+                    default_on: true,
+                    enabled: cfg.auto_update,
+                    removable: true,
+                },
+                Feature {
                     id: "command-palette",
                     name: "Command palette",
                     description: "Ctrl+Shift+P fuzzy command launcher",
@@ -458,6 +476,7 @@ impl FeatureRegistry {
         cfg.scrollbar = self.is_enabled("scrollbar");
         cfg.latency_hud = self.is_enabled("latency-hud");
         cfg.terminal = self.is_enabled("terminal");
+        cfg.auto_update = self.is_enabled("updater");
     }
 }
 

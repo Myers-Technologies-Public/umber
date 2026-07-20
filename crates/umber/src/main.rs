@@ -340,7 +340,41 @@ fn onoff(v: bool) -> String {
     }
 }
 
+/// Optional self-update before the window opens. Gated by the `updater` module
+/// (config `auto_update`) and skippable with `--no-update`. Fail-closed and
+/// non-fatal: any error just launches on the current binary. On a successful
+/// swap it re-execs so the user immediately runs the new build.
+fn maybe_self_update() {
+    if std::env::args().any(|a| a == "--no-update") {
+        return;
+    }
+    if !Config::load().auto_update {
+        return;
+    }
+    match umber_update::check_and_apply(env!("CARGO_PKG_VERSION")) {
+        Ok(umber_update::Outcome::Updated { version }) => {
+            eprintln!("umber: updated to {version}; restarting");
+            if let Ok(exe) = std::env::current_exe() {
+                let args: Vec<String> = std::env::args().skip(1).collect();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::CommandExt;
+                    let _ = std::process::Command::new(exe).args(&args).exec();
+                }
+                #[cfg(windows)]
+                {
+                    let _ = std::process::Command::new(exe).args(&args).spawn();
+                    std::process::exit(0);
+                }
+            }
+        }
+        Ok(umber_update::Outcome::UpToDate) => {}
+        Err(e) => eprintln!("umber: update check skipped ({e})"),
+    }
+}
+
 fn main() -> ExitCode {
+    maybe_self_update();
     // Cold-start clock starts at the earliest point in the process (docs/PLAN.md
     // P0 exit: cold start <= 300 ms).
     let start = Instant::now();
