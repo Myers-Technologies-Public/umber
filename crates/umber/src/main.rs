@@ -1510,6 +1510,18 @@ impl App {
     }
 
     /// Close the active tab (always keeps at least one open).
+    /// If the only open doc is an empty untitled scratch (no path + no text),
+    /// drop it back to a fresh husk. Called after opening a terminal so a
+    /// no-op 'new tab' doesn't linger on screen once the shell owns it.
+    fn close_scratch_tab(&mut self) {
+        if self.docs.len() == 1
+            && self.buffer.path().is_none()
+            && self.buffer.len_chars() == 0
+        {
+            self.close_active_tab();
+        }
+    }
+
     fn close_active_tab(&mut self) {
         if self.docs.len() <= 1 {
             // Last tab: closing clears back to a fresh untitled scratch so the
@@ -3472,7 +3484,10 @@ impl App {
                     ch,
                     shell,
                 ) {
-                    Ok(session) => self.terminal = Some(session),
+                    Ok(session) => {
+                        self.terminal = Some(session);
+                        self.close_scratch_tab();
+                    },
                     Err(err) => {
                         eprintln!("umber: terminal spawn failed: {err}");
                         if let Some(r) = self.renderer.as_mut() {
