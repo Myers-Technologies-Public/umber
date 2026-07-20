@@ -2249,10 +2249,14 @@ impl App {
             View::PaneRename => Some(OverlaySpec {
                 title: Some("Rename pane".to_string()),
                 input: Some(format!("name> {}", self.rename_input)),
-                rows: Vec::new(),
-                left_color: [225, 225, 230],
-                right_color: [135, 135, 150],
-                split_frac: 0.62,
+                rows: vec![
+                    ("Enter".to_string(), "save".to_string()),
+                    ("(empty) + Enter".to_string(), "clear name".to_string()),
+                    ("Esc".to_string(), "cancel".to_string()),
+                ],
+                left_color: [236, 233, 227],
+                right_color: [150, 150, 162],
+                split_frac: 0.42,
                 selected: None,
                 hint: Some(
                     "type a name \u{2022} Enter save (empty clears) \u{2022} Esc cancel".to_string(),
