@@ -480,6 +480,7 @@ fn main() -> ExitCode {
         remote_host_input: String::new(),
         rename_input: String::new(),
         rename_target: None,
+        rename_in_popout: None,
         pane_names: HashMap::new(),
         remote_path_input: String::new(),
         git_status: std::collections::HashMap::new(),
@@ -598,6 +599,8 @@ struct Popout {
     pane_tree: PaneTree,
     pane_terms: Vec<(u64, TerminalSession<UmberNotifier>)>,
     next_pane_term: u64,
+    /// Per-tile names inside this popout (the displayed badge label).
+    pane_names: HashMap<u64, String>,
     /// Last pointer position in this window (physical px), for chrome hits.
     pointer: (f64, f64),
 }
@@ -721,6 +724,9 @@ struct App {
     remote_host_input: String,
     /// Pane rename overlay: the in-progress typed name.
     rename_input: String,
+    /// Popout-side rename target popout idx, if rename_target is on a popout
+    /// tile rather than a main-app pane.
+    rename_in_popout: Option<usize>,
     /// Pane targeted by the rename overlay.
     rename_target: Option<u64>,
     /// User-assigned pane names by stable pane id (island badges).
@@ -1782,6 +1788,16 @@ impl App {
         self.refresh_overlay();
     }
 
+    /// Open the pane-rename overlay for a tile inside popout `pidx`.
+    fn open_popout_rename(&mut self, pidx: usize, tile_id: u64) {
+        self.dismiss_context_menu();
+        self.rename_in_popout = Some(pidx);
+        self.rename_target = Some(tile_id);
+        self.rename_input = self.popouts.get(pidx).and_then(|p| p.pane_names.get(&tile_id)).cloned().unwrap_or_default();
+        self.view = View::PaneRename;
+        self.refresh_overlay();
+    }
+
     /// Handle the pane-rename prompt: Enter stores the name (empty clears it),
     /// Esc cancels. Names may contain spaces.
     fn rename_key(&mut self, event: KeyEvent) {
@@ -1790,12 +1806,20 @@ impl App {
             Key::Named(NamedKey::Enter) => {
                 if let Some(id) = self.rename_target.take() {
                     let name = self.rename_input.trim().to_string();
-                    if name.is_empty() {
-                        self.pane_names.remove(&id);
+                    // Route to the popout's pane_names map when renaming
+                    // a popout tile; else the main App's pane_names.
+                    let did_popout_idx = self.rename_in_popout.take();
+                    if let Some(pidx) = did_popout_idx {
+                        if let Some(p) = self.popouts.get_mut(pidx) {
+                            if name.is_empty() { p.pane_names.remove(&id); }
+                            else { p.pane_names.insert(id, name); }
+                        }
+                        self.popout_sync_panes(pidx);
                     } else {
-                        self.pane_names.insert(id, name);
+                        if name.is_empty() { self.pane_names.remove(&id); }
+                        else { self.pane_names.insert(id, name); }
+                        self.sync_panes();
                     }
-                    self.sync_panes();
                 }
                 self.close_overlay();
             }
@@ -3789,6 +3813,7 @@ impl App {
             pane_tree,
             pane_terms,
             next_pane_term: 1,
+            pane_names: HashMap::new(),
             pointer: (0.0, 0.0),
         });
         self.popout_sync_panes(idx_new);
@@ -5099,10 +5124,12 @@ impl ApplicationHandler<UserEvent> for App {
                                 "Split Down",
                                 "Copy",
                                 "Paste",
+                                "Rename Pane",
+                                "Pop Out",
                                 "Close Pane",
                             ],
                         );
-                        self.popouts[idx].win.set_context_separators(&[3, 5]);
+                        self.popouts[idx].win.set_context_separators(&[3, 7]);
                         return;
                     }
                     // Left-click: if the menu is open, either activate a row
@@ -5179,6 +5206,45 @@ impl ApplicationHandler<UserEvent> for App {
                                                     let bytes = text.into_bytes();
                                                     if let Some(s) = self.popout_session_mut(idx, tid) { s.write(bytes); }
                                                 }
+                                            }
+                                        }
+                                    }
+                                    // Rename Pane: open the rename overlay for
+                                    // the focused tile in this popout.
+                                    6 => {
+                                        let focused_leaf = self.popouts.get(idx).map(|p| p.pane_tree.focused).unwrap_or(0);
+                                        self.open_popout_rename(idx, focused_leaf);
+                                    }
+                                    // Pop Out: spawn a sibling pop-out window
+                                    // with a fresh shell (a pop-out can't move
+                                    // into a separate pop-out cleanly yet, so
+                                    // this opens a brand-new one).
+                                    7 => {
+                                        if let Some(mut win) = self.create_popout_window(event_loop) {
+                                            let (cols, rows) = win.grid();
+                                            let (cw, ch) = win.cell_px();
+                                            if let Ok(sess) = TerminalSession::spawn_with_shell(
+                                                UmberNotifier(self.event_proxy.clone()),
+                                                cols, rows, cw, ch, None,
+                                            ) {
+                                                let snap = sess.styled_content();
+                                                let spans: Vec<TerminalTextSpan> = snap.spans.iter().map(|sp| TerminalTextSpan { start: sp.start, end: sp.end, rgb: sp.rgb, bold: sp.bold, italic: sp.italic }).collect();
+                                                let mut pane_tree = PaneTree::new();
+                                                pane_tree.set_content(0, PaneContent::Terminal(0));
+                                                pane_tree.focused = 0;
+                                                win.set_term_panes(&[(0, [0.0, 0.0, 1.0, 1.0], true)], &[]);
+                                                win.set_term_pane_content(0, &snap.text, snap.cursor, &spans, snap.display_offset);
+                                                win.request_redraw();
+                                                let pidx_new = self.popouts.len();
+                                                self.popouts.push(Popout {
+                                                    win,
+                                                    pane_tree,
+                                                    pane_terms: vec![(0, sess)],
+                                                    next_pane_term: 1,
+                                                    pane_names: HashMap::new(),
+                                                    pointer: (0.0, 0.0),
+                                                });
+                                                self.popout_sync_panes(pidx_new);
                                             }
                                         }
                                     }
