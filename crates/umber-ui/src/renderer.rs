@@ -2908,24 +2908,6 @@ impl Renderer {
         let h = self.surface_config.height as i32;
 
         let mut areas: Vec<TextArea> = Vec::with_capacity(8);
-        // Pane name badges: a label at each named pane's inner top-left.
-        for (buffer, rect, _) in &self.pane_badges {
-            let (bx, by, _, _) = self.pane_card_px(*rect);
-            areas.push(TextArea {
-                buffer,
-                left: bx + pad * 1.6,
-                top: by + pad * 0.8,
-                scale: 1.0,
-                bounds: TextBounds {
-                    left: 0,
-                    top: 0,
-                    right: w,
-                    bottom: h,
-                },
-                default_color: OVERLAY_INPUT_COLOR,
-                custom_glyphs: &[],
-            });
-        }
         if self.sidebar_enabled {
             // "umber" wordmark in the corner block above the file tabs.
             areas.push(TextArea {
@@ -3174,8 +3156,29 @@ impl Renderer {
         // a pass after the dim quad (glyphon renders a renderer's areas in one
         // pass). Areas borrow the overlay buffers; geometry is snapshotted from
         // the immutable accessors first.
-        if self.overlay_active || self.context_active {
+        if self.overlay_active || self.context_active || !self.pane_badges.is_empty() {
             let mut ov_areas: Vec<TextArea> = Vec::with_capacity(6);
+            // Pane name badges ride the late pass so the label composites OVER
+            // its post-text pill, sitting below the pane's top bar.
+            for (buffer, rect, _) in &self.pane_badges {
+                let (bx, by, _, _) = self.pane_card_px(*rect);
+                let lp = self.line_px();
+                let pd = self.pad_px();
+                ov_areas.push(TextArea {
+                    buffer,
+                    left: bx + pd * 1.5,
+                    top: by + lp * 1.7,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left: 0,
+                        top: 0,
+                        right: w,
+                        bottom: h,
+                    },
+                    default_color: OVERLAY_INPUT_COLOR,
+                    custom_glyphs: &[],
+                });
+            }
             if self.overlay_active {
                 let ov_alpha = self.overlay_anim;
                 let ovf = |c: Color| {
@@ -4148,7 +4151,7 @@ impl Renderer {
                 fw,
                 fh,
                 bx + bpad * 0.9,
-                by + bpad * 0.45,
+                by + lh * 1.6,
                 text_w + bpad * 2.4,
                 lh * 1.2,
                 CONTEXT_MENU_COLOR,
@@ -4300,7 +4303,7 @@ impl Renderer {
                 pass.set_vertex_buffer(0, self.sidebar_vbuf.slice(..));
                 pass.draw(ctx_quad_start..sidebar_verts, 0..1);
             }
-            if self.overlay_active || self.context_active {
+            if self.overlay_active || self.context_active || !self.pane_badges.is_empty() {
                 self.overlay_text_renderer
                     .render(&self.atlas, &self.viewport, &mut pass)
                     .expect("render overlay text");
