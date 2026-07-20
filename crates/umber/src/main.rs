@@ -5198,7 +5198,7 @@ impl ApplicationHandler<UserEvent> for App {
                         let (px, py) = (px as f32, py as f32);
                         match state {
                             ElementState::Pressed => {
-                                self.popouts[idx].win.clear_selection();
+                                self.popouts[idx].win.clear_term_pane_selections();
                                 if let Some(dir) = self.popouts[idx].win.resize_dir_at(px, py) {
                                     self.popouts[idx].win.start_resize(dir);
                                 } else if let Some(b) =
@@ -5215,7 +5215,18 @@ impl ApplicationHandler<UserEvent> for App {
                                 } else if self.popouts[idx].win.in_titlebar(px, py) {
                                     self.popouts[idx].win.drag();
                                 } else {
-                                    // Anywhere else on the grid: start selecting.
+                                    // Click on a tile: move focus so keyboard writes
+                                    // route to that tile, then begin selecting.
+                                    let (ix, iy, iw, ih) = self.popouts[idx].win.term_island_px();
+                                    let fx = ((px - ix) / iw.max(1.0)).clamp(0.0, 1.0);
+                                    let fy = ((py - iy) / ih.max(1.0)).clamp(0.0, 1.0);
+                                    self.popouts[idx].pane_tree.focus_at(fx, fy);
+                                    let tid_in = match self.popouts[idx].pane_tree.focused_content() {
+                                        PaneContent::Terminal(tid) => Some(tid),
+                                        _ => None,
+                                    };
+                                    self.popouts[idx].win.set_focused_tile(tid_in);
+                                    self.popout_sync_panes(idx);
                                     self.popouts[idx].win.begin_selection(px, py);
                                 }
                             }

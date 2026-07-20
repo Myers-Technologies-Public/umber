@@ -862,6 +862,27 @@ impl PopoutWindow {
         None
     }
 
+    /// The pop-out's term island origin in physical px (mirrors `term_island`
+    /// but public so the bin can compute click-to-frac for focus).
+    pub fn term_island_px(&self) -> (f32, f32, f32, f32) {
+        self.term_island()
+    }
+
+    /// Set the focused tile id; the next render highlights its card ring.
+    pub fn set_focused_tile(&mut self, tid: Option<u64>) {
+        self.focused_tile = tid;
+        if let Some(tid) = tid {
+            for t in &mut self.tiles {
+                t.focused = t.id == tid;
+            }
+        } else {
+            for t in &mut self.tiles {
+                t.focused = false;
+            }
+        }
+        self.window.request_redraw();
+    }
+
     pub fn term_pane_selection(&self) -> Option<(u64, ((usize, usize), (usize, usize)))> {
         for t in &self.tiles {
             if let Some((a, b)) = t.sel.filter(|(a, b)| a != b) {
