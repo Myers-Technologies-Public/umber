@@ -890,6 +890,15 @@ impl PopoutWindow {
         }
 
         // Text areas: terminal grid + button glyphs.
+        // Shrink the terminal glyph clip away from the scroll-back overlay
+        // strip so the strip's dark fill reads as solid (terminal text no
+        // longer paints through it). Only when an overlay is up.
+        let term_bounds_bottom: i32 =
+            if let Some(&overlay_y) = overlay_top.as_ref() {
+                (overlay_y - self.pad).max(iy) as i32
+            } else {
+                (iy + ih) as i32
+            };
         let term_area = TextArea {
             buffer: &self.buffer,
             left: ix + self.pad,
@@ -899,7 +908,7 @@ impl PopoutWindow {
                 left: ix as i32,
                 top: iy as i32,
                 right: (ix + iw) as i32,
-                bottom: (iy + ih) as i32,
+                bottom: term_bounds_bottom,
             },
             default_color: Color::rgb(220, 214, 201),
             custom_glyphs: &[],

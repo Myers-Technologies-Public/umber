@@ -3739,23 +3739,75 @@ impl App {
         let Some(i) = self.pane_terms.iter().position(|(t, _)| *t == tid) else {
             return;
         };
+        // Strip-from-main only when this terminal has siblings still on the
+        // page — leave the sole terminal alone: a pop-out then spawns a fresh
+        // shell so neither goes unresponsive.
+        let lone = self.pane_terms.len() <= 1;
         let Some(mut win) = self.create_popout_window(event_loop) else {
             return;
         };
-        let (_, sess) = self.pane_terms.remove(i);
-        self.pane_tree.close(pane_id);
-        self.term_focused = self.focused_pane_term_id().is_some();
-        self.sync_panes();
         let (cols, rows) = win.grid();
         let (cw, ch) = win.cell_px();
-        sess.resize(cols, rows, cw, ch);
-        win.set_content(&sess.styled_content().text);
-        win.request_redraw();
-        self.popouts.push(Popout {
-            win,
-            sess,
-            pointer: (0.0, 0.0),
-        });
+        if lone {
+            // Don't strip the sole terminal away from the main page: spawn a
+            // FRESH shell in the popup so both stay responsive.
+            match TerminalSession::spawn_with_shell(
+                UmberNotifier(self.event_proxy.clone()),
+                cols, rows, cw, ch, None,
+            ) {
+                Ok(sess) => {
+                    let snap = sess.styled_content();
+                    let spans: Vec<TerminalTextSpan> = snap
+                        .spans
+                        .iter()
+                        .map(|sp| TerminalTextSpan {
+                            start: sp.start,
+                            end: sp.end,
+                            rgb: sp.rgb,
+                            bold: sp.bold,
+                            italic: sp.italic,
+                        })
+                        .collect();
+                    win.set_styled_content(&snap.text, snap.cursor, &spans);
+                    win.request_redraw();
+                    self.popouts.push(Popout {
+                        win,
+                        sess,
+                        pointer: (0.0, 0.0),
+                    });
+                }
+                Err(e) => {
+                    self.modules_hint = Some(format!("pop-out spawn failed: {e}"));
+                }
+            }
+        } else {
+            // Multi-tile: move the live session into the pop-out (the rest of
+            // the layout keeps working).
+            let (_, sess) = self.pane_terms.remove(i);
+            self.pane_tree.close(pane_id);
+            self.term_focused = self.focused_pane_term_id().is_some();
+            self.sync_panes();
+            sess.resize(cols, rows, cw, ch);
+            let snap = sess.styled_content();
+            let spans: Vec<TerminalTextSpan> = snap
+                .spans
+                .iter()
+                .map(|sp| TerminalTextSpan {
+                    start: sp.start,
+                    end: sp.end,
+                    rgb: sp.rgb,
+                    bold: sp.bold,
+                    italic: sp.italic,
+                })
+                .collect();
+            win.set_styled_content(&snap.text, snap.cursor, &spans);
+            win.request_redraw();
+            self.popouts.push(Popout {
+                win,
+                sess,
+                pointer: (0.0, 0.0),
+            });
+        }
     }
 
     /// Extract the highlighted text from pop-out `idx`'s terminal selection
@@ -4954,46 +5006,26 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
                 WindowEvent::MouseInput { state, button, .. } => {
-                    if button == MouseButton::Left {
-                        let (px, py) = self.popouts[idx].pointer;
-                        let (px, py) = (px as f32, py as f32);
-                        match state {
-                            ElementState::Pressed => {
-                                self.popouts[idx].win.clear_selection();
-                                if let Some(dir) = self.popouts[idx].win.resize_dir_at(px, py) {
-                                    self.popouts[idx].win.start_resize(dir);
-                                } else if let Some(b) =
-                                    self.popouts[idx].win.window_button_at(px, py)
-                                {
-                                    match b {
-                                        0 => self.popouts[idx].win.set_minimized(),
-                                        1 => self.popouts[idx].win.toggle_maximized(),
-                                        _ => {
-                                            let mut p = self.popouts.remove(idx);
-                                            p.sess.shutdown();
-                                        }
-                                    }
-                                } else if self.popouts[idx].win.in_titlebar(px, py) {
-                                    self.popouts[idx].win.drag();
-                                } else {
-                                    // Anywhere else on the grid: start selecting.
-                                    self.popouts[idx].win.begin_selection(px, py);
-                                }
-                            }
-                            ElementState::Released => {
-                                self.popouts[idx].win.end_selection();
-                            }
-                        }
-                    }
-                    // The pop-out's single-tile context menu: Paste / Close.
-                    // (No splits / sibling pop-out / rename here — one tile.)
+                    // The pop-out's single-tile context menu: Split Left/Up/
+                    // Right/Down open a fresh pop-out (a pop-out is one tile),
+                    // then Copy / Paste, divider'd from Close.
                     if button == MouseButton::Right && state == ElementState::Pressed {
                         let (px, py) = self.popouts[idx].pointer;
                         let (px, py) = (px as f32, py as f32);
-                        self.popouts[idx]
-                            .win
-                            .set_context_menu(px, py, &["Copy", "Paste", "Close Pop-out"]);
-                        self.popouts[idx].win.set_context_separators(&[0, 1]);
+                        self.popouts[idx].win.set_context_menu(
+                            px,
+                            py,
+                            &[
+                                "Split Left",
+                                "Split Right",
+                                "Split Up",
+                                "Split Down",
+                                "Copy",
+                                "Paste",
+                                "Close Pop-out",
+                            ],
+                        );
+                        self.popouts[idx].win.set_context_separators(&[3, 5]);
                         return;
                     }
                     // Left-click: if the menu is open, either activate a row
@@ -5007,9 +5039,44 @@ impl ApplicationHandler<UserEvent> for App {
                             self.popouts[idx].win.clear_context_menu();
                             if let Some(row) = row {
                                 match row {
-                                    // Copy: popped-out terminal selection -> clipboard
-                                    // (whole pane text as fallback).
-                                    0 => {
+                                    // Splits open a fresh pop-out terminal from
+                                    // the existing template (events above).
+                                    0..=3 => {
+                                        if let Some(mut win) = self.create_popout_window(event_loop) {
+                                            let (cols, rows) = win.grid();
+                                            let (cw, ch) = win.cell_px();
+                                            if let Ok(sess) = TerminalSession::spawn_with_shell(
+                                                UmberNotifier(self.event_proxy.clone()),
+                                                cols, rows, cw, ch, None,
+                                            ) {
+                                                let s_snap = sess.styled_content();
+                                                let spans: Vec<TerminalTextSpan> = s_snap
+                                                    .spans
+                                                    .iter()
+                                                    .map(|sp| TerminalTextSpan {
+                                                        start: sp.start,
+                                                        end: sp.end,
+                                                        rgb: sp.rgb,
+                                                        bold: sp.bold,
+                                                        italic: sp.italic,
+                                                    })
+                                                    .collect();
+                                                win.set_styled_content(
+                                                    &s_snap.text,
+                                                    s_snap.cursor,
+                                                    &spans,
+                                                );
+                                                win.request_redraw();
+                                                self.popouts.push(Popout {
+                                                    win,
+                                                    sess,
+                                                    pointer: (0.0, 0.0),
+                                                });
+                                            }
+                                        }
+                                    }
+                                    // Copy: popped-out selection -> clipboard.
+                                    4 => {
                                         let text = self
                                             .popout_selection_text(idx)
                                             .or_else(|| self.popouts.get(idx).map(|p| p.sess.content().0));
@@ -5018,7 +5085,7 @@ impl ApplicationHandler<UserEvent> for App {
                                         }
                                     }
                                     // Paste: clipboard -> session bytes.
-                                    1 => {
+                                    5 => {
                                         if let Some(text) = self.clipboard_text() {
                                             if !text.is_empty() {
                                                 self.popouts[idx].sess.write(text.into_bytes());

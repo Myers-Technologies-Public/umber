@@ -3830,9 +3830,13 @@ impl Renderer {
                     let cols = ((pw - ppad * 2.0) / pcell_w).floor().max(1.0) as usize;
                     let rows_visible = ((ph - ppad * 2.0) / pline_px).floor().max(1.0) as usize;
                     for grid_row in start.0..=end.0 {
-                        // Map grid row -> current viewport row using the stored
-                        // display_offset; skip rows scrolled out of view.
-                        let view_row = grid_row.saturating_sub(p.display_offset);
+                        // Skip rows scrolled below the visible viewport (off-screen
+                        // under the current scroll position — the highlight follows
+                        // the text, so when the row is gone, the highlight is too).
+                        if grid_row < p.display_offset {
+                            continue;
+                        }
+                        let view_row = grid_row - p.display_offset;
                         if view_row >= rows_visible {
                             continue;
                         }
