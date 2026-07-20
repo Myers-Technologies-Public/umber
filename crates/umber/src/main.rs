@@ -5012,14 +5012,19 @@ impl ApplicationHandler<UserEvent> for App {
                     if button == MouseButton::Right && state == ElementState::Pressed {
                         let (px, py) = self.popouts[idx].pointer;
                         let (px, py) = (px as f32, py as f32);
+                        // Until the pop-out grows its own pane tree (a
+                        // follow-up), these open a sibling pop-out window
+                        // labelled with a direction. The wording is honest:
+                        // it's a separate terminal window on that side, not a
+                        // split inside this one.
                         self.popouts[idx].win.set_context_menu(
                             px,
                             py,
                             &[
-                                "Split Left",
-                                "Split Right",
-                                "Split Up",
-                                "Split Down",
+                                "Open Pop-out (Left)",
+                                "Open Pop-out (Right)",
+                                "Open Pop-out (Up)",
+                                "Open Pop-out (Down)",
                                 "Copy",
                                 "Paste",
                                 "Close Pop-out",
