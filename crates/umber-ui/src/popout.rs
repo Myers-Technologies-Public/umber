@@ -12,6 +12,8 @@ use std::time::Instant;
 use cosmic_text::{
     Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style, SwashCache, Weight, Wrap,
 };
+
+use crate::PaneDividerSpec;
 use glyphon::{Cache, Resolution, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport};
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{ResizeDirection, Window, WindowId};
@@ -129,6 +131,20 @@ struct Chrome {
     buttons: [(f32, f32, f32, f32); 3],
 }
 
+/// One tiled terminal inside a popup (mirrors renderer.rs' TermPaneView —
+/// kept here so the popup can host real splits reusing the data shape the
+/// in-app pane system already uses).
+pub struct PopoutTile {
+    pub id: u64,
+    pub rect: [f32; 4],
+    buffer: Buffer,
+    cursor: Option<(usize, usize)>,
+    pub focused: bool,
+    display_offset: usize,
+    sel: Option<((usize, usize), (usize, usize))>,
+    focus_anim: f32,
+}
+
 pub struct PopoutWindow {
     window: Arc<Window>,
     instance: Instance,
@@ -145,6 +161,13 @@ pub struct PopoutWindow {
     buffer: Buffer,
     /// Grid cell coords of the text cursor, like the main renderer's TermPane.
     cursor: Option<(usize, usize)>,
+    /// Multi-tile terminal panes, mirroring the in-app renderer. When non-empty
+    /// the popup draws / hit-tests these instead of the single legacy buffer;
+    /// when empty the legacy single-buffer path runs.
+    tiles: Vec<PopoutTile>,
+    pane_divs: Vec<PaneDividerSpec>,
+    /// Id of the focused tile (only meaningful when `tiles` is non-empty).
+    focused_tile: Option<u64>,
     // Quad pass (chrome).
     quad_pipeline: wgpu::RenderPipeline,
     quad_vbuf: wgpu::Buffer,
@@ -323,6 +346,9 @@ impl PopoutWindow {
             text_renderer,
             buffer,
             cursor: None,
+            tiles: Vec::new(),
+            pane_divs: Vec::new(),
+            focused_tile: None,
             quad_pipeline,
             quad_vbuf,
             scale,
