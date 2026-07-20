@@ -1794,11 +1794,10 @@ impl App {
     /// Open the pane-rename overlay for a tile inside popout `pidx`.
     fn open_popout_rename(&mut self, pidx: usize, tile_id: u64) {
         self.dismiss_context_menu();
-        self.rename_in_popout = Some(pidx);
-        self.rename_target = Some(tile_id);
-        self.rename_input = self.popouts.get(pidx).and_then(|p| p.pane_names.get(&tile_id)).cloned().unwrap_or_default();
-        self.view = View::PaneRename;
-        self.refresh_overlay();
+        if let Some(p) = self.popouts.get_mut(pidx) {
+            let current = p.pane_names.get(&tile_id).cloned();
+            p.win.open_rename(tile_id, current);
+        }
     }
 
     /// Handle the pane-rename prompt: Enter stores the name (empty clears it),
