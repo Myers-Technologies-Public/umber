@@ -3539,6 +3539,7 @@ impl App {
         if let Some(r) = self.renderer.as_mut() {
             if self.pane_tree.is_plain_editor() {
                 r.set_panes(None, &[], &[], &[]);
+                r.set_pane_badges(&[]);
             } else {
                 let mut editor = None;
                 let mut terms = Vec::new();
@@ -3566,6 +3567,17 @@ impl App {
                     })
                     .collect();
                 r.set_panes(editor, &terms, &doc_tiles, &divs);
+                let badges: Vec<([f32; 4], String)> = self
+                    .pane_tree
+                    .layout()
+                    .iter()
+                    .filter_map(|p| {
+                        self.pane_names
+                            .get(&p.id)
+                            .map(|n| ([p.rect.x, p.rect.y, p.rect.w, p.rect.h], n.clone()))
+                    })
+                    .collect();
+                r.set_pane_badges(&badges);
             }
             let (cw, ch) = r.cell_px();
             for (tid, _) in &self.pane_terms {

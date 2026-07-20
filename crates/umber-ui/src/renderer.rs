@@ -676,6 +676,8 @@ pub struct Renderer {
     /// line rect within the content area).
     pane_divs: Vec<PaneDividerSpec>,
     doc_panes: Vec<DocPaneView>,
+    /// Pane name badges: (shaped label buffer, pane rect, text width px).
+    pane_badges: Vec<(Buffer, [f32; 4], f32)>,
     /// The editor tile owns focus (drives its accent ring when tiled).
     editor_pane_focused: bool,
     /// Editor focus-ring cross-fade + selection fade-in progress.
@@ -1082,6 +1084,7 @@ impl Renderer {
             term_panes: Vec::new(),
             pane_divs: Vec::new(),
             doc_panes: Vec::new(),
+            pane_badges: Vec::new(),
             editor_pane_focused: true,
             editor_focus_anim: 1.0,
             sel_anim: 0.0,
@@ -1315,6 +1318,25 @@ impl Renderer {
             (r[2] * cw - g * 2.0).max(1.0),
             (r[3] * ch - g * 2.0).max(1.0),
         )
+    }
+
+    /// Set per-pane name badges: `(normalized_rect, name)`. Each becomes a small
+    /// shaped label drawn at the pane's inner top-left. Empty clears them.
+    pub fn set_pane_badges(&mut self, badges: &[([f32; 4], String)]) {
+        self.pane_badges.clear();
+        let metrics = self.doc_buffer.metrics();
+        let attrs = Attrs::new().family(Family::SansSerif);
+        let line_px = self.line_px();
+        for (rect, name) in badges {
+            let mut buffer = Buffer::new(&mut self.font_system, metrics);
+            buffer.set_wrap(Wrap::None);
+            buffer.set_text(name, &attrs, Shaping::Advanced, None);
+            buffer.set_size(Some(600.0), Some(line_px));
+            buffer.shape_until_scroll(&mut self.font_system, false);
+            let text_w = buffer.layout_runs().next().map(|r| r.line_w).unwrap_or(0.0);
+            self.pane_badges.push((buffer, *rect, text_w));
+        }
+        self.window.request_redraw();
     }
 
     /// The editor's card rect in physical px — the pane share when tiled,
@@ -2886,6 +2908,24 @@ impl Renderer {
         let h = self.surface_config.height as i32;
 
         let mut areas: Vec<TextArea> = Vec::with_capacity(8);
+        // Pane name badges: a label at each named pane's inner top-left.
+        for (buffer, rect, _) in &self.pane_badges {
+            let (bx, by, _, _) = self.pane_card_px(*rect);
+            areas.push(TextArea {
+                buffer,
+                left: bx + pad * 1.6,
+                top: by + pad * 0.8,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: 0,
+                    top: 0,
+                    right: w,
+                    bottom: h,
+                },
+                default_color: OVERLAY_INPUT_COLOR,
+                custom_glyphs: &[],
+            });
+        }
         if self.sidebar_enabled {
             // "umber" wordmark in the corner block above the file tabs.
             areas.push(TextArea {
@@ -4094,6 +4134,26 @@ impl Renderer {
                     0.0,
                 );
             }
+        }
+        // Pane name badge pills (post-text so the label reads over content).
+        let badge_rects: Vec<([f32; 4], f32)> =
+            self.pane_badges.iter().map(|(_, r, tw)| (*r, *tw)).collect();
+        for (rect, text_w) in badge_rects {
+            let (bx, by, _, _) = self.pane_card_px(rect);
+            let s = self.scale_factor as f32;
+            let bpad = self.pad_px();
+            let lh = self.line_px();
+            sidebar_verts += push_rquad(
+                &mut self.sidebar_bytes,
+                fw,
+                fh,
+                bx + bpad * 0.9,
+                by + bpad * 0.45,
+                text_w + bpad * 2.4,
+                lh * 1.2,
+                CONTEXT_MENU_COLOR,
+                6.0 * s,
+            );
         }
         // Drag-to-dock preview: a translucent accent wash over the target
         // half, in the post-text range so it reads over the glyphs.
