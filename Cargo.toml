@@ -9,6 +9,7 @@ members = [
     "crates/umber-host",
     "crates/umber-proto",
     "crates/umberd",
+    "crates/umber-update",
 ]
 
 # D3: OSS core is dual-licensed MIT OR Apache-2.0.
@@ -54,3 +55,10 @@ arboard = { version = "3.6", default-features = false }
 # hook + VmState API the Lua backend relies on). Both are single-sourced here.
 wasmtime = { version = "46.0", features = ["wat"] }
 mlua = { version = "0.12", features = ["lua54", "vendored"] }
+
+# umber-update self-updater (optional module). ureq is rustls-based (no OpenSSL,
+# cross-platform); ed25519-dalek verifies the release signature; self_replace
+# swaps the running binary.
+ureq = "2"
+ed25519-dalek = "2"
+self-replace = "1"
