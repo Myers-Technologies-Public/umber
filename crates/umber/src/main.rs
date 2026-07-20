@@ -4053,8 +4053,16 @@ impl App {
     /// Push the open-document tab labels (with dirty markers) + active index
     /// to the renderer's tab strip.
     fn sync_tabs(&mut self) {
-        let mut labels: Vec<String> = Vec::with_capacity(self.docs.len());
-        for i in 0..self.docs.len() {
+        // When a terminal pane owns the layout and the lone editor doc is an
+        // empty untitled scratch (the auto-opened New Tab), don't list it in
+        // the strip — opening the shell cleared it, the tab is dead weight.
+        let hide_scratch = !self.pane_terms.is_empty()
+            && self.docs.len() == 1
+            && self.docs[0].buffer.path().is_none()
+            && self.docs[0].buffer.len_chars() == 0;
+        let n_docs = if hide_scratch { 0 } else { self.docs.len() };
+        let mut labels: Vec<String> = Vec::with_capacity(n_docs);
+        for i in 0..n_docs {
             let dirty = if i == self.active_doc {
                 self.buffer.is_dirty()
             } else {
