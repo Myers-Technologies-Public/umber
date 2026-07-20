@@ -507,6 +507,8 @@ fn main() -> ExitCode {
         next_pane_term: 1,
         popouts: Vec::new(),
         pane_drag: None,
+        top_island_press: None,
+        top_window_dragging: false,
         pane_div_hot: None,
         tab_drag: None,
         context_target: None,
@@ -764,6 +766,13 @@ struct App {
     next_pane_term: u64,
     /// Dragging a pane divider: (split path, is-horizontal-split).
     pane_drag: Option<(u32, bool)>,
+    /// Top-island press in progress: (hit tab index, press x, press y). A quick
+    /// click activates the activity item; a drag past slop hands the move to
+    /// the OS borderless window-drag. Always draggable, no matter the panels.
+    top_island_press: Option<(usize, f64, f64)>,
+    /// True once the top-island press has handed off to `drag_window()` so the
+    /// release does not also activate.
+    top_window_dragging: bool,
     /// Divider hover state, so the resize cursor sets/resets on change.
     pane_div_hot: Option<bool>,
     /// Drag-a-tab-to-dock: (doc index, press pos, past slop, drop zone).
@@ -4966,6 +4975,17 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.pointer = (position.x, position.y);
+                // Top-island press: hand a >5px drag to the OS window drag.
+                if let Some((_, px, py)) = self.top_island_press {
+                    let dx = position.x - px;
+                    let dy = position.y - py;
+                    if dx * dx + dy * dy > 25.0 && !self.top_window_dragging {
+                        self.top_window_dragging = true;
+                        if let Some(r) = self.renderer.as_ref() {
+                            let _ = r.window().drag_window();
+                        }
+                    }
+                }
                 // Window-control button hover (repaint only on change).
                 if let Some(r) = self.renderer.as_mut() {
                     let h = r.window_button_at(position.x as f32, position.y as f32);
@@ -5191,6 +5211,16 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
+                // A clean click in the top floating island (press->release
+                // with no drag) activates the activity item under it.
+                if state == ElementState::Released && button == MouseButton::Left {
+                    if let Some((i, _, _)) = self.top_island_press.take() {
+                        self.top_window_dragging = false;
+                        self.sidebar_tab_activate(i);
+                        return;
+                    }
+                    self.top_window_dragging = false;
+                }
                 // An open context menu captures the next press. Left-click a
                 // row to activate; any other press dismisses it.
                 if state == ElementState::Pressed
@@ -5479,13 +5509,16 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         return;
                     }
-                    // Top strip = activity actions: click activates.
+                    // Top strip = activity items; a click activates one, but
+                    // a press+drag moves the whole borderless window. Record
+                    // the press and let the CursorMoved handler decide (slop).
                     if let Some(i) = self
                         .renderer
                         .as_ref()
                         .and_then(|r| r.tabstrip_at(self.pointer.0 as f32, self.pointer.1 as f32))
                     {
-                        self.sidebar_tab_activate(i);
+                        self.top_island_press = Some((i, self.pointer.0, self.pointer.1));
+                        self.top_window_dragging = false;
                         return;
                     }
                     // Empty command-bar area: drag to move the borderless window.
