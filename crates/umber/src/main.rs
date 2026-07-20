@@ -4727,6 +4727,10 @@ impl ApplicationHandler<UserEvent> for App {
                             })
                             .collect();
                         p.win.set_styled_content(&snap.text, snap.cursor, &spans);
+                        // Keep the scroll-back input overlay fresh as text streams
+                        // in while the pop-out is scrolled up.
+                        let overlay = p.sess.bottom_text(1);
+                        p.win.set_overlay_text(overlay);
                         p.win.request_redraw();
                     }
                 }
@@ -4936,13 +4940,9 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                         }
                     }
-                    // Right-click: the pop-out terminal is one tile, so its
-                    // only context action is Close (matching a pane Close Pane).
-                    if button == MouseButton::Right && state == ElementState::Pressed {
-                        let mut p = self.popouts.remove(idx);
-                        p.sess.shutdown();
-                        return;
-                    }
+                    // Right-click is reserved for a context menu (don't
+                    // mistake the right-press for a window close — Kill the
+                    // pop-out via double Ctrl+C / corner close button instead).
                 }
                 WindowEvent::MouseWheel { delta, .. } => {
                     let lines = match delta {
@@ -4951,6 +4951,8 @@ impl ApplicationHandler<UserEvent> for App {
                     };
                     self.popouts[idx].win.clear_selection();
                     self.popouts[idx].sess.scroll(lines);
+                    let overlay = self.popouts[idx].sess.bottom_text(1);
+                    self.popouts[idx].win.set_overlay_text(overlay);
                     let snap = self.popouts[idx].sess.styled_content();
                     let spans: Vec<TerminalTextSpan> = snap
                         .spans

@@ -157,6 +157,10 @@ pub struct PopoutWindow {
     /// Drag-selection over the grid: `(anchor (row,col), head (row,col))`.
     sel: Option<((usize, usize), (usize, usize))>,
     selecting: bool,
+    /// Scroll-back input overlay: a pinned one-line strip at the island bottom
+    /// showing the being-typed prompt row while the user is scrolled up. None
+    // = bottom-visible, no strip. Shaped lazily on set_overlay_text.
+    overlay: Option<Buffer>,
     /// Per-button hover animation progress (0=idle, 1=hovered).
     win_btn_anim: [f32; 3],
     anim_prev: Instant,
@@ -314,6 +318,7 @@ impl PopoutWindow {
             hover: None,
             sel: None,
             selecting: false,
+            overlay: None,
             win_btn_anim: [0.0; 3],
             anim_prev: Instant::now(),
         };
@@ -530,6 +535,22 @@ impl PopoutWindow {
     /// grid cursor, mirroring `Renderer::set_term_pane_content` so a pop-out
     /// reads identical to the in-app tile — colours, suggested-code styling,
     /// and a blinking-set cursor block — rather than plain monochrome text.
+    /// Pinned input overlay: `Some(text)` shows it at the island bottom, None
+    /// clears it. Useful while the user is scrolled away from the prompt.
+    pub fn set_overlay_text(&mut self, text: Option<String>) {
+        self.overlay = None;
+        if let Some(t) = text {
+            let metrics = Metrics::new(BASE_FONT, BASE_LINE);
+            let mut buf = Buffer::new(&mut self.font_system, metrics);
+            buf.set_wrap(Wrap::None);
+            buf.set_text(&t, &Attrs::new().family(Family::Monospace), Shaping::Advanced, None);
+            buf.set_size(Some(900.0), Some(self.line_px));
+            buf.shape_until_scroll(&mut self.font_system, false);
+            self.overlay = Some(buf);
+        }
+        self.window.request_redraw();
+    }
+
     pub fn set_styled_content(
         &mut self,
         text: &str,
@@ -746,7 +767,42 @@ impl PopoutWindow {
             default_color: Color::rgb(220, 214, 201),
             custom_glyphs: &[],
         };
-        let areas = vec![term_area];
+        let areas = if let Some(buf) = &self.overlay {
+            // Pill: dark rounded backdrop behind the overlay labels at the
+            // island bottom, then push its text area.
+            let n = buf.layout_runs().count().max(1) as f32;
+            let strip_h = (n + 0.6) * self.line_px;
+            let px = ix + self.pad * 0.9;
+            let py = iy + ih - strip_h - self.pad;
+            verts += push_rquad(
+                &mut bytes,
+                sw,
+                sh,
+                px,
+                py,
+                (iw - self.pad * 1.8).max(1.0),
+                strip_h,
+                EDITOR_PANEL_COLOR,
+                6.0 * s,
+            );
+            let overlay_area = TextArea {
+                buffer: buf,
+                left: ix + self.pad * 1.5,
+                top: py,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: ix as i32,
+                    top: py as i32,
+                    right: (ix + iw) as i32,
+                    bottom: (iy + ih) as i32,
+                },
+                default_color: Color::rgb(232, 232, 238),
+                custom_glyphs: &[],
+            };
+            vec![term_area, overlay_area]
+        } else {
+            vec![term_area]
+        };
         if self
             .text_renderer
             .prepare(
