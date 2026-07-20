@@ -227,6 +227,8 @@ pub struct PopoutWindow {
     // doesn't盖上 the main editor).
     rename_tile: Option<u64>,
     rename_input: String,
+    /// Per-tile name badges (shaped label buffer, pane rect, text width px).
+    pane_badges: Vec<(Buffer, [f32; 4], f32)>,
 }
 
 impl PopoutWindow {
@@ -404,6 +406,7 @@ impl PopoutWindow {
             context_separators: Vec::new(),
             rename_tile: None,
             rename_input: String::new(),
+            pane_badges: Vec::new(),
             win_btn_anim: [0.0; 3],
             anim_prev: Instant::now(),
         };
@@ -810,6 +813,25 @@ impl PopoutWindow {
     /// Wipe + rebuild the per-tile terminal batch with `terms` + their dividers.
     /// Mirrors `Renderer::set_panes` (terminal-only, no editor/doc leaves):
     /// tiles are reused by id when they survive a split-close.
+    /// Set per-tile name badges: `(normalized_rect, name)`. Mirrors the
+    /// main renderer's set_pane_badges. Empty vector clears all badges.
+    pub fn set_pane_badges(&mut self, badges: &[([f32; 4], String)]) {
+        self.pane_badges.clear();
+        let metrics = self.buffer.metrics();
+        let attrs = Attrs::new().family(Family::SansSerif);
+        let line_px = self.line_px;
+        for (rect, name) in badges {
+            let mut buffer = Buffer::new(&mut self.font_system, metrics);
+            buffer.set_wrap(Wrap::None);
+            buffer.set_text(name, &attrs, Shaping::Advanced, None);
+            buffer.set_size(Some(600.0), Some(line_px));
+            buffer.shape_until_scroll(&mut self.font_system, false);
+            let text_w = buffer.layout_runs().next().map(|r| r.line_w).unwrap_or(0.0);
+            self.pane_badges.push((buffer, *rect, text_w));
+        }
+        self.window.request_redraw();
+    }
+
     pub fn set_term_panes(
         &mut self,
         terms: &[(u64, [f32; 4], bool)],
@@ -1178,6 +1200,16 @@ impl PopoutWindow {
         // Compute the menu's draw descriptor (deferring the card quads to the
         // POST-text sector so terminal glyphs sit BENEATH the card — labels go
         // through the overlay_text_renderer over both).
+        // Pane name badge pills (under-text so labels go via the text pass on top).
+        let badge_descs: Vec<([f32; 4], f32)> = self.pane_badges.iter().map(|(_, r, tw)| (*r, *tw)).collect();
+        for (rect, text_w) in &badge_descs {
+            let (bx, by, _, _) = tile_card_px(*rect, ix, iy, iw, ih, self.pad);
+            let pill_w = text_w + self.pad * 2.4;
+            verts += push_rquad(&mut bytes, sw, sh,
+                bx + self.pad * 0.7, by + self.pad * 0.3,
+                pill_w, self.line_px * 1.2,
+                [0.357, 0.373, 0.235, 1.0], 6.0 * s);
+        }
         let menu_area_desc: Option<(f32, f32, f32, usize)> = self.context_active.then(||
             (self.context_x + 10.0 * s, self.context_y + 5.0 * s, self.context_width, self.context_rows)
         );
@@ -1330,7 +1362,22 @@ impl PopoutWindow {
         // `bytes` above (they had to be written before the quad vbuf upload).
         // The label TextArea for the menu must be appended here, where the
         // areas vec is assembled for glyphon.
-        let mut areas = Vec::with_capacity(3 + self.tiles.len());
+        let mut areas = Vec::with_capacity(3 + self.tiles.len() + self.pane_badges.len());
+        // Pane name badge labels (same pass as text; badges sit under-text).
+        for (buf, rect, _) in &self.pane_badges {
+            let (bx, by, _, _) = tile_card_px(*rect, ix, iy, iw, ih, self.pad);
+            areas.push(TextArea {
+                buffer: buf,
+                left: bx + self.pad,
+                top: by + self.pad * 0.6,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: 0, top: 0, right: self.config.width as i32, bottom: self.config.height as i32,
+                },
+                default_color: Color::rgb(245, 235, 215),
+                custom_glyphs: &[],
+            });
+        }
         if let Some(buf) = &self.overlay {
             areas.push(TextArea {
                 buffer: buf,

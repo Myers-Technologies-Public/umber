@@ -3860,6 +3860,12 @@ impl App {
             x: d.rect.x, y: d.rect.y, w: d.rect.w, h: d.rect.h,
         }).collect();
         p.win.set_term_panes(&terms, &divs);
+        // Push pane name badges for tiles that have a name.
+        let badges: Vec<([f32; 4], String)> = layout.iter().filter_map(|pr| match pr.content {
+            PaneContent::Terminal(tid) => p.pane_names.get(&pr.id).map(|n| ([pr.rect.x, pr.rect.y, pr.rect.w, pr.rect.h], n.clone())),
+            _ => None,
+        }).collect();
+        p.win.set_pane_badges(&badges);
         let cw = p.win.cell_px().0 as u16;
         let ch = p.win.cell_px().1 as u16;
         // Push each tile's snapshot into the renderer so the spawn-on-split case
