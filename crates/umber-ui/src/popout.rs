@@ -9,7 +9,9 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Wrap};
+use cosmic_text::{
+    Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style, SwashCache, Weight, Wrap,
+};
 use glyphon::{Cache, Resolution, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport};
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{ResizeDirection, Window, WindowId};
@@ -34,6 +36,7 @@ const EDITOR_PANEL_COLOR: [f32; 4] = [0.014, 0.012, 0.010, 1.0];
 const TERM_BG_COLOR: [f32; 4] = [0.010, 0.009, 0.008, 1.0];
 const PANE_FOCUS_BORDER_COLOR: [f32; 4] = [0.30, 0.135, 0.070, 1.0];
 const SELECTION_COLOR: [f32; 4] = [0.86, 0.47, 0.30, 0.6];
+const TERM_CURSOR_COLOR: [f32; 4] = [0.757, 0.373, 0.235, 0.45];
 
 /// 11 floats/vertex: clip pos (2), rgba (4), local px (2), half px (2), radius (1).
 const FLOATS_PER_VERT: usize = 11;
@@ -140,6 +143,8 @@ pub struct PopoutWindow {
     viewport: Viewport,
     text_renderer: TextRenderer,
     buffer: Buffer,
+    /// Grid cell coords of the text cursor, like the main renderer's TermPane.
+    cursor: Option<(usize, usize)>,
     // Quad pass (chrome).
     quad_pipeline: wgpu::RenderPipeline,
     quad_vbuf: wgpu::Buffer,
@@ -299,6 +304,7 @@ impl PopoutWindow {
             viewport,
             text_renderer,
             buffer,
+            cursor: None,
             quad_pipeline,
             quad_vbuf,
             scale,
@@ -477,6 +483,10 @@ impl PopoutWindow {
             (true, _, _, true) => ResizeDirection::NorthEast,
             (_, true, true, _) => ResizeDirection::SouthWest,
             (_, true, _, true) => ResizeDirection::SouthEast,
+            (true, _, _, _) => ResizeDirection::North,
+            (_, true, _, _) => ResizeDirection::South,
+            (_, _, true, _) => ResizeDirection::West,
+            (_, _, _, true) => ResizeDirection::East,
             _ => return None,
         })
     }
@@ -512,6 +522,53 @@ impl PopoutWindow {
             Shaping::Advanced,
             None,
         );
+        self.cursor = None;
+        self.reshape_buffer();
+    }
+
+    /// Styled terminal content: rich text spans (ANSI fg + bold/italic) and the
+    /// grid cursor, mirroring `Renderer::set_term_pane_content` so a pop-out
+    /// reads identical to the in-app tile — colours, suggested-code styling,
+    /// and a blinking-set cursor block — rather than plain monochrome text.
+    pub fn set_styled_content(
+        &mut self,
+        text: &str,
+        cursor: Option<(usize, usize)>,
+        spans: &[crate::renderer::TerminalTextSpan],
+    ) {
+        self.cursor = cursor;
+        let default_attrs = Attrs::new().family(Family::Monospace);
+        if spans.is_empty() {
+            self.buffer.set_text(text, &default_attrs, Shaping::Advanced, None);
+        } else {
+            let mut rich: Vec<(&str, Attrs)> = Vec::with_capacity(spans.len() * 2 + 1);
+            let mut pos = 0;
+            for span in spans {
+                if span.start > pos {
+                    if let Some(segment) = text.get(pos..span.start) {
+                        rich.push((segment, default_attrs.clone()));
+                    }
+                }
+                if let Some(segment) = text.get(span.start..span.end) {
+                    let mut attrs = default_attrs
+                        .clone()
+                        .color(Color::rgb(span.rgb[0], span.rgb[1], span.rgb[2]));
+                    if span.bold {
+                        attrs = attrs.weight(Weight::BOLD);
+                    }
+                    if span.italic {
+                        attrs = attrs.style(Style::Italic);
+                    }
+                    rich.push((segment, attrs));
+                }
+                pos = span.end;
+            }
+            if let Some(segment) = text.get(pos..) {
+                rich.push((segment, default_attrs.clone()));
+            }
+            self.buffer
+                .set_rich_text(rich, &default_attrs, Shaping::Advanced, None);
+        }
         self.reshape_buffer();
     }
 
@@ -600,6 +657,28 @@ impl PopoutWindow {
                     verts +=
                         push_rquad(&mut bytes, sw, sh, x0, y0, wq, self.line_px, SELECTION_COLOR, 0.0);
                 }
+            }
+        }
+        // Text cursor block, same rust accent the main pane uses.
+        if let Some((row, col)) = self.cursor {
+            let tx = ix + self.pad;
+            let ty = iy + self.pad;
+            let cx0 = tx + col as f32 * self.cell_w;
+            let cy0 = ty + row as f32 * self.line_px;
+            if cx0 + self.cell_w <= ix + iw - self.pad
+                && cy0 + self.line_px <= iy + ih - self.pad
+            {
+                verts += push_rquad(
+                    &mut bytes,
+                    sw,
+                    sh,
+                    cx0,
+                    cy0,
+                    self.cell_w,
+                    self.line_px,
+                    TERM_CURSOR_COLOR,
+                    2.0 * s,
+                );
             }
         }
         // Everything above draws UNDER the terminal text; the control island

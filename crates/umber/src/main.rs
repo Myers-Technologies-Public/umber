@@ -4709,11 +4709,24 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::TerminalWakeup => {
-                // Popped-out terminals: feed each its own snapshot + repaint.
+                // Popped-out terminals: feed each its own styled snapshot
+                // (colours, bold/italic, cursor) + repaint — same data the
+                // in-app pane uses so a pop-out reads identical to the tile.
                 for p in &mut self.popouts {
                     if p.sess.take_dirty() {
-                        let text = p.sess.styled_content().text;
-                        p.win.set_content(&text);
+                        let snap = p.sess.styled_content();
+                        let spans: Vec<TerminalTextSpan> = snap
+                            .spans
+                            .iter()
+                            .map(|sp| TerminalTextSpan {
+                                start: sp.start,
+                                end: sp.end,
+                                rgb: sp.rgb,
+                                bold: sp.bold,
+                                italic: sp.italic,
+                            })
+                            .collect();
+                        p.win.set_styled_content(&snap.text, snap.cursor, &spans);
                         p.win.request_redraw();
                     }
                 }
@@ -4859,6 +4872,22 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             return;
                         }
+                        // Double Ctrl+C in the pop-out: a second Ctrl+C inside
+                        // ~400ms kills this pop-out's session (parity with the
+                        // in-app pane / Claude Code).
+                        if ctrl && matches!(ctrl_char(&key), Some('c')) {
+                            let now = Instant::now();
+                            if self
+                                .last_term_intr_at
+                                .is_some_and(|t| now.duration_since(t) < Duration::from_millis(400))
+                            {
+                                self.last_term_intr_at = None;
+                                let mut p = self.popouts.remove(idx);
+                                p.sess.shutdown();
+                                return;
+                            }
+                            self.last_term_intr_at = Some(now);
+                        }
                         if let Some(bytes) = Self::term_key_bytes(&key, ctrl, shift) {
                             self.popouts[idx].sess.write(bytes);
                         }
@@ -4881,6 +4910,7 @@ impl ApplicationHandler<UserEvent> for App {
                         let (px, py) = (px as f32, py as f32);
                         match state {
                             ElementState::Pressed => {
+                                self.popouts[idx].win.clear_selection();
                                 if let Some(dir) = self.popouts[idx].win.resize_dir_at(px, py) {
                                     self.popouts[idx].win.start_resize(dir);
                                 } else if let Some(b) =
@@ -4906,6 +4936,37 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                         }
                     }
+                    // Right-click: the pop-out terminal is one tile, so its
+                    // only context action is Close (matching a pane Close Pane).
+                    if button == MouseButton::Right && state == ElementState::Pressed {
+                        let mut p = self.popouts.remove(idx);
+                        p.sess.shutdown();
+                        return;
+                    }
+                }
+                WindowEvent::MouseWheel { delta, .. } => {
+                    let lines = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => (y * WHEEL_LINES) as i32,
+                        MouseScrollDelta::PixelDelta(p) => (p.y / BASE_LINE_PX) as i32,
+                    };
+                    self.popouts[idx].win.clear_selection();
+                    self.popouts[idx].sess.scroll(lines);
+                    let snap = self.popouts[idx].sess.styled_content();
+                    let spans: Vec<TerminalTextSpan> = snap
+                        .spans
+                        .iter()
+                        .map(|sp| TerminalTextSpan {
+                            start: sp.start,
+                            end: sp.end,
+                            rgb: sp.rgb,
+                            bold: sp.bold,
+                            italic: sp.italic,
+                        })
+                        .collect();
+                    self.popouts[idx]
+                        .win
+                        .set_styled_content(&snap.text, snap.cursor, &spans);
+                    self.popouts[idx].win.request_redraw();
                 }
                 _ => {}
             }
