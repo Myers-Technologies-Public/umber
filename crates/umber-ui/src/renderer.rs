@@ -3190,12 +3190,11 @@ impl Renderer {
             // its post-text pill, sitting below the pane's top bar.
             for (buffer, rect, _) in &self.pane_badges {
                 let (bx, by, _, _) = self.pane_card_px(*rect);
-                let lp = self.line_px();
                 let pd = self.pad_px();
                 ov_areas.push(TextArea {
                     buffer,
-                    left: bx + pd * 1.5,
-                    top: by + lp * 1.7,
+                    left: bx + pd,
+                    top: by + pd * 0.6,
                     scale: 1.0,
                     bounds: TextBounds {
                         left: 0,
@@ -3203,7 +3202,7 @@ impl Renderer {
                         right: w,
                         bottom: h,
                     },
-                    default_color: OVERLAY_INPUT_COLOR,
+                    default_color: Color::rgb(245, 235, 215),
                     custom_glyphs: &[],
                 });
             }
@@ -4196,15 +4195,16 @@ impl Renderer {
             let s = self.scale_factor as f32;
             let bpad = self.pad_px();
             let lh = self.line_px();
+            let pill_w = text_w + bpad * 2.4;
             sidebar_verts += push_rquad(
                 &mut self.sidebar_bytes,
                 fw,
                 fh,
-                bx + bpad * 0.9,
-                by + lh * 1.6,
-                text_w + bpad * 2.4,
+                bx + bpad * 0.7,
+                by + bpad * 0.3,
+                pill_w,
                 lh * 1.2,
-                CONTEXT_MENU_COLOR,
+                [0.357, 0.373, 0.235, 1.0],
                 6.0 * s,
             );
         }
