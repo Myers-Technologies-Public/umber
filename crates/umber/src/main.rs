@@ -512,6 +512,7 @@ fn main() -> ExitCode {
         context_target: None,
         last_click_at: None,
         last_click_pos: None,
+        last_term_intr_at: None,
         event_proxy,
         start,
         first_frame: false,
@@ -772,6 +773,9 @@ struct App {
     /// Double-click tracking for word-select.
     last_click_at: Option<Instant>,
     last_click_pos: Option<usize>,
+    /// Last Ctrl+C time in the terminal; a second within ~400ms kills the
+    /// focused shell/pi/TUI session (Claude Code-style).
+    last_term_intr_at: Option<Instant>,
     /// Proxy for background threads to wake the event loop.
     event_proxy: EventLoopProxy<UserEvent>,
 
@@ -5771,6 +5775,26 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                         }
                     }
+                    // Double Ctrl+C in the terminal: two Ctrl+C inputs inside
+                    // a short window kill the focused session (shell / pi / TUI)
+                    // the way Claude Code does. Normal Ctrl+C below still sends
+                    // \x03 (SIGINT) to the running process.
+                    if ctrl && matches!(ctrl_char(&event), Some('c')) {
+                        let now = Instant::now();
+                        let kill = self
+                            .last_term_intr_at
+                            .is_some_and(|t| now.duration_since(t) < Duration::from_millis(400));
+                        if kill {
+                            self.last_term_intr_at = None;
+                            if let Some(id) = self.focused_pane_term_id() {
+                                self.close_pane(id);
+                            } else if self.terminal.is_some() {
+                                self.kill_terminal();
+                            }
+                            return;
+                        }
+                        self.last_term_intr_at = Some(now);
+                    }
                     let session = self
                         .focused_pane_term_id()
                         .and_then(|id| self.pane_session(id))
@@ -6169,6 +6193,15 @@ impl ApplicationHandler<UserEvent> for App {
 
 /// True for a "word" char: alphanumeric (Unicode) or underscore. Punctuation
 /// and whitespace are not word chars.
+/// The lowercase ASCII letter a Ctrl+<letter> chord would send, or `None`.
+fn ctrl_char(event: &winit::event::KeyEvent) -> Option<char> {
+    if let Key::Character(c) = &event.logical_key {
+        c.chars().next().map(|ch| ch.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
 fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
