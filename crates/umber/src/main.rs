@@ -3762,6 +3762,7 @@ impl App {
                         "Close Pane",
                     ],
                 );
+                r.set_context_separators(&[3, 5]);
             } else {
                 r.set_context_menu(
                     x,
@@ -3775,6 +3776,7 @@ impl App {
                         "Pop Out",
                     ],
                 );
+                r.set_context_separators(&[3]);
             }
         }
     }

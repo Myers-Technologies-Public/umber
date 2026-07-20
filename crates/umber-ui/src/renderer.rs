@@ -575,6 +575,8 @@ pub struct Renderer {
     context_width: f32,
     context_rows: usize,
     context_hover: Option<usize>,
+    /// Row indices after which a group-divider line draws (visual only).
+    context_separators: Vec<usize>,
     overlay_active: bool,
     /// Open/close fade progress (0=hidden, 1=shown) and its target.
     overlay_anim: f32,
@@ -1037,6 +1039,7 @@ impl Renderer {
             context_width: 0.0,
             context_rows: 0,
             context_hover: None,
+            context_separators: Vec::new(),
             overlay_has_input: false,
             overlay_has_title: false,
             overlay_has_hint: false,
@@ -1502,6 +1505,7 @@ impl Renderer {
         self.context_width = width;
         self.context_rows = labels.len();
         self.context_hover = None;
+        self.context_separators.clear();
         self.context_active = !labels.is_empty();
         let text = labels.join("\n");
         self.context_buffer.set_text(
@@ -1523,6 +1527,14 @@ impl Renderer {
             self.context_hover = None;
             self.window.request_redraw();
         }
+    }
+
+    /// Set the group-divider rows for the open menu (indices after which a
+    /// separator line draws). Call right after [`Renderer::set_context_menu`].
+    pub fn set_context_separators(&mut self, seps: &[usize]) {
+        self.context_separators.clear();
+        self.context_separators.extend_from_slice(seps);
+        self.window.request_redraw();
     }
 
     pub fn context_menu_active(&self) -> bool {
@@ -4056,6 +4068,23 @@ impl Renderer {
                     row_h,
                     CONTEXT_MENU_HOVER_COLOR,
                     5.0 * s,
+                );
+            }
+            // Group dividers (visual only): thin lines at the requested row
+            // boundaries; hit-testing and row indices are unaffected.
+            let seps = self.context_separators.clone();
+            for sep in seps {
+                let ly = self.context_y + pad_y + (sep + 1) as f32 * row_h;
+                sidebar_verts += push_rquad(
+                    &mut self.sidebar_bytes,
+                    fw,
+                    fh,
+                    self.context_x + 6.0 * s,
+                    ly,
+                    (self.context_width - 12.0 * s).max(1.0),
+                    (1.0 * s).max(1.0),
+                    PANEL_BORDER_COLOR,
+                    0.0,
                 );
             }
         }
