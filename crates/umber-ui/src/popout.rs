@@ -1218,12 +1218,10 @@ impl PopoutWindow {
             });
         }
         // Menu labels are rendered via the overlay_text_renderer (after the
-        // post-text quad pass) so they sit on top of the menu card.
-        // When the context menu is open, hide terminal text so the menu's
-        // card reads cleanly (no terminal glyphs under the menu). The card
-        // itself was already pushed in the post-text quad pass; the labels below
-        // are rendered by overlay_text_renderer over the card.
-        if !self.context_active {
+        // post-text quad pass) so they sit on top of the menu card. The menu
+        // card itself (pushed post-text above) is opaque, so terminal glyphs
+        // beneath it are covered only where the card sits — the rest of the
+        // terminal stays visible.
         // Single-tile buffer pushes when multi-tile isn't active; otherwise
         // emit one TextArea per tile so glyphs land inside their cards.
         if self.tiles.is_empty() {
@@ -1248,7 +1246,6 @@ impl PopoutWindow {
                     custom_glyphs: &[],
                 });
             }
-        }
         }
         // Overlay text pass: render menu labels on top of the menu card via
         // the overlay_text_renderer. The card paints over terminal glyphs,
