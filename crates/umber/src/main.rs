@@ -4814,8 +4814,36 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::TerminalExited => {
-                // Shell ended (exit / Ctrl+D): close the panel and reap.
-                self.kill_terminal();
+                // One shell ended. Reap ONLY the session/surface that exited,
+                // leaving every other terminal pane and every other popped-out
+                // window untouched (each pop-out + pane is independent).
+                let dropped_popout = self
+                    .popouts
+                    .iter()
+                    .position(|p| p.sess.has_exited());
+                if let Some(i) = dropped_popout {
+                    let mut p = self.popouts.remove(i);
+                    p.sess.shutdown();
+                } else {
+                    let pane_dead = self
+                        .pane_terms
+                        .iter()
+                        .position(|(_, s)| s.has_exited());
+                    if let Some(i) = pane_dead {
+                        let (id, _) = self.pane_terms.remove(i);
+                        self.pane_tree
+                            .layout()
+                            .into_iter()
+                            .find(|p| matches!(p.content, PaneContent::Terminal(t2) if t2 == id))
+                            .map(|p| p.id)
+                            .into_iter()
+                            .for_each(|leaf| self.close_pane(leaf));
+                    } else if self.terminal.as_ref().is_some_and(|s| s.has_exited()) {
+                        // Legacy standalone terminal tab (<Ctrl+` / Ctrl+J):
+                        // kill it without disturbing pane terms or pop-outs.
+                        self.kill_terminal();
+                    }
+                }
             }
             UserEvent::AgentUpdated => {
                 // Live agent changed state/output: refresh the dashboard if
@@ -4952,8 +4980,8 @@ impl ApplicationHandler<UserEvent> for App {
                         let (px, py) = (px as f32, py as f32);
                         self.popouts[idx]
                             .win
-                            .set_context_menu(px, py, &["Paste", "Close Pop-out"]);
-                        self.popouts[idx].win.set_context_separators(&[]);
+                            .set_context_menu(px, py, &["Copy", "Paste", "Close Pop-out"]);
+                        self.popouts[idx].win.set_context_separators(&[0, 1]);
                         return;
                     }
                     // Left-click: if the menu is open, either activate a row
@@ -4967,8 +4995,18 @@ impl ApplicationHandler<UserEvent> for App {
                             self.popouts[idx].win.clear_context_menu();
                             if let Some(row) = row {
                                 match row {
-                                    // Paste: clipboard -> session bytes.
+                                    // Copy: popped-out terminal selection -> clipboard
+                                    // (whole pane text as fallback).
                                     0 => {
+                                        let text = self
+                                            .popout_selection_text(idx)
+                                            .or_else(|| self.popouts.get(idx).map(|p| p.sess.content().0));
+                                        if let Some(t) = text {
+                                            self.set_clipboard_text(t);
+                                        }
+                                    }
+                                    // Paste: clipboard -> session bytes.
+                                    1 => {
                                         if let Some(text) = self.clipboard_text() {
                                             if !text.is_empty() {
                                                 self.popouts[idx].sess.write(text.into_bytes());

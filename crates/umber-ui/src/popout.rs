@@ -793,6 +793,50 @@ impl PopoutWindow {
         // Everything above draws UNDER the terminal text; the control island
         // and buttons below draw OVER it, so the grid is truly cut out beneath
         // them (a bordered island, no glyphs bleeding through).
+        // Pointer context-menu card + scroll-back overlay pill, pushed BEFORE
+        // the under/post split so they draw BEHIND their labels (label goes
+        // via the text pass that runs after under-verts and before post-quad).
+        let menu_area_desc: Option<(f32, f32, f32, usize)> = if self.context_active {
+            let pad_y = 5.0 * s;
+            let row_h = self.line_px;
+            let menu_h = self.context_rows as f32 * row_h + pad_y * 2.0;
+            verts += push_rquad(&mut bytes, sw, sh,
+                self.context_x, self.context_y,
+                self.context_width, menu_h, PANEL_BORDER_COLOR, 8.0 * s);
+            verts += push_rquad(&mut bytes, sw, sh,
+                self.context_x + s, self.context_y + s,
+                (self.context_width - 2.0 * s).max(1.0),
+                (menu_h - 2.0 * s).max(1.0), EDITOR_PANEL_COLOR, 7.0 * s);
+            if let Some(row) = self.context_hover {
+                verts += push_rquad(&mut bytes, sw, sh,
+                    self.context_x + 4.0 * s,
+                    self.context_y + pad_y + row as f32 * row_h,
+                    (self.context_width - 8.0 * s).max(1.0),
+                    row_h, SELECTION_COLOR, 5.0 * s);
+            }
+            let seps = self.context_separators.clone();
+            for sep in seps {
+                let ly = self.context_y + pad_y + (sep + 1) as f32 * row_h;
+                verts += push_rquad(&mut bytes, sw, sh,
+                    self.context_x + 6.0 * s, ly,
+                    (self.context_width - 12.0 * s).max(1.0),
+                    (1.0 * s).max(1.0), PANEL_BORDER_COLOR, 0.0);
+            }
+            Some((self.context_x + 10.0 * s, self.context_y + 5.0 * s, self.context_width, self.context_rows))
+        } else {
+            None
+        };
+        let mut overlay_top: Option<f32> = None;
+        if let Some(buf) = &self.overlay {
+            let n = buf.layout_runs().count().max(1) as f32;
+            let strip_h = (n + 0.6) * self.line_px;
+            let py = iy + ih - strip_h - self.pad;
+            verts += push_rquad(&mut bytes, sw, sh,
+                ix + self.pad * 0.9, py,
+                (iw - self.pad * 1.8).max(1.0), strip_h,
+                EDITOR_PANEL_COLOR, 6.0 * s);
+            overlay_top = Some(py);
+        }
         let under_verts = verts;
         // Buttons island: a small rounded panel cut into the top-right corner.
         verts += panel(&mut bytes, ch.control);
@@ -835,65 +879,6 @@ impl PopoutWindow {
                 &mut bytes, sw, sh, *bx - grow * 0.5, *by - grow * 0.5,
                 *bw + grow, *bh + grow, c, (*bw + grow) * 0.5,
             );
-        }
-        // Pointer context menu card (post-text so the labels read over glyphs).
-        let menu_area_desc: Option<(f32, f32, f32, usize)> = if self.context_active {
-            let pad_y = 5.0 * s;
-            let row_h = self.line_px;
-            let menu_h = self.context_rows as f32 * row_h + pad_y * 2.0;
-            verts += push_rquad(
-                &mut bytes, sw, sh,
-                self.context_x, self.context_y,
-                self.context_width, menu_h,
-                PANEL_BORDER_COLOR, 8.0 * s,
-            );
-            verts += push_rquad(
-                &mut bytes, sw, sh,
-                self.context_x + s, self.context_y + s,
-                (self.context_width - 2.0 * s).max(1.0),
-                (menu_h - 2.0 * s).max(1.0),
-                EDITOR_PANEL_COLOR, 7.0 * s,
-            );
-            if let Some(row) = self.context_hover {
-                verts += push_rquad(
-                    &mut bytes, sw, sh,
-                    self.context_x + 4.0 * s,
-                    self.context_y + pad_y + row as f32 * row_h,
-                    (self.context_width - 8.0 * s).max(1.0),
-                    row_h,
-                    SELECTION_COLOR, 5.0 * s,
-                );
-            }
-            let seps = self.context_separators.clone();
-            for sep in seps {
-                let ly = self.context_y + pad_y + (sep + 1) as f32 * row_h;
-                verts += push_rquad(
-                    &mut bytes, sw, sh,
-                    self.context_x + 6.0 * s, ly,
-                    (self.context_width - 12.0 * s).max(1.0),
-                    (1.0 * s).max(1.0),
-                    PANEL_BORDER_COLOR, 0.0,
-                );
-            }
-            Some((self.context_x + 10.0 * s, self.context_y + 5.0 * s, self.context_width, self.context_rows))
-        } else {
-            None
-        };
-        // Overlay pill: a dark rounded backdrop behind the pinned scroll-back
-        // input strip. Pushed here into `bytes` so it lands in the same write
-        // as the menu card + chrome (drawn over glyphs, under its label).
-        let mut overlay_top: Option<f32> = None;
-        if let Some(buf) = &self.overlay {
-            let n = buf.layout_runs().count().max(1) as f32;
-            let strip_h = (n + 0.6) * self.line_px;
-            let py = iy + ih - strip_h - self.pad;
-            verts += push_rquad(
-                &mut bytes, sw, sh,
-                ix + self.pad * 0.9, py,
-                (iw - self.pad * 1.8).max(1.0), strip_h,
-                EDITOR_PANEL_COLOR, 6.0 * s,
-            );
-            overlay_top = Some(py);
         }
         if !bytes.is_empty() {
             self.queue.write_buffer(&self.quad_vbuf, 0, &bytes);
