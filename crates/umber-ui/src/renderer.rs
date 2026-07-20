@@ -1356,7 +1356,12 @@ impl Renderer {
             let mut buffer = Buffer::new(&mut self.font_system, metrics);
             buffer.set_wrap(Wrap::None);
             buffer.set_text(&text, &attrs, Shaping::Advanced, None);
-            buffer.set_size(Some(600.0), Some(self.line_px()));
+            // Size for the full multi-row overlay (one line per text row),
+            // not just one line — otherwise cosmic-text clips the tail and
+            // you get a strange half-rendered strip.
+            let row_px = self.line_px();
+            let rows = (text.lines().count() as f32 + 0.6) * row_px;
+            buffer.set_size(Some(900.0), Some(rows));
             buffer.shape_until_scroll(&mut self.font_system, false);
             self.term_overlay = Some((buffer, rect));
         }
@@ -3212,7 +3217,8 @@ impl Renderer {
                 let (bx, by, _, ph) = self.pane_card_px(*rect);
                 let lp = self.line_px();
                 let pd = self.pad_px();
-                let strip_h = lp * 1.4;
+                let n = buffer.layout_runs().count().max(1) as f32;
+                let strip_h = (n + 0.6) * lp;
                 ov_areas.push(TextArea {
                     buffer,
                     left: bx + pd * 1.5,
@@ -4209,12 +4215,13 @@ impl Renderer {
             );
         }
         // Terminal input overlay pill (pinned at the pane's bottom).
-        if let Some((_, rect)) = &self.term_overlay {
+        if let Some((buf, rect)) = &self.term_overlay {
             let (bx, by, pw, ph) = self.pane_card_px(*rect);
             let s = self.scale_factor as f32;
             let lp = self.line_px();
             let pd = self.pad_px();
-            let strip_h = lp * 1.4;
+            let n = buf.layout_runs().count().max(1) as f32;
+            let strip_h = (n + 0.6) * lp;
             sidebar_verts += push_rquad(
                 &mut self.sidebar_bytes,
                 fw,
