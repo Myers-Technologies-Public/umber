@@ -4901,7 +4901,12 @@ impl ApplicationHandler<UserEvent> for App {
                     self.popouts[idx].pointer = (position.x, position.y);
                     let (x, y) = (position.x as f32, position.y as f32);
                     let mut redraw = self.popouts[idx].win.set_hover(x, y);
-                    if self.popouts[idx].win.extend_selection(x, y) {
+                    // Context menu hover follows the row under the pointer.
+                    if self.popouts[idx].win.context_menu_active() {
+                        let row = self.popouts[idx].win.context_menu_row_at(x, y);
+                        self.popouts[idx].win.set_context_menu_hover(row);
+                        redraw = true;
+                    } else if self.popouts[idx].win.extend_selection(x, y) {
                         redraw = true;
                     }
                     if redraw {
@@ -4940,9 +4945,76 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                         }
                     }
-                    // Right-click is reserved for a context menu (don't
-                    // mistake the right-press for a window close — Kill the
-                    // pop-out via double Ctrl+C / corner close button instead).
+                    // The pop-out's single-tile context menu: Paste / Close.
+                    // (No splits / sibling pop-out / rename here — one tile.)
+                    if button == MouseButton::Right && state == ElementState::Pressed {
+                        let (px, py) = self.popouts[idx].pointer;
+                        let (px, py) = (px as f32, py as f32);
+                        self.popouts[idx]
+                            .win
+                            .set_context_menu(px, py, &["Paste", "Close Pop-out"]);
+                        self.popouts[idx].win.set_context_separators(&[]);
+                        return;
+                    }
+                    // Left-click: if the menu is open, either activate a row
+                    // (click on a row) or dismiss it (click outside), both
+                    // swallowing the press so we don't start a drag too.
+                    if button == MouseButton::Left {
+                        if self.popouts[idx].win.context_menu_active() {
+                            let (px, py) = self.popouts[idx].pointer;
+                            let (px, py) = (px as f32, py as f32);
+                            let row = self.popouts[idx].win.context_menu_row_at(px, py);
+                            self.popouts[idx].win.clear_context_menu();
+                            if let Some(row) = row {
+                                match row {
+                                    // Paste: clipboard -> session bytes.
+                                    0 => {
+                                        if let Some(text) = self.clipboard_text() {
+                                            if !text.is_empty() {
+                                                self.popouts[idx].sess.write(text.into_bytes());
+                                            }
+                                        }
+                                    }
+                                    // Close Pop-out.
+                                    _ => {
+                                        let mut p = self.popouts.remove(idx);
+                                        p.sess.shutdown();
+                                        return;
+                                    }
+                                }
+                            }
+                            return;
+                        }
+                        let (px, py) = self.popouts[idx].pointer;
+                        let (px, py) = (px as f32, py as f32);
+                        match state {
+                            ElementState::Pressed => {
+                                self.popouts[idx].win.clear_selection();
+                                if let Some(dir) = self.popouts[idx].win.resize_dir_at(px, py) {
+                                    self.popouts[idx].win.start_resize(dir);
+                                } else if let Some(b) =
+                                    self.popouts[idx].win.window_button_at(px, py)
+                                {
+                                    match b {
+                                        0 => self.popouts[idx].win.set_minimized(),
+                                        1 => self.popouts[idx].win.toggle_maximized(),
+                                        _ => {
+                                            let mut p = self.popouts.remove(idx);
+                                            p.sess.shutdown();
+                                        }
+                                    }
+                                } else if self.popouts[idx].win.in_titlebar(px, py) {
+                                    self.popouts[idx].win.drag();
+                                } else {
+                                    // Anywhere else on the grid: start selecting.
+                                    self.popouts[idx].win.begin_selection(px, py);
+                                }
+                            }
+                            ElementState::Released => {
+                                self.popouts[idx].win.end_selection();
+                            }
+                        }
+                    }
                 }
                 WindowEvent::MouseWheel { delta, .. } => {
                     let lines = match delta {

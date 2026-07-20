@@ -164,6 +164,15 @@ pub struct PopoutWindow {
     /// Per-button hover animation progress (0=idle, 1=hovered).
     win_btn_anim: [f32; 3],
     anim_prev: Instant,
+    // Pointer context menu (mostly a port of the main renderer's menu cards).
+    context_buffer: Buffer,
+    context_active: bool,
+    context_x: f32,
+    context_y: f32,
+    context_width: f32,
+    context_rows: usize,
+    context_hover: Option<usize>,
+    context_separators: Vec<usize>,
 }
 
 impl PopoutWindow {
@@ -295,6 +304,11 @@ impl PopoutWindow {
             mapped_at_creation: false,
         });
 
+        // Construct buffers that need `font_system` *before* it is moved into
+        // the struct (it is borrowed again post-move otherwise).
+        let mut context_buffer = Buffer::new(&mut font_system, Metrics::new(BASE_FONT, BASE_LINE));
+        context_buffer.set_wrap(Wrap::None);
+
         let mut this = Self {
             window,
             instance,
@@ -319,6 +333,14 @@ impl PopoutWindow {
             sel: None,
             selecting: false,
             overlay: None,
+            context_buffer,
+            context_active: false,
+            context_x: 0.0,
+            context_y: 0.0,
+            context_width: 0.0,
+            context_rows: 0,
+            context_hover: None,
+            context_separators: Vec::new(),
             win_btn_anim: [0.0; 3],
             anim_prev: Instant::now(),
         };
@@ -535,6 +557,72 @@ impl PopoutWindow {
     /// grid cursor, mirroring `Renderer::set_term_pane_content` so a pop-out
     /// reads identical to the in-app tile — colours, suggested-code styling,
     /// and a blinking-set cursor block — rather than plain monochrome text.
+    /// Open the pointer context menu at `(x, y)` with the given row labels.
+    pub fn set_context_menu(&mut self, x: f32, y: f32, labels: &[&str]) {
+        let pad = 10.0 * self.scale;
+        let row_h = self.line_px;
+        let max_chars = labels.iter().map(|s| s.chars().count()).max().unwrap_or(1);
+        let width = ((max_chars as f32 + 1.0) * self.cell_w + pad * 2.0).max(150.0 * self.scale);
+        let height = labels.len() as f32 * row_h + pad;
+        self.context_x = x.clamp(4.0 * self.scale, (self.config.width as f32 - width - 4.0 * self.scale).max(4.0 * self.scale));
+        self.context_y = y.clamp(4.0 * self.scale, (self.config.height as f32 - height - 4.0 * self.scale).max(4.0 * self.scale));
+        self.context_width = width;
+        self.context_rows = labels.len();
+        self.context_hover = None;
+        self.context_separators.clear();
+        self.context_active = !labels.is_empty();
+        let text = labels.join("\n");
+        self.context_buffer.set_text(&text, &Attrs::new().family(Family::Monospace), Shaping::Advanced, None);
+        self.context_buffer.set_size(Some(width - pad * 2.0), Some(height));
+        self.context_buffer.shape_until_scroll(&mut self.font_system, false);
+        self.window.request_redraw();
+    }
+
+    pub fn clear_context_menu(&mut self) {
+        if self.context_active {
+            self.context_active = false;
+            self.context_hover = None;
+            self.window.request_redraw();
+        }
+    }
+
+    /// Set the group-divider rows for the open menu (after a `set_context_menu`).
+    pub fn set_context_separators(&mut self, seps: &[usize]) {
+        self.context_separators.clear();
+        self.context_separators.extend_from_slice(seps);
+        self.window.request_redraw();
+    }
+
+    pub fn context_menu_active(&self) -> bool {
+        self.context_active
+    }
+
+    pub fn context_menu_row_at(&self, x: f32, y: f32) -> Option<usize> {
+        if !self.context_active {
+            return None;
+        }
+        let pad_y = 5.0 * self.scale;
+        let row_h = self.line_px;
+        let height = self.context_rows as f32 * row_h + pad_y * 2.0;
+        if x < self.context_x
+            || x > self.context_x + self.context_width
+            || y < self.context_y
+            || y > self.context_y + height
+        {
+            return None;
+        }
+        let row = ((y - self.context_y - pad_y) / row_h).floor().max(0.0) as usize;
+        (row < self.context_rows).then_some(row)
+    }
+
+    pub fn set_context_menu_hover(&mut self, hover: Option<usize>) -> bool {
+        if self.context_hover == hover {
+            return false;
+        }
+        self.context_hover = hover;
+        true
+    }
+
     /// Pinned input overlay: `Some(text)` shows it at the island bottom, None
     /// clears it. Useful while the user is scrolled away from the prompt.
     pub fn set_overlay_text(&mut self, text: Option<String>) {
@@ -748,6 +836,65 @@ impl PopoutWindow {
                 *bw + grow, *bh + grow, c, (*bw + grow) * 0.5,
             );
         }
+        // Pointer context menu card (post-text so the labels read over glyphs).
+        let menu_area_desc: Option<(f32, f32, f32, usize)> = if self.context_active {
+            let pad_y = 5.0 * s;
+            let row_h = self.line_px;
+            let menu_h = self.context_rows as f32 * row_h + pad_y * 2.0;
+            verts += push_rquad(
+                &mut bytes, sw, sh,
+                self.context_x, self.context_y,
+                self.context_width, menu_h,
+                PANEL_BORDER_COLOR, 8.0 * s,
+            );
+            verts += push_rquad(
+                &mut bytes, sw, sh,
+                self.context_x + s, self.context_y + s,
+                (self.context_width - 2.0 * s).max(1.0),
+                (menu_h - 2.0 * s).max(1.0),
+                EDITOR_PANEL_COLOR, 7.0 * s,
+            );
+            if let Some(row) = self.context_hover {
+                verts += push_rquad(
+                    &mut bytes, sw, sh,
+                    self.context_x + 4.0 * s,
+                    self.context_y + pad_y + row as f32 * row_h,
+                    (self.context_width - 8.0 * s).max(1.0),
+                    row_h,
+                    SELECTION_COLOR, 5.0 * s,
+                );
+            }
+            let seps = self.context_separators.clone();
+            for sep in seps {
+                let ly = self.context_y + pad_y + (sep + 1) as f32 * row_h;
+                verts += push_rquad(
+                    &mut bytes, sw, sh,
+                    self.context_x + 6.0 * s, ly,
+                    (self.context_width - 12.0 * s).max(1.0),
+                    (1.0 * s).max(1.0),
+                    PANEL_BORDER_COLOR, 0.0,
+                );
+            }
+            Some((self.context_x + 10.0 * s, self.context_y + 5.0 * s, self.context_width, self.context_rows))
+        } else {
+            None
+        };
+        // Overlay pill: a dark rounded backdrop behind the pinned scroll-back
+        // input strip. Pushed here into `bytes` so it lands in the same write
+        // as the menu card + chrome (drawn over glyphs, under its label).
+        let mut overlay_top: Option<f32> = None;
+        if let Some(buf) = &self.overlay {
+            let n = buf.layout_runs().count().max(1) as f32;
+            let strip_h = (n + 0.6) * self.line_px;
+            let py = iy + ih - strip_h - self.pad;
+            verts += push_rquad(
+                &mut bytes, sw, sh,
+                ix + self.pad * 0.9, py,
+                (iw - self.pad * 1.8).max(1.0), strip_h,
+                EDITOR_PANEL_COLOR, 6.0 * s,
+            );
+            overlay_top = Some(py);
+        }
         if !bytes.is_empty() {
             self.queue.write_buffer(&self.quad_vbuf, 0, &bytes);
         }
@@ -767,42 +914,48 @@ impl PopoutWindow {
             default_color: Color::rgb(220, 214, 201),
             custom_glyphs: &[],
         };
-        let areas = if let Some(buf) = &self.overlay {
-            // Pill: dark rounded backdrop behind the overlay labels at the
-            // island bottom, then push its text area.
-            let n = buf.layout_runs().count().max(1) as f32;
-            let strip_h = (n + 0.6) * self.line_px;
-            let px = ix + self.pad * 0.9;
-            let py = iy + ih - strip_h - self.pad;
-            verts += push_rquad(
-                &mut bytes,
-                sw,
-                sh,
-                px,
-                py,
-                (iw - self.pad * 1.8).max(1.0),
-                strip_h,
-                EDITOR_PANEL_COLOR,
-                6.0 * s,
-            );
-            let overlay_area = TextArea {
+        // NOTE: the overlay pill and the menu card were already pushed into
+        // `bytes` above (they had to be written before the quad vbuf upload).
+        // The label TextArea for the menu must be appended here, where the
+        // areas vec is assembled for glyphon.
+        let mut areas = Vec::with_capacity(3);
+        if let Some(buf) = &self.overlay {
+            areas.push(TextArea {
                 buffer: buf,
                 left: ix + self.pad * 1.5,
-                top: py,
+                top: overlay_top.unwrap_or(iy + ih),
                 scale: 1.0,
                 bounds: TextBounds {
                     left: ix as i32,
-                    top: py as i32,
+                    top: (overlay_top.unwrap_or(iy + ih)) as i32,
                     right: (ix + iw) as i32,
                     bottom: (iy + ih) as i32,
                 },
                 default_color: Color::rgb(232, 232, 238),
                 custom_glyphs: &[],
-            };
-            vec![term_area, overlay_area]
-        } else {
-            vec![term_area]
-        };
+            });
+        }
+        // NOTE: popout's overlay pill was previously pushed here in `bytes`.
+        // It is now drawn above as part of the menu+pill batch so we can do a
+        // single write_buffer before the text pass (avoiding the push_rquad
+        // borrow conflict against `self.overlay`).
+        if let Some((mx, my, mw, _)) = menu_area_desc {
+            areas.push(TextArea {
+                buffer: &self.context_buffer,
+                left: mx,
+                top: my,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: (mx - 10.0 * s) as i32,
+                    top: my as i32,
+                    right: (mx + mw) as i32,
+                    bottom: self.config.height as i32,
+                },
+                default_color: Color::rgb(226, 219, 205),
+                custom_glyphs: &[],
+            });
+        }
+        areas.push(term_area);
         if self
             .text_renderer
             .prepare(
