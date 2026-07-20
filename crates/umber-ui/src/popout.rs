@@ -146,6 +146,16 @@ struct Chrome {
 /// One tiled terminal inside a popup (mirrors renderer.rs' TermPaneView —
 /// kept here so the popup can host real splits reusing the data shape the
 /// in-app pane system already uses).
+/// Result of a key event handled by the in-popout rename modal.
+pub enum RenameOutcome {
+    /// Enter: store `name` (empty clears) on tile `id`.
+    Commit { id: u64, name: String },
+    /// Esc: cancel without changing the name.
+    Cancelled,
+    /// Text input / Backspace: consumed by the modal, no commit yet.
+    Consumed,
+}
+
 pub struct PopoutTile {
     pub id: u64,
     pub rect: [f32; 4],
@@ -212,6 +222,11 @@ pub struct PopoutWindow {
     context_rows: usize,
     context_hover: Option<usize>,
     context_separators: Vec<usize>,
+    // Local rename overlay state (mirrors the App's View::PaneRename, but
+    // entirely within the pop-out so the modal lives inside this window and
+    // doesn't盖上 the main editor).
+    rename_tile: Option<u64>,
+    rename_input: String,
 }
 
 impl PopoutWindow {
@@ -387,6 +402,8 @@ impl PopoutWindow {
             context_rows: 0,
             context_hover: None,
             context_separators: Vec::new(),
+            rename_tile: None,
+            rename_input: String::new(),
             win_btn_anim: [0.0; 3],
             anim_prev: Instant::now(),
         };
@@ -641,6 +658,69 @@ impl PopoutWindow {
 
     pub fn context_menu_active(&self) -> bool {
         self.context_active
+    }
+
+    /// Begin the in-popout rename modal for `tile_id` (prefill its existing
+    /// label, if any). Captures keyboard while `rename_tile.is_some()`.
+    pub fn open_rename(&mut self, tile_id: u64, current_name: Option<String>) {
+        self.rename_tile = Some(tile_id);
+        self.rename_input = current_name.unwrap_or_default();
+        self.window.request_redraw();
+    }
+
+    pub fn is_rename_active(&self) -> bool {
+        self.rename_tile.is_some()
+    }
+
+    /// Handle a key event for the rename modal. Returns Some(true) on Enter
+    /// (with `id` set + the trimmed name in `self.rename_input` for the caller
+    /// to commit), Some(false) on Escape (cancel), None when the key wasn't a
+    /// rename terminator and was consumed (text input / Backspace).
+    pub fn rename_handle_key(&mut self, event: &winit::event::KeyEvent) -> Option<RenameOutcome> {
+        use winit::event::ElementState;
+        use winit::keyboard::{Key, NamedKey};
+        if event.state != ElementState::Pressed || self.rename_tile.is_none() {
+            return None;
+        }
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.rename_tile = None;
+                self.rename_input.clear();
+                self.window.request_redraw();
+                Some(RenameOutcome::Cancelled)
+            }
+            Key::Named(NamedKey::Enter) => {
+                let id = self.rename_tile.take();
+                let name = self.rename_input.trim().to_string();
+                self.rename_input.clear();
+                self.window.request_redraw();
+                id.map(|tid| RenameOutcome::Commit { id: tid, name })
+            }
+            Key::Named(NamedKey::Backspace) => {
+                self.rename_input.pop();
+                self.window.request_redraw();
+                Some(RenameOutcome::Consumed)
+            }
+            _ => {
+                if let Some(t) = &event.text {
+                    let mut changed = false;
+                    for ch in t.chars() {
+                        if !ch.is_control() {
+                            self.rename_input.push(ch);
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        self.window.request_redraw();
+                        Some(RenameOutcome::Consumed)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+        }
     }
 
     pub fn context_menu_row_at(&self, x: f32, y: f32) -> Option<usize> {

@@ -508,6 +508,7 @@ fn main() -> ExitCode {
         next_pane_term: 1,
         popouts: Vec::new(),
         pane_drag: None,
+        popout_drag: None,
         top_island_press: None,
         top_window_dragging: false,
         pane_div_hot: None,
@@ -781,6 +782,8 @@ struct App {
     next_pane_term: u64,
     /// Dragging a pane divider: (split path, is-horizontal-split).
     pane_drag: Option<(u32, bool)>,
+    /// Dragging a pane divider inside a popout: (popout_idx, split path, is horizontal split).
+    popout_drag: Option<(usize, u32, bool)>,
     /// Top-island press in progress: (hit tab index, press x, press y). A quick
     /// click activates the activity item; a drag past slop hands the move to
     /// the OS borderless window-drag. Always draggable, no matter the panels.
@@ -5098,6 +5101,19 @@ impl ApplicationHandler<UserEvent> for App {
                     } else if self.popouts[idx].win.extend_selection(x, y) {
                         redraw = true;
                     }
+                    // Dragging a pane divider inside the popout retiles live.
+                    if let Some((didx, path, horiz)) = self.popout_drag {
+                        if didx == idx {
+                            let (ix, iy, iw, ih) = self.popouts[idx].win.term_island_px();
+                            let pos = if horiz {
+                                ((x - ix) / iw.max(1.0)).clamp(0.05, 0.95)
+                            } else {
+                                ((y - iy) / ih.max(1.0)).clamp(0.05, 0.95)
+                            };
+                            self.popouts[idx].pane_tree.drag(path, pos);
+                            self.popout_sync_panes(idx);
+                        }
+                    }
                     if redraw {
                         self.popouts[idx].win.request_redraw();
                     }
@@ -5278,6 +5294,11 @@ impl ApplicationHandler<UserEvent> for App {
                                             for (_, mut s) in p.pane_terms.drain(..) { s.shutdown(); }
                                         }
                                     }
+                                } else if let Some((path, horiz)) =
+                                    self.popouts[idx].win.pane_divider_at(px, py)
+                                {
+                                    // Drag a pane divider inside the popout to retile.
+                                    self.popout_drag = Some((idx, path, horiz));
                                 } else if self.popouts[idx].win.in_titlebar(px, py) {
                                     self.popouts[idx].win.drag();
                                 } else {
@@ -5297,6 +5318,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 }
                             }
                             ElementState::Released => {
+                                self.popout_drag = None;
                                 self.popouts[idx].win.end_selection();
                             }
                         }

@@ -11,7 +11,7 @@
 mod popout;
 mod renderer;
 
-pub use popout::PopoutWindow;
+pub use popout::{PopoutWindow, RenameOutcome};
 pub use renderer::{
     OverlaySpec, PaneDividerSpec, Renderer, ScrollbarGeom, ScrollbarInfo, SelSpan,
     TerminalTextSpan, GIT_ADDED_COLOR, GIT_DELETED_COLOR, GIT_MODIFIED_COLOR,
