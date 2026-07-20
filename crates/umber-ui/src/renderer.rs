@@ -109,7 +109,7 @@ const SIDEBAR_TAB_PITCH: f32 = 1.4;
 /// Expanded activity-bar width (icons + text labels).
 const SIDEBAR_W_EXPANDED: f32 = 208.0;
 /// Tab labels shown when expanded (aligned to the glyph rows).
-const SIDEBAR_LABELS: &str = "Palette\nFind\nAgents\nTerminal\nSettings";
+const SIDEBAR_LABELS: &str = "Palette\nFind\nAgents\nTerminal\nSettings\nModules";
 const SIDEBAR_HOVER_COLOR: [f32; 4] = [1.0, 0.96, 0.88, 0.075];
 const SIDEBAR_ACTIVE_CARD_COLOR: [f32; 4] = [0.095, 0.055, 0.035, 0.72];
 /// Floating-shell surfaces. These deliberately create a new silhouette rather

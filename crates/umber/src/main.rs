@@ -3990,6 +3990,7 @@ impl App {
             "◉ Agents",
             "▣ Terminal",
             "⚙ Settings",
+            "▦ Modules",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -4000,6 +4001,7 @@ impl App {
             View::Agents | View::AgentPrompt | View::AgentThread => 2,
             View::Editor if self.term_focused => 3,
             View::Settings => 4,
+            View::Modules => 5,
             _ => usize::MAX,
         };
         if let Some(r) = self.renderer.as_mut() {
@@ -4017,6 +4019,7 @@ impl App {
                 self.terminal_toggle();
             }
             4 => self.open_settings(),
+            5 => self.open_modules(),
             _ => {}
         }
     }
