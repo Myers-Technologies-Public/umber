@@ -51,7 +51,7 @@ const WHEEL_LINES: f32 = 3.0;
 const BASE_LINE_PX: f64 = 20.0;
 
 /// Number of rows on the settings page (drives selection clamping).
-const SETTINGS_ROWS: usize = 7;
+const SETTINGS_ROWS: usize = 8;
 
 /// Cross-thread wakeups from background machinery (P3: the terminal's PTY
 /// reader thread). Delivered through winit's user-event channel.
@@ -2269,6 +2269,10 @@ impl App {
                     ("Overlay scrollbar".to_string(), onoff(c.scrollbar)),
                     ("Latency HUD".to_string(), onoff(c.latency_hud)),
                     ("Open terminal".to_string(), "\u{2192} Ctrl+J".to_string()),
+                    (
+                        "Manage modules\u{2026}".to_string(),
+                        "\u{2192} Enter".to_string(),
+                    ),
                 ];
                 Some(OverlaySpec {
                     title: Some("Preferences \u{2014} Settings".to_string()),
@@ -3216,8 +3220,11 @@ impl App {
                 self.refresh_overlay();
             }
             Key::Named(NamedKey::Enter) => {
-                // Enter toggles booleans; numeric rows ignore it.
-                if self.settings_sel >= 3 {
+                // Last row opens the Modules page; boolean rows toggle;
+                // numeric rows ignore Enter.
+                if self.settings_sel == SETTINGS_ROWS - 1 {
+                    self.open_modules();
+                } else if self.settings_sel >= 3 {
                     self.settings_adjust(1);
                 }
             }
