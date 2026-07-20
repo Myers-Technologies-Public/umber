@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop as PtyEventLoop, EventLoopSender, Msg, State};
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config as TermConfig, Term};
@@ -228,6 +228,7 @@ fn resolve_color(color: Color, colors: &alacritty_terminal::term::color::Colors)
 /// A live terminal: shell child, PTY reader thread, shared parsed grid.
 pub struct TerminalSession<N: TermNotifier> {
     term: Arc<FairMutex<Term<EventProxy<N>>>>,
+    notifier: N,
     sender: EventLoopSender,
     dirty: Arc<AtomicBool>,
     exited: Arc<AtomicBool>,
@@ -235,7 +236,9 @@ pub struct TerminalSession<N: TermNotifier> {
 }
 
 impl<N: TermNotifier> TerminalSession<N> {
-    /// Spawn `$SHELL` (fallback `/bin/sh`) in a PTY of `cols` x `lines` cells.
+    /// Spawn the user's default shell in a PTY of `cols` x `lines` cells: on
+    /// unix `$SHELL` (fallback `/bin/sh`), on Windows `%ComSpec%` (fallback
+    /// `cmd.exe`) driven over ConPTY.
     pub fn spawn(
         notifier: N,
         cols: usize,
@@ -257,10 +260,13 @@ impl<N: TermNotifier> TerminalSession<N> {
         shell: Option<(String, Vec<String>)>,
     ) -> io::Result<Self> {
         let (program, args) = shell.unwrap_or_else(|| {
-            (
-                std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
-                Vec::new(),
-            )
+            // Default shell is platform-specific. alacritty_terminal drives the
+            // Windows program over ConPTY; unix keeps the prior $SHELL behavior.
+            #[cfg(windows)]
+            let program = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string());
+            #[cfg(not(windows))]
+            let program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+            (program, Vec::new())
         });
         let options = PtyOptions {
             shell: Some(Shell::new(program, args)),
@@ -278,7 +284,7 @@ impl<N: TermNotifier> TerminalSession<N> {
         let exited = Arc::new(AtomicBool::new(false));
         let writer = Arc::new(Mutex::new(None));
         let proxy = EventProxy {
-            notifier,
+            notifier: notifier.clone(),
             dirty: dirty.clone(),
             exited: exited.clone(),
             writer: writer.clone(),
@@ -303,11 +309,28 @@ impl<N: TermNotifier> TerminalSession<N> {
 
         Ok(Self {
             term,
+            notifier,
             sender,
             dirty,
             exited,
             io_thread,
         })
+    }
+
+    /// Scroll this terminal's viewport within its scrollback by `lines`
+    /// (positive = toward older output). scroll_display fires no parser
+    /// wakeup, so re-arm the dirty flag and poke the UI to repaint the new
+    /// viewport through the normal terminal-wakeup path.
+    pub fn scroll(&self, lines: i32) {
+        if lines == 0 {
+            return;
+        }
+        {
+            let mut term = self.term.lock();
+            term.scroll_display(Scroll::Delta(lines));
+        }
+        self.dirty.store(true, Ordering::Release);
+        self.notifier.wake();
     }
 
     /// Queue `bytes` for the PTY (keyboard input, paste, control bytes).

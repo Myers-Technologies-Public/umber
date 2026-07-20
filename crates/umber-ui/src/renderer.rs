@@ -88,7 +88,7 @@ const THUMB_COLOR: [f32; 4] = [0.60, 0.56, 0.50, 0.45];
 /// Selection highlight fill (straight-alpha RGBA). Muted grey-blue, translucent
 /// so the glyphs drawn over it stay legible \u{2014} deliberately NOT the rust
 /// cursor accent.
-const SELECTION_COLOR: [f32; 4] = [0.757, 0.373, 0.235, 0.25];
+const SELECTION_COLOR: [f32; 4] = [0.86, 0.47, 0.30, 0.6];
 
 /// Terminal panel (P3): height fraction of the window, border colors (the
 /// border doubles as the focus cue), cursor cell fill, and grid text color.
@@ -115,6 +115,9 @@ const SIDEBAR_ACTIVE_CARD_COLOR: [f32; 4] = [0.095, 0.055, 0.035, 0.72];
 /// Floating-shell surfaces. These deliberately create a new silhouette rather
 /// than recoloring the old full-bleed columns.
 const SHELL_GAP: f32 = 8.0;
+/// Gap between adjacent floating panes — the visual width of the draggable
+/// divider. Thinner than the outer SHELL_GAP so tiles sit close together.
+const PANE_GAP: f32 = 3.0;
 const SHELL_RADIUS: f32 = 12.0;
 // Quad colors are linear (the swapchain is sRGB), hence the deliberately
 // small values: these display as warm near-black rather than middle grey.
@@ -308,6 +311,12 @@ struct TermPaneView {
     buffer: Buffer,
     cursor: Option<(usize, usize)>,
     focused: bool,
+    /// Active drag-selection in cell coords: `(anchor (row,col), head (row,col))`,
+    /// head inclusive. `None` = no highlight. Survives content updates because
+    /// the struct is reused by id in `set_term_pane_content`.
+    sel: Option<((usize, usize), (usize, usize))>,
+    /// Focus-ring cross-fade progress (0=unfocused, 1=focused).
+    focus_anim: f32,
 }
 
 /// One tiled read-view document tile (drag-a-tab docking).
@@ -318,6 +327,8 @@ struct DocPaneView {
     focused: bool,
     /// Shaped text cache: refresh calls with unchanged windows are free.
     text: String,
+    /// Focus-ring cross-fade progress (0=unfocused, 1=focused).
+    focus_anim: f32,
 }
 
 /// Divider hit-test spec from the app's pane tree, normalized to the
@@ -348,6 +359,16 @@ pub struct ScrollbarGeom {
 /// raw `f32` bytes in the `[pos.x, pos.y, r, g, b, a]` layout the quad pipeline
 /// expects. Pixel coords are converted to clip space here. Returns the vertex
 /// count added. `out` is a reused buffer \u{2014} no per-frame heap allocation.
+/// Linear-interpolate two RGBA colors.
+fn lerp4(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
+    [
+        a[0] + (b[0] - a[0]) * t,
+        a[1] + (b[1] - a[1]) * t,
+        a[2] + (b[2] - a[2]) * t,
+        a[3] + (b[3] - a[3]) * t,
+    ]
+}
+
 fn push_quad(
     out: &mut Vec<u8>,
     fw: f32,
@@ -555,6 +576,9 @@ pub struct Renderer {
     context_rows: usize,
     context_hover: Option<usize>,
     overlay_active: bool,
+    /// Open/close fade progress (0=hidden, 1=shown) and its target.
+    overlay_anim: f32,
+    overlay_target: f32,
     overlay_has_input: bool,
     overlay_has_title: bool,
     overlay_has_hint: bool,
@@ -636,6 +660,15 @@ pub struct Renderer {
     /// Tiled panes (Ghostty-style splits). `None` = the editor alone fills
     /// the content area and all legacy geometry applies unchanged.
     editor_pane: Option<[f32; 4]>,
+    /// Whether any tiled-pane layout is active — independent of whether the
+    /// editor still holds a tile (it can be closed/hidden while terminals fill).
+    tiling: bool,
+    /// Which window-control button (0=min, 1=max, 2=close) the pointer is over.
+    window_btn_hover: Option<usize>,
+    /// Per-button hover animation progress (0=idle, 1=hovered), eased per frame.
+    win_btn_anim: [f32; 3],
+    /// Previous frame instant, for animation dt.
+    anim_prev: Instant,
     term_panes: Vec<TermPaneView>,
     /// Divider hit-test specs: (split path, is-horizontal-split, normalized
     /// line rect within the content area).
@@ -643,6 +676,9 @@ pub struct Renderer {
     doc_panes: Vec<DocPaneView>,
     /// The editor tile owns focus (drives its accent ring when tiled).
     editor_pane_focused: bool,
+    /// Editor focus-ring cross-fade + selection fade-in progress.
+    editor_focus_anim: f32,
+    sel_anim: f32,
     /// Drag-to-dock drop preview, physical px (drawn over the text).
     drop_preview: Option<(f32, f32, f32, f32)>,
     term_text: String,
@@ -654,6 +690,10 @@ pub struct Renderer {
     sidebar_expanded: bool,
     /// Tab under the pointer (hover highlight), and the active view's tab.
     sidebar_hover: Option<usize>,
+    /// Eased hover fade + last-hovered row (so it fades out, not snaps).
+    sidebar_hover_anim: f32,
+    /// Eased row index for the sidebar hover pill (slides between rows).
+    sidebar_pill_row: f32,
     sidebar_active: Option<usize>,
     /// Text labels column, shown when expanded.
     sidebar_labels_buffer: Buffer,
@@ -676,6 +716,9 @@ pub struct Renderer {
     tab_active: usize,
     /// Action under the pointer in the top strip (hover wash).
     tabstrip_hover: Option<usize>,
+    tabstrip_hover_anim: f32,
+    /// Eased (x0, x1) for the tab hover pill (slides between tabs).
+    tabstrip_pill: (f32, f32),
 
     /// The last document window text, kept so a scale change can re-shape it
     /// without the caller re-supplying it.
@@ -730,12 +773,24 @@ impl Renderer {
             .create_surface(window.clone())
             .expect("create a wgpu surface");
         let swapchain_format = TextureFormat::Bgra8UnormSrgb;
+        // Prefer a low-latency present mode so interactive resize tracks the
+        // pointer instead of serializing behind vsync (Fifo felt very laggy).
+        let present_mode = {
+            let modes = surface.get_capabilities(&adapter).present_modes;
+            if modes.contains(&PresentMode::Mailbox) {
+                PresentMode::Mailbox
+            } else if modes.contains(&PresentMode::Immediate) {
+                PresentMode::Immediate
+            } else {
+                PresentMode::Fifo
+            }
+        };
         let surface_config = SurfaceConfiguration {
             usage: TextureUsages::RENDER_ATTACHMENT,
             format: swapchain_format,
             width: physical_size.width.max(1),
             height: physical_size.height.max(1),
-            present_mode: PresentMode::Fifo,
+            present_mode,
             alpha_mode: CompositeAlphaMode::Opaque,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -966,6 +1021,8 @@ impl Renderer {
             gutter_digits: 0,
             gutter_measured_w: 0.0,
             overlay_active: false,
+            overlay_anim: 0.0,
+            overlay_target: 0.0,
             overlay_left,
             overlay_right,
             overlay_input,
@@ -1015,18 +1072,26 @@ impl Renderer {
             term_maximized: false,
             term_split_frac_override: None,
             editor_pane: None,
+            tiling: false,
+            window_btn_hover: None,
+            win_btn_anim: [0.0; 3],
+            anim_prev: Instant::now(),
             term_panes: Vec::new(),
             pane_divs: Vec::new(),
             doc_panes: Vec::new(),
             editor_pane_focused: true,
+            editor_focus_anim: 1.0,
+            sel_anim: 0.0,
             drop_preview: None,
             term_text: String::new(),
             term_spans: Vec::new(),
             term_cursor: None,
             term_buffer,
             sidebar_enabled: true,
-            sidebar_expanded: true,
+            sidebar_expanded: false,
             sidebar_hover: None,
+            sidebar_hover_anim: 0.0,
+            sidebar_pill_row: 0.0,
             sidebar_active: None,
             sidebar_labels_buffer,
             sidebar_tabs_text: String::new(),
@@ -1040,6 +1105,8 @@ impl Renderer {
             tab_layout_px: Vec::new(),
             tab_active: 0,
             tabstrip_hover: None,
+            tabstrip_hover_anim: 0.0,
+            tabstrip_pill: (0.0, 0.0),
             doc_text: String::new(),
             syntax: SyntaxSet::new(),
             doc_lang: None,
@@ -1228,7 +1295,9 @@ impl Renderer {
         let fw = self.surface_config.width as f32;
         let fh = self.surface_config.height as f32;
         let x = self.sidebar_w() + gap;
-        let y = self.doc_top_base() - self.pad_px() * 0.45;
+        // Panels fill to the top; the command + controls islands float over
+        // them in the draggable strip (mirrors the pop-out layout).
+        let y = gap;
         (x, y, (fw - x - gap).max(1.0), (fh - gap - y).max(1.0))
     }
 
@@ -1236,7 +1305,7 @@ impl Renderer {
     /// content area, deflated by half a shell gap so tiles visibly separate.
     fn pane_card_px(&self, r: [f32; 4]) -> (f32, f32, f32, f32) {
         let (cx, cy, cw, ch) = self.content_area();
-        let g = SHELL_GAP * self.scale_factor as f32 * 0.5;
+        let g = PANE_GAP * self.scale_factor as f32 * 0.5;
         (
             cx + r[0] * cw + g,
             cy + r[1] * ch + g,
@@ -1298,7 +1367,9 @@ impl Renderer {
     pub fn doc_top(&self) -> f32 {
         if self.editor_pane.is_some() {
             let (_, py, ..) = self.editor_card_rect();
-            py + self.pad_px() * 0.45
+            // Keep the editor text below the floating command strip so no code
+            // line is hidden under it, even though the card fills to the top.
+            (py + self.pad_px() * 0.45).max(self.doc_top_base())
         } else {
             self.doc_top_base()
         }
@@ -1966,6 +2037,7 @@ impl Renderer {
     ) {
         self.editor_pane = editor.map(|(r, _)| r);
         self.editor_pane_focused = editor.map(|(_, f)| f).unwrap_or(true);
+        self.tiling = editor.is_some() || !terms.is_empty() || !docs.is_empty();
         self.pane_divs = divs.to_vec();
         self.doc_panes
             .retain(|p| docs.iter().any(|(id, ..)| *id == p.id));
@@ -1983,6 +2055,7 @@ impl Renderer {
                     buffer,
                     focused,
                     text: String::new(),
+                    focus_anim: if focused { 1.0 } else { 0.0 },
                 });
             }
         }
@@ -2011,6 +2084,8 @@ impl Renderer {
                     buffer,
                     cursor: None,
                     focused,
+                    sel: None,
+                    focus_anim: if focused { 1.0 } else { 0.0 },
                 });
             }
         }
@@ -2037,19 +2112,130 @@ impl Renderer {
 
     /// True when Ghostty-style tiling is active.
     pub fn panes_active(&self) -> bool {
-        self.editor_pane.is_some()
+        self.tiling
+    }
+
+    /// True when `(x, y)` (physical px) is over the command-bar strip — the
+    /// borderless window's drag handle (doubles as the custom title bar).
+    pub fn in_command_bar(&self, x: f32, y: f32) -> bool {
+        let s = self.scale_factor as f32;
+        let gap = SHELL_GAP * s;
+        let ts_h = self.tabstrip_h();
+        let dock_x = self.sidebar_w() + gap;
+        let (island_x, ..) = self.window_controls_island();
+        x >= dock_x && x <= island_x - gap && y >= gap && y <= gap + ts_h
+    }
+
+    /// The window-controls island: its own rounded panel (min/max/close) at
+    /// the top-right, detached from the command bar. Physical px.
+    pub fn window_controls_island(&self) -> (f32, f32, f32, f32) {
+        let s = self.scale_factor as f32;
+        let gap = SHELL_GAP * s;
+        let ts_h = self.tabstrip_h();
+        let d = (ts_h * 0.5).max(12.0 * s);
+        let bpad = 8.0 * s;
+        let bspace = 8.0 * s;
+        let w = 3.0 * d + 2.0 * bspace + 2.0 * bpad;
+        let x = self.surface_config.width as f32 - gap - w;
+        (x, gap, w, ts_h)
+    }
+
+    /// The three control button rects (min, max, close), inside the island.
+    pub fn window_button_rects(&self) -> [(f32, f32, f32, f32); 3] {
+        let s = self.scale_factor as f32;
+        let ts_h = self.tabstrip_h();
+        let d = (ts_h * 0.5).max(12.0 * s);
+        let bpad = 8.0 * s;
+        let bspace = 8.0 * s;
+        let (ix, iy, _, ih) = self.window_controls_island();
+        let by = iy + (ih - d) * 0.5;
+        let b0 = ix + bpad;
+        let b1 = b0 + d + bspace;
+        let b2 = b1 + d + bspace;
+        [(b0, by, d, d), (b1, by, d, d), (b2, by, d, d)]
+    }
+
+    /// Which window-control button `(x, y)` hits (0=min, 1=max, 2=close).
+    pub fn window_button_at(&self, x: f32, y: f32) -> Option<usize> {
+        for (i, (bx, by, bw, bh)) in self.window_button_rects().iter().enumerate() {
+            if x >= *bx && x <= bx + bw && y >= *by && y <= by + bh {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Set which window button is hovered; returns true if it changed (repaint).
+    pub fn set_window_button_hover(&mut self, h: Option<usize>) -> bool {
+        if self.window_btn_hover != h {
+            self.window_btn_hover = h;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether the editor surface should be drawn: always in the legacy
+    /// single-pane layout; when tiling, only while it still holds a tile.
+    fn editor_visible(&self) -> bool {
+        self.editor_pane.is_some() || !self.tiling
     }
 
     /// Terminal pane grid `(cols, rows)` for PTY sizing.
+    /// Map a physical pixel to `(tile id, row, col)` when it lands inside a
+    /// terminal tile's text area. Row/col clamp to the tile grid so a drag past
+    /// the edge resolves to the nearest cell (inverse of `term_pane_grid`).
+    pub fn term_pane_cell_at(&self, x: f32, y: f32) -> Option<(u64, usize, usize)> {
+        let (cw, lh, ppad) = (self.cell_w(), self.line_px(), self.pad_px());
+        for p in &self.term_panes {
+            let (px, py, pw, ph) = self.pane_card_px(p.rect);
+            if x >= px && x < px + pw && y >= py && y < py + ph {
+                let ct = (py + ppad).max(self.doc_top_base());
+                let cols = ((pw - ppad * 2.0) / cw).floor().max(1.0) as usize;
+                let rows = (((py + ph - ppad - ct) / lh).floor().max(1.0)) as usize;
+                let col = (((x - px - ppad) / cw).floor().max(0.0) as usize).min(cols - 1);
+                let row = (((y - ct) / lh).floor().max(0.0) as usize).min(rows - 1);
+                return Some((p.id, row, col));
+            }
+        }
+        None
+    }
+
+    /// Set (or clear with `None`) a terminal tile's selection highlight.
+    pub fn set_term_pane_selection(
+        &mut self,
+        id: u64,
+        sel: Option<((usize, usize), (usize, usize))>,
+    ) {
+        if let Some(p) = self.term_panes.iter_mut().find(|p| p.id == id) {
+            if p.sel != sel {
+                p.sel = sel;
+                self.window.request_redraw();
+            }
+        }
+    }
+
+    /// Drop every terminal selection highlight (a click off any prior span).
+    pub fn clear_term_selections(&mut self) {
+        let mut changed = false;
+        for p in self.term_panes.iter_mut() {
+            if p.sel.take().is_some() {
+                changed = true;
+            }
+        }
+        if changed {
+            self.window.request_redraw();
+        }
+    }
+
     pub fn term_pane_grid(&self, id: u64) -> Option<(usize, usize)> {
         let p = self.term_panes.iter().find(|p| p.id == id)?;
-        let (_, _, pw, ph) = self.pane_card_px(p.rect);
-        let cols = ((pw - self.pad_px() * 2.0) / self.cell_w())
-            .floor()
-            .max(1.0) as usize;
-        let rows = ((ph - self.pad_px() * 2.0) / self.line_px())
-            .floor()
-            .max(1.0) as usize;
+        let (_, py, pw, ph) = self.pane_card_px(p.rect);
+        let ppad = self.pad_px();
+        let cols = ((pw - ppad * 2.0) / self.cell_w()).floor().max(1.0) as usize;
+        // Rows fit the area below the clamped content top (matches cursor/text).
+        let ct = (py + ppad).max(self.doc_top_base());
+        let rows = (((py + ph - ppad - ct) / self.line_px()).floor().max(1.0)) as usize;
         Some((cols, rows))
     }
 
@@ -2226,7 +2412,7 @@ impl Renderer {
     /// Divider under the pointer: `(split path, is-horizontal-split)`, with
     /// a full tile-gap of grab tolerance.
     pub fn pane_divider_at(&self, x: f32, y: f32) -> Option<(u32, bool)> {
-        if self.editor_pane.is_none() {
+        if !self.tiling {
             return None;
         }
         let (cx, cy, cw, ch) = self.content_area();
@@ -2313,7 +2499,8 @@ impl Renderer {
     /// Y of the first overlay list row (below the header, if any).
     fn overlay_rows_top(&self) -> f32 {
         if self.overlay_has_input || self.overlay_has_title {
-            self.overlay_top() + self.line_px() * 1.9
+            // Extra air below the enlarged (1.4x) title / input header.
+            self.overlay_top() + self.line_px() * 2.4
         } else {
             self.overlay_top()
         }
@@ -2348,11 +2535,14 @@ impl Renderer {
         let spec = match spec {
             Some(s) => s,
             None => {
-                self.overlay_active = false;
+                // Begin the close fade; stays drawn until overlay_anim hits 0.
+                self.overlay_target = 0.0;
+                self.window.request_redraw();
                 return;
             }
         };
         self.overlay_active = true;
+        self.overlay_target = 1.0;
         self.overlay_row_count = spec.rows.len();
         self.overlay_selected = spec.selected;
         self.overlay_left_color =
@@ -2364,7 +2554,9 @@ impl Renderer {
         );
         self.overlay_split_frac = spec.split_frac;
 
-        let attrs = Attrs::new().family(Family::Monospace);
+        // Chrome (palette / settings / agents / find) renders in a proportional
+        // UI font — the mono two-column list read too terminal-y. Code stays mono.
+        let attrs = Attrs::new().family(Family::SansSerif);
         let content_w = self.overlay_content_width();
         let tall = self.surface_config.height as f32;
         let line_px = self.line_px();
@@ -2732,23 +2924,8 @@ impl Renderer {
             });
         }
         // Status (Ln/Col · latency), right-aligned inside the strip row.
-        if self.last_status_chars > 0 {
-            let sw = self.last_status_chars as f32 * cell_w;
-            areas.push(TextArea {
-                buffer: &self.stats_buffer,
-                left: (w as f32 - pad - sw).max(left),
-                top: self.tabstrip_top() + line_px * 0.25,
-                scale: 1.0,
-                bounds: TextBounds {
-                    left: 0,
-                    top: 0,
-                    right: w,
-                    bottom: h,
-                },
-                default_color: Color::rgb(148, 141, 128),
-                custom_glyphs: &[],
-            });
-        }
+        // Right-side status text (Ln/Col / latency) intentionally not drawn.
+        let _ = self.last_status_chars;
         if !self.tab_layout.is_empty() {
             let ts_top = self.tabstrip_top();
             areas.push(TextArea {
@@ -2766,7 +2943,7 @@ impl Renderer {
                 custom_glyphs: &[],
             });
         }
-        if self.gutter_enabled && self.gutter_digits > 0 {
+        if self.gutter_enabled && self.gutter_digits > 0 && self.editor_visible() {
             areas.push(TextArea {
                 buffer: &self.gutter_buffer,
                 left: gutter_x,
@@ -2782,22 +2959,24 @@ impl Renderer {
                 custom_glyphs: &[],
             });
         }
-        areas.push(TextArea {
-            buffer: &self.doc_buffer,
-            left: text_left,
-            top: doc_top,
-            scale: 1.0,
-            bounds: TextBounds {
-                left: text_left as i32,
-                top: doc_top as i32,
-                right: doc_clip_right,
-                bottom: doc_clip_bottom,
-            },
-            default_color: Color::rgb(232, 226, 213),
-            custom_glyphs: &[],
-        });
+        if self.editor_visible() {
+            areas.push(TextArea {
+                buffer: &self.doc_buffer,
+                left: text_left,
+                top: doc_top,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: text_left as i32,
+                    top: doc_top as i32,
+                    right: doc_clip_right,
+                    bottom: doc_clip_bottom,
+                },
+                default_color: Color::rgb(232, 226, 213),
+                custom_glyphs: &[],
+            });
+        }
         // Empty untitled tab: a centered, muted call-to-action in the canvas.
-        if self.empty_hint && !self.overlay_active {
+        if self.empty_hint && !self.overlay_active && self.editor_visible() {
             let (ex, ey, ew, eh) = self.editor_card_rect();
             let wpx = 57.0 * cell_w;
             areas.push(TextArea {
@@ -2836,14 +3015,17 @@ impl Renderer {
         // Tiled terminal panes: each pane's grid clipped to its own card.
         for p in &self.term_panes {
             let (px, py, pw, ph) = self.pane_card_px(p.rect);
+            // Keep the grid below the floating command strip (top-row panes
+            // otherwise render over the islands).
+            let ttop = (py + pad).max(self.doc_top_base());
             areas.push(TextArea {
                 buffer: &p.buffer,
                 left: px + pad,
-                top: py + pad,
+                top: ttop,
                 scale: 1.0,
                 bounds: TextBounds {
                     left: px as i32,
-                    top: py as i32,
+                    top: ttop as i32,
                     right: (px + pw) as i32,
                     bottom: (py + ph) as i32,
                 },
@@ -2854,14 +3036,15 @@ impl Renderer {
         // Tiled document read-views, syntax-lit, clipped to their cards.
         for p in &self.doc_panes {
             let (px, py, pw, ph) = self.pane_card_px(p.rect);
+            let ttop = (py + pad).max(self.doc_top_base());
             areas.push(TextArea {
                 buffer: &p.buffer,
                 left: px + pad,
-                top: py + pad,
+                top: ttop,
                 scale: 1.0,
                 bounds: TextBounds {
                     left: px as i32,
-                    top: py as i32,
+                    top: ttop as i32,
                     right: (px + pw) as i32,
                     bottom: (py + ph) as i32,
                 },
@@ -2873,7 +3056,7 @@ impl Renderer {
         // word's exact grid cell (monospace -> covers them precisely). Shaped
         // only when the word changes (set_hover_word); here it is just placed.
         if let Some((line, start_col)) = self.hover_word {
-            if !self.overlay_active {
+            if !self.overlay_active && self.editor_visible() {
                 let x = text_left + start_col as f32 * cell_w;
                 let y = doc_top + line as f32 * line_px;
                 if y < h as f32 {
@@ -2894,7 +3077,7 @@ impl Renderer {
                 }
             }
         }
-        if let Some((line, col)) = self.cursor {
+        if let Some((line, col)) = self.cursor.filter(|_| self.editor_visible()) {
             let x = text_left + col as f32 * cell_w;
             let y = doc_top + line as f32 * line_px;
             if y < h as f32 {
@@ -2942,6 +3125,10 @@ impl Renderer {
         if self.overlay_active || self.context_active {
             let mut ov_areas: Vec<TextArea> = Vec::with_capacity(6);
             if self.overlay_active {
+                let ov_alpha = self.overlay_anim;
+                let ovf = |c: Color| {
+                    Color::rgba(c.r(), c.g(), c.b(), ((c.a() as f32) * ov_alpha) as u8)
+                };
                 let ov_left = self.overlay_content_left();
                 let ov_w = self.overlay_content_width();
                 let ov_top = self.overlay_top();
@@ -2961,9 +3148,9 @@ impl Renderer {
                         buffer: &self.overlay_title,
                         left: ov_left,
                         top: ov_top,
-                        scale: 1.0,
+                        scale: 1.4,
                         bounds: full,
-                        default_color: OVERLAY_TITLE_COLOR,
+                        default_color: ovf(OVERLAY_TITLE_COLOR),
                         custom_glyphs: &[],
                     });
                 }
@@ -2974,7 +3161,7 @@ impl Renderer {
                         top: ov_top,
                         scale: 1.0,
                         bounds: full,
-                        default_color: OVERLAY_INPUT_COLOR,
+                        default_color: ovf(OVERLAY_INPUT_COLOR),
                         custom_glyphs: &[],
                     });
                 }
@@ -2984,7 +3171,7 @@ impl Renderer {
                     top: ov_rows_top,
                     scale: 1.0,
                     bounds: full,
-                    default_color: self.overlay_left_color,
+                    default_color: ovf(self.overlay_left_color),
                     custom_glyphs: &[],
                 });
                 ov_areas.push(TextArea {
@@ -2993,7 +3180,7 @@ impl Renderer {
                     top: ov_rows_top,
                     scale: 1.0,
                     bounds: full,
-                    default_color: self.overlay_right_color,
+                    default_color: ovf(self.overlay_right_color),
                     custom_glyphs: &[],
                 });
                 if self.overlay_has_hint {
@@ -3003,7 +3190,7 @@ impl Renderer {
                         top: hint_y,
                         scale: 1.0,
                         bounds: full,
-                        default_color: OVERLAY_HINT_COLOR,
+                        default_color: ovf(OVERLAY_HINT_COLOR),
                         custom_glyphs: &[],
                     });
                 }
@@ -3062,7 +3249,7 @@ impl Renderer {
         let shell_gap = SHELL_GAP * self.scale_factor as f32;
         let sel_right_edge = fw - pad - shell_gap;
         let mut sel_verts: u32 = 0;
-        if !self.overlay_active {
+        if !self.overlay_active && self.editor_visible() {
             // Current-line highlight first (selection draws over it): a faint
             // full-width wash behind the cursor's line.
             if let Some((line, _)) = self.cursor {
@@ -3081,6 +3268,8 @@ impl Renderer {
                     );
                 }
             }
+            let mut sel_col = SELECTION_COLOR;
+            sel_col[3] *= self.sel_anim;
             for span in self.selection.iter().take(QUAD_MAX - 8) {
                 let y = doc_top + span.line as f32 * line_px;
                 if y >= fh {
@@ -3101,7 +3290,7 @@ impl Renderer {
                         y,
                         width,
                         line_px,
-                        SELECTION_COLOR,
+                        sel_col,
                     );
                 }
             }
@@ -3109,7 +3298,7 @@ impl Renderer {
 
         // Scrollbar track + thumb, appended after the selection vertices (also
         // suppressed while a modal overlay is up).
-        let geom = if self.overlay_active {
+        let geom = if self.overlay_active || !self.editor_visible() {
             None
         } else {
             self.scrollbar
@@ -3146,7 +3335,7 @@ impl Renderer {
         // gold so the rule always shows the pointer's line. Both count toward
         // QUAD_MAX (selection is capped at QUAD_MAX-4 to reserve these).
         let mut sep_verts: u32 = 0;
-        if !self.overlay_active && self.gutter_enabled && self.gutter_digits > 0 {
+        if !self.overlay_active && self.gutter_enabled && self.gutter_digits > 0 && self.editor_visible() {
             let s = self.scale_factor as f32;
             let sep_w = (SEPARATOR_W * s).max(1.0);
             let sep_x =
@@ -3186,7 +3375,7 @@ impl Renderer {
         // QUAD_MAX overlay budget). Editor view only.
         self.git_bytes.clear();
         let mut git_verts: u32 = 0;
-        if !self.overlay_active && self.gutter_enabled {
+        if !self.overlay_active && self.gutter_enabled && self.editor_visible() {
             let s = self.scale_factor as f32;
             let mark_w = (3.0 * s).max(1.0);
             let mark_x = self.gutter_left() - self.pad_px() * 0.6;
@@ -3259,6 +3448,8 @@ impl Renderer {
         // the overlay text.
         let mut ov_verts: u32 = 0;
         if self.overlay_active {
+            let ova = self.overlay_anim;
+            let ovf4 = |c: [f32; 4]| [c[0], c[1], c[2], c[3] * ova];
             let ov_left = self.overlay_content_left();
             let ov_w = self.overlay_content_width();
             let ov_top = self.overlay_top();
@@ -3271,7 +3462,7 @@ impl Renderer {
                 0.0,
                 fw,
                 fh,
-                OVERLAY_DIM_COLOR,
+                ovf4(OVERLAY_DIM_COLOR),
             );
             // Opaque content panel behind the whole page (title/input, rows,
             // hint) so overlay text never fights the editor text behind it.
@@ -3285,7 +3476,7 @@ impl Renderer {
                 panel_y,
                 panel_w,
                 panel_h,
-                PANEL_BORDER_COLOR,
+                ovf4(PANEL_BORDER_COLOR),
                 12.0 * self.scale_factor as f32,
             );
             ov_verts += push_rquad(
@@ -3296,7 +3487,7 @@ impl Renderer {
                 panel_y + ov_border,
                 (panel_w - ov_border * 2.0).max(1.0),
                 (panel_h - ov_border * 2.0).max(1.0),
-                OVERLAY_PANEL_COLOR,
+                ovf4(OVERLAY_PANEL_COLOR),
                 (12.0 * self.scale_factor as f32 - ov_border).max(1.0),
             );
             if self.overlay_has_input {
@@ -3308,7 +3499,7 @@ impl Renderer {
                     ov_top - line_px * 0.15,
                     ov_w + pad * 2.0,
                     line_px * 1.3,
-                    OVERLAY_BOX_COLOR,
+                    ovf4(OVERLAY_BOX_COLOR),
                     6.0 * self.scale_factor as f32,
                 );
             }
@@ -3324,7 +3515,7 @@ impl Renderer {
                             hy,
                             ov_w + pad,
                             line_px,
-                            OVERLAY_HL_COLOR,
+                            ovf4(OVERLAY_HL_COLOR),
                             5.0 * self.scale_factor as f32,
                         );
                     }
@@ -3348,7 +3539,6 @@ impl Renderer {
             let pitch = self.line_px() * SIDEBAR_TAB_PITCH;
             let s = self.scale_factor as f32;
             let gap = SHELL_GAP * s;
-            let hover = self.sidebar_hover.filter(|&h| h < self.sidebar_tab_count);
             let active = self.sidebar_active;
             // The sidebar is now an inset floating panel, visibly detached from
             // the window and editor rather than a full-height flat column.
@@ -3377,17 +3567,19 @@ impl Renderer {
                 SIDEBAR_PANEL_COLOR,
                 (SHELL_RADIUS * s - border).max(1.0),
             );
-            if let Some(hrow) = hover {
+            if self.sidebar_hover_anim > 0.002 {
                 let s2 = self.scale_factor as f32;
+                let mut hc = SIDEBAR_HOVER_COLOR;
+                hc[3] *= self.sidebar_hover_anim;
                 sidebar_verts += push_rquad(
                     &mut self.sidebar_bytes,
                     fw,
                     fh,
                     gap + 5.0 * s2,
-                    sb_top + hrow as f32 * pitch + 1.0 * s2,
+                    sb_top + self.sidebar_pill_row * pitch + 1.0 * s2,
                     sw - gap - 12.0 * s2,
                     pitch - 2.0 * s2,
-                    SIDEBAR_HOVER_COLOR,
+                    hc,
                     6.0 * s2,
                 );
             }
@@ -3440,59 +3632,36 @@ impl Renderer {
             let _ = le;
             let border = s.max(1.0);
             let dock_x = sidebar_w + gap;
-            let dock_w = (fw - sidebar_w - gap * 2.0).max(1.0);
-            // Floating command/status dock: bordered outer shape + inset fill.
-            sidebar_verts += push_rquad(
-                &mut self.sidebar_bytes,
-                fw,
-                fh,
-                dock_x,
-                gap,
-                dock_w,
-                ts_h,
-                PANEL_BORDER_COLOR,
-                SHELL_RADIUS * s,
-            );
-            sidebar_verts += push_rquad(
-                &mut self.sidebar_bytes,
-                fw,
-                fh,
-                dock_x + border,
-                gap + border,
-                (dock_w - border * 2.0).max(1.0),
-                (ts_h - border * 2.0).max(1.0),
-                TOP_DOCK_COLOR,
-                (SHELL_RADIUS * s - border).max(1.0),
-            );
+            let (island_x, island_y, island_w, island_h) = self.window_controls_island();
+            let dock_w = (island_x - gap - dock_x).max(1.0);
+            // The command + controls islands are drawn AFTER the panes (below)
+            // so they float on top of the full-height cards — see "top islands".
             // Inset editor canvas below the dock, with its own hairline edge.
             // When tiling is active, editor focus wears the accent ring.
-            let editor_ring = self.editor_pane.is_some() && self.editor_pane_focused;
-            sidebar_verts += push_rquad(
-                &mut self.sidebar_bytes,
-                fw,
-                fh,
-                editor_x,
-                editor_y,
-                editor_w,
-                editor_h,
-                if editor_ring {
-                    PANE_FOCUS_BORDER_COLOR
-                } else {
-                    PANEL_BORDER_COLOR
-                },
-                SHELL_RADIUS * s,
-            );
-            sidebar_verts += push_rquad(
-                &mut self.sidebar_bytes,
-                fw,
-                fh,
-                editor_x + border,
-                editor_y + border,
-                (editor_w - border * 2.0).max(1.0),
-                (editor_h - border * 2.0).max(1.0),
-                EDITOR_PANEL_COLOR,
-                (SHELL_RADIUS * s - border).max(1.0),
-            );
+            if self.editor_visible() {
+                sidebar_verts += push_rquad(
+                    &mut self.sidebar_bytes,
+                    fw,
+                    fh,
+                    editor_x,
+                    editor_y,
+                    editor_w,
+                    editor_h,
+                    lerp4(PANEL_BORDER_COLOR, PANE_FOCUS_BORDER_COLOR, self.editor_focus_anim),
+                    SHELL_RADIUS * s,
+                );
+                sidebar_verts += push_rquad(
+                    &mut self.sidebar_bytes,
+                    fw,
+                    fh,
+                    editor_x + border,
+                    editor_y + border,
+                    (editor_w - border * 2.0).max(1.0),
+                    (editor_h - border * 2.0).max(1.0),
+                    EDITOR_PANEL_COLOR,
+                    (SHELL_RADIUS * s - border).max(1.0),
+                );
+            }
             // Tiled terminal pane cards: same border+fill language as the
             // editor; the focused pane wears the accent ring. Cursor blocks
             // draw here (pre-text) so glyphs stay legible over them.
@@ -3500,11 +3669,10 @@ impl Renderer {
             for i in 0..self.term_panes.len() {
                 let (px, py, pw, ph) = self.pane_card_px(self.term_panes[i].rect);
                 let p = &self.term_panes[i];
-                let ring = if p.focused {
-                    PANE_FOCUS_BORDER_COLOR
-                } else {
-                    PANEL_BORDER_COLOR
-                };
+                // Content top clamped below the floating command strip (matches
+                // the text area) so cursor + selection line up with the glyphs.
+                let ct = (py + ppad).max(self.doc_top_base());
+                let ring = lerp4(PANEL_BORDER_COLOR, PANE_FOCUS_BORDER_COLOR, p.focus_anim);
                 sidebar_verts += push_rquad(
                     &mut self.sidebar_bytes,
                     fw,
@@ -3527,10 +3695,37 @@ impl Renderer {
                     TERM_BG_COLOR,
                     (SHELL_RADIUS * s - border).max(1.0),
                 );
+                // Drag-selection highlight: row-by-row column spans (head cell
+                // inclusive), behind the text but over the bg, using the same
+                // cell arithmetic as the cursor block below.
+                if let Some((a, b)) = p.sel {
+                    let (start, end) = if (a.0, a.1) <= (b.0, b.1) { (a, b) } else { (b, a) };
+                    let cols = ((pw - ppad * 2.0) / pcell_w).floor().max(1.0) as usize;
+                    for row in start.0..=end.0 {
+                        let c0 = if row == start.0 { start.1 } else { 0 };
+                        let c1 = if row == end.0 { end.1 } else { cols.saturating_sub(1) };
+                        let x0 = px + ppad + c0 as f32 * pcell_w;
+                        let y0 = ct + row as f32 * pline_px;
+                        let max_w = (px + pw - border - x0).max(0.0);
+                        let w = (((c1 + 1).saturating_sub(c0)) as f32 * pcell_w).min(max_w);
+                        if w > 0.0 && y0 + pline_px <= py + ph - border {
+                            sidebar_verts += push_quad(
+                                &mut self.sidebar_bytes,
+                                fw,
+                                fh,
+                                x0,
+                                y0,
+                                w,
+                                pline_px,
+                                SELECTION_COLOR,
+                            );
+                        }
+                    }
+                }
                 // Snapshot cursor tuple is (row, col) — terminal.rs:styled_content.
                 if let Some((line, col)) = p.cursor {
                     let cx0 = px + ppad + col as f32 * pcell_w;
-                    let cy0 = py + ppad + line as f32 * pline_px;
+                    let cy0 = ct + line as f32 * pline_px;
                     if cx0 + pcell_w <= px + pw && cy0 + pline_px <= py + ph {
                         sidebar_verts += push_rquad(
                             &mut self.sidebar_bytes,
@@ -3550,11 +3745,8 @@ impl Renderer {
             // ring when the tile owns focus.
             for i in 0..self.doc_panes.len() {
                 let (px, py, pw, ph) = self.pane_card_px(self.doc_panes[i].rect);
-                let ring = if self.doc_panes[i].focused {
-                    PANE_FOCUS_BORDER_COLOR
-                } else {
-                    PANEL_BORDER_COLOR
-                };
+                let ring =
+                    lerp4(PANEL_BORDER_COLOR, PANE_FOCUS_BORDER_COLOR, self.doc_panes[i].focus_anim);
                 sidebar_verts += push_rquad(
                     &mut self.sidebar_bytes,
                     fw,
@@ -3578,26 +3770,162 @@ impl Renderer {
                     (SHELL_RADIUS * s - border).max(1.0),
                 );
             }
+            // Top islands, drawn LAST so they float over the full-height panel
+            // cards: the command/status dock (left) + window-controls island
+            // (right), then the min/max/close buttons.
+            sidebar_verts += push_rquad(
+                &mut self.sidebar_bytes, fw, fh, dock_x, gap, dock_w, ts_h,
+                PANEL_BORDER_COLOR, SHELL_RADIUS * s,
+            );
+            sidebar_verts += push_rquad(
+                &mut self.sidebar_bytes, fw, fh, dock_x + border, gap + border,
+                (dock_w - border * 2.0).max(1.0), (ts_h - border * 2.0).max(1.0),
+                TOP_DOCK_COLOR, (SHELL_RADIUS * s - border).max(1.0),
+            );
+            sidebar_verts += push_rquad(
+                &mut self.sidebar_bytes, fw, fh, island_x, island_y, island_w, island_h,
+                PANEL_BORDER_COLOR, SHELL_RADIUS * s,
+            );
+            sidebar_verts += push_rquad(
+                &mut self.sidebar_bytes, fw, fh, island_x + border, island_y + border,
+                (island_w - border * 2.0).max(1.0), (island_h - border * 2.0).max(1.0),
+                TOP_DOCK_COLOR, (SHELL_RADIUS * s - border).max(1.0),
+            );
+            let btns = self.window_button_rects();
+            let btn_colors = [
+                [0.84, 0.70, 0.35, 1.0], // amber — minimize
+                [0.49, 0.70, 0.49, 1.0], // green — maximize
+                [0.85, 0.43, 0.28, 1.0], // rust — close
+            ];
+            let btn_hover_colors = [
+                [0.96, 0.82, 0.47, 1.0],
+                [0.62, 0.82, 0.62, 1.0],
+                [0.94, 0.55, 0.39, 1.0],
+            ];
+            // Ease all hover animations toward their targets (~110ms). Fades
+            // use a remembered last position so they animate OUT, not snap.
+            {
+                let now = Instant::now();
+                // Clamp dt low so an idle gap can't jump the animation to its
+                // target in a single frame (that read as "no transition").
+                let dt = now.duration_since(self.anim_prev).as_secs_f32().min(0.033);
+                self.anim_prev = now;
+                let step = dt / 0.16;
+                let ease = |t: &mut f32, target: f32| {
+                    if (*t - target).abs() <= step {
+                        *t = target;
+                    } else {
+                        *t += step * (target - *t).signum();
+                    }
+                };
+                for i in 0..3 {
+                    ease(
+                        &mut self.win_btn_anim[i],
+                        if self.window_btn_hover == Some(i) { 1.0 } else { 0.0 },
+                    );
+                }
+                // Slide the hover pills toward the hovered target (snap only
+                // when appearing from idle, so they don't fly across).
+                let pos_step = (dt / 0.12).min(1.0);
+                if let Some((hx0, hx1)) =
+                    self.tabstrip_hover.and_then(|h| self.tab_layout_px.get(h).copied())
+                {
+                    if self.tabstrip_hover_anim < 0.02 {
+                        self.tabstrip_pill = (hx0, hx1);
+                    } else {
+                        self.tabstrip_pill.0 += (hx0 - self.tabstrip_pill.0) * pos_step;
+                        self.tabstrip_pill.1 += (hx1 - self.tabstrip_pill.1) * pos_step;
+                    }
+                }
+                ease(
+                    &mut self.tabstrip_hover_anim,
+                    if self.tabstrip_hover.is_some() { 1.0 } else { 0.0 },
+                );
+                if let Some(h) = self.sidebar_hover {
+                    let target = h as f32;
+                    if self.sidebar_hover_anim < 0.02 {
+                        self.sidebar_pill_row = target;
+                    } else {
+                        self.sidebar_pill_row += (target - self.sidebar_pill_row) * pos_step;
+                    }
+                }
+                ease(
+                    &mut self.sidebar_hover_anim,
+                    if self.sidebar_hover.is_some() { 1.0 } else { 0.0 },
+                );
+                for p in self.term_panes.iter_mut() {
+                    ease(&mut p.focus_anim, if p.focused { 1.0 } else { 0.0 });
+                }
+                for p in self.doc_panes.iter_mut() {
+                    ease(&mut p.focus_anim, if p.focused { 1.0 } else { 0.0 });
+                }
+                ease(
+                    &mut self.editor_focus_anim,
+                    if self.editor_pane.is_some() && self.editor_pane_focused {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                );
+                ease(
+                    &mut self.sel_anim,
+                    if self.selection.is_empty() { 0.0 } else { 1.0 },
+                );
+                ease(&mut self.overlay_anim, self.overlay_target);
+                if self.overlay_target <= 0.0 && self.overlay_anim <= 0.001 {
+                    self.overlay_active = false;
+                }
+            }
+            for (bi, (bx, by, bw, bh)) in btns.iter().enumerate() {
+                let t = self.win_btn_anim[bi];
+                let base = btn_colors[bi];
+                let hov = btn_hover_colors[bi];
+                // Smoothly lerp color base->hover, and grow a translucent halo
+                // ring + the dot as hover eases in.
+                let c = [
+                    base[0] + (hov[0] - base[0]) * t,
+                    base[1] + (hov[1] - base[1]) * t,
+                    base[2] + (hov[2] - base[2]) * t,
+                    1.0,
+                ];
+                if t > 0.002 {
+                    let halo = *bw * 0.7 * t;
+                    let mut hc = c;
+                    hc[3] = 0.35 * t;
+                    sidebar_verts += push_rquad(
+                        &mut self.sidebar_bytes, fw, fh,
+                        *bx - halo * 0.5, *by - halo * 0.5, *bw + halo, *bh + halo,
+                        hc, (*bw + halo) * 0.5,
+                    );
+                }
+                let grow = *bw * 0.3 * t;
+                sidebar_verts += push_rquad(
+                    &mut self.sidebar_bytes, fw, fh,
+                    *bx - grow * 0.5, *by - grow * 0.5, *bw + grow, *bh + grow,
+                    c, (*bw + grow) * 0.5,
+                );
+            }
             // Hovered action: a rounded pill wash sized from the REAL glyph
             // extents (pixel-exact; no column arithmetic).
-            if let Some(hrow) = self.tabstrip_hover {
-                if let Some(&(hx0, hx1)) = self.tab_layout_px.get(hrow) {
-                    if hx1 > hx0 {
-                        let padx = 7.0 * s;
-                        let pady = 3.0 * s;
-                        let hh = ts_h - pady * 2.0;
-                        sidebar_verts += push_rquad(
-                            &mut self.sidebar_bytes,
-                            fw,
-                            fh,
-                            origin + hx0 - padx,
-                            ts_top + pady,
-                            (hx1 - hx0) + padx * 2.0,
-                            hh,
-                            SIDEBAR_HOVER_COLOR,
-                            hh * 0.5,
-                        );
-                    }
+            if self.tabstrip_hover_anim > 0.002 {
+                let (hx0, hx1) = self.tabstrip_pill;
+                if hx1 > hx0 {
+                    let padx = 7.0 * s;
+                    let pady = 3.0 * s;
+                    let hh = ts_h - pady * 2.0;
+                    let mut hc = SIDEBAR_HOVER_COLOR;
+                    hc[3] *= self.tabstrip_hover_anim;
+                    sidebar_verts += push_rquad(
+                        &mut self.sidebar_bytes,
+                        fw,
+                        fh,
+                        origin + hx0 - padx,
+                        ts_top + pady,
+                        (hx1 - hx0) + padx * 2.0,
+                        hh,
+                        hc,
+                        hh * 0.5,
+                    );
                 }
             }
             // Active destination: a filled capsule plus a tiny rust baseline,
@@ -3807,21 +4135,22 @@ impl Renderer {
                 multiview_mask: None,
             });
 
-            // Selection highlights composited BEHIND the text (drawn first so
-            // the glyphs render over them).
-            if sel_verts > 0 {
-                pass.set_pipeline(&self.quad_pipeline);
-                pass.set_vertex_buffer(0, self.quad_vbuf.slice(..));
-                pass.draw(0..sel_verts, 0..1);
-            }
-
-            // Sidebar background behind everything on the left strip; the tab
-            // glyphs (in the text pass just below) draw over it. Only the
+            // Sidebar background + pane cards + floating islands FIRST, so the
+            // selection highlight below composites OVER the cards rather than
+            // being painted over by them (that hid it entirely). Only the
             // pre-context range: the menu card must sit ABOVE the text.
             if ctx_quad_start > 0 {
                 pass.set_pipeline(&self.quad_pipeline);
                 pass.set_vertex_buffer(0, self.sidebar_vbuf.slice(..));
                 pass.draw(0..ctx_quad_start, 0..1);
+            }
+
+            // Selection highlights: OVER the cards, BEHIND the text (the glyphs
+            // render over them).
+            if sel_verts > 0 {
+                pass.set_pipeline(&self.quad_pipeline);
+                pass.set_vertex_buffer(0, self.quad_vbuf.slice(..));
+                pass.draw(0..sel_verts, 0..1);
             }
 
             self.text_renderer
@@ -3893,6 +4222,31 @@ impl Renderer {
             for t in self.pending.drain(..) {
                 self.latency.record(now.duration_since(t));
             }
+        }
+        // Keep animating while any transition is mid-flight (alpha fades OR a
+        // pill still sliding toward its hovered target).
+        let mid = |t: f32| t > 0.0 && t < 1.0;
+        let tab_sliding = self
+            .tabstrip_hover
+            .and_then(|h| self.tab_layout_px.get(h).copied())
+            .is_some_and(|(x0, x1)| {
+                (self.tabstrip_pill.0 - x0).abs() > 0.5 || (self.tabstrip_pill.1 - x1).abs() > 0.5
+            });
+        let side_sliding = self
+            .sidebar_hover
+            .is_some_and(|h| (self.sidebar_pill_row - h as f32).abs() > 0.01);
+        if self.win_btn_anim.iter().any(|t| mid(*t))
+            || mid(self.tabstrip_hover_anim)
+            || mid(self.sidebar_hover_anim)
+            || mid(self.editor_focus_anim)
+            || mid(self.sel_anim)
+            || tab_sliding
+            || side_sliding
+            || mid(self.overlay_anim)
+            || self.term_panes.iter().any(|p| mid(p.focus_anim))
+            || self.doc_panes.iter().any(|p| mid(p.focus_anim))
+        {
+            self.window.request_redraw();
         }
         true
     }

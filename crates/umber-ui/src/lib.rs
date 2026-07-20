@@ -8,8 +8,10 @@
 //! winit window and event loop live in the `umber` bin (per the architecture
 //! sketch in docs/PLAN.md); this crate is handed an `Arc<Window>`.
 
+mod popout;
 mod renderer;
 
+pub use popout::PopoutWindow;
 pub use renderer::{
     OverlaySpec, PaneDividerSpec, Renderer, ScrollbarGeom, ScrollbarInfo, SelSpan,
     TerminalTextSpan, GIT_ADDED_COLOR, GIT_DELETED_COLOR, GIT_MODIFIED_COLOR,

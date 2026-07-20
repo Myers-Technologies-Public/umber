@@ -27,6 +27,7 @@ use umber_host::{HostCommand, Manifest, ModuleHost};
 use umber_kernel::{Command, CommandRegistry, Config, FeatureRegistry};
 use umber_text::TextBuffer;
 use umber_ui::PaneDividerSpec;
+use umber_ui::PopoutWindow;
 use umber_ui::{
     OverlaySpec, Renderer, ScrollbarInfo, SelSpan, TerminalTextSpan, GIT_ADDED_COLOR,
     GIT_DELETED_COLOR, GIT_MODIFIED_COLOR,
@@ -220,6 +221,7 @@ fn build_command_registry() -> CommandRegistry {
         ("pane.splitUp", "Pane: Split Up", ""),
         ("pane.splitDown", "Pane: Split Down", "Ctrl+Shift+E"),
         ("pane.close", "Pane: Close Focused", ""),
+        ("terminal.popout", "Terminal: Pop Out Window", ""),
         ("app.quit", "Application: Quit", "Ctrl+Q"),
     ] {
         reg.register(Command {
@@ -455,12 +457,15 @@ fn main() -> ExitCode {
         openfile_results: Vec::new(),
         terminal: None,
         term_focused: false,
+        term_sel: None,
+        term_selecting: false,
         term_resizing: false,
         sidebar_resizing: false,
         term_tab_active: false,
         pane_tree: PaneTree::new(),
         pane_terms: Vec::new(),
         next_pane_term: 1,
+        popouts: Vec::new(),
         pane_drag: None,
         pane_div_hot: None,
         tab_drag: None,
@@ -522,6 +527,29 @@ impl Document {
     }
 }
 
+/// A popped-out terminal: its own OS window plus the live PTY session moved
+/// out of the tiled panes. Fed grid snapshots on `TerminalWakeup`.
+/// Corner-resize direction for a borderless window: `(x, y)` within margin `m`
+/// of two adjacent edges. Corners only (edges are left to the window chrome).
+fn resize_dir(x: f32, y: f32, w: f32, h: f32, m: f32) -> Option<winit::window::ResizeDirection> {
+    use winit::window::ResizeDirection::*;
+    let (l, r, t, b) = (x <= m, x >= w - m, y <= m, y >= h - m);
+    Some(match (t, b, l, r) {
+        (true, _, true, _) => NorthWest,
+        (true, _, _, true) => NorthEast,
+        (_, true, true, _) => SouthWest,
+        (_, true, _, true) => SouthEast,
+        _ => return None,
+    })
+}
+
+struct Popout {
+    win: PopoutWindow,
+    sess: TerminalSession<UmberNotifier>,
+    /// Last pointer position in this window (physical px), for chrome hits.
+    pointer: (f64, f64),
+}
+
 struct App {
     buffer: TextBuffer,
     /// Open editor tabs (one husk slot per tab; active tab's data is in the
@@ -529,6 +557,9 @@ struct App {
     docs: Vec<Document>,
     active_doc: usize,
     renderer: Option<Renderer>,
+    /// Popped-out terminal windows — each its own OS window + wgpu surface,
+    /// keyed by `WindowId` in the event router.
+    popouts: Vec<Popout>,
 
     // --- Slice 2: kernel + modal views ---
     /// Current input surface (editor or a modal).
@@ -668,6 +699,11 @@ struct App {
     terminal: Option<TerminalSession<UmberNotifier>>,
     /// Keyboard focus owner: `true` = terminal panel, else the editor.
     term_focused: bool,
+    /// Active terminal drag-selection: `(tile id, anchor cell, head cell)` in
+    /// `(row, col)`. Present only while a highlight exists (cleared on a plain
+    /// click). `term_selecting` = the button is down and extending it.
+    term_sel: Option<(u64, (usize, usize), (usize, usize))>,
+    term_selecting: bool,
     /// Dragging the terminal's top border to resize the split.
     term_resizing: bool,
     /// Dragging the sidebar separator to resize it.
@@ -1356,6 +1392,7 @@ impl App {
 
     /// Switch to tab `i`.
     fn switch_tab(&mut self, i: usize) {
+        self.ensure_editor_pane();
         if i == self.active_doc || i >= self.docs.len() {
             return;
         }
@@ -1416,6 +1453,27 @@ impl App {
     /// Close the active tab (always keeps at least one open).
     fn close_active_tab(&mut self) {
         if self.docs.len() <= 1 {
+            // Last tab: closing clears back to a fresh untitled scratch so the
+            // editor always keeps one buffer (a hard "no tabs" state needs the
+            // hideable-editor work). This makes a lone "new tab" closable.
+            self.docs.clear();
+            self.docs.push(Document::husk());
+            self.active_doc = 0;
+            self.buffer = TextBuffer::empty();
+            self.cursor_char = 0;
+            self.goal_col = 0;
+            self.selection_anchor = None;
+            self.first_visible_line = 0;
+            if let Some(mut ws) = self.remote.take() {
+                ws.shutdown();
+            }
+            self.remote_file = None;
+            self.selecting = false;
+            self.refresh_git();
+            self.apply_view(true);
+            if let Some(r) = self.renderer.as_ref() {
+                r.window().request_redraw();
+            }
             return;
         }
         let i = self.active_doc;
@@ -1447,12 +1505,13 @@ impl App {
         }
     }
 
-    /// Close any tab by index (keeps at least one open).
+    /// Close any tab by index. The active or last tab routes through
+    /// `close_active_tab` (which resets the final tab to a fresh scratch).
     fn close_tab(&mut self, i: usize) {
-        if self.docs.len() <= 1 || i >= self.docs.len() {
+        if i >= self.docs.len() {
             return;
         }
-        if i == self.active_doc {
+        if self.docs.len() <= 1 || i == self.active_doc {
             self.close_active_tab();
             return;
         }
@@ -1532,7 +1591,7 @@ impl App {
         }
     }
 
-    fn activate_context_menu_row(&mut self, row: usize) {
+    fn activate_context_menu_row(&mut self, row: usize, event_loop: &ActiveEventLoop) {
         let target = self.context_target.take();
         if let Some(r) = self.renderer.as_mut() {
             r.clear_context_menu();
@@ -1553,7 +1612,9 @@ impl App {
                 };
                 self.split_pane(dir, before);
             }
-            (Some(ContextTarget::Pane(pid, true)), 4) => self.close_pane(pid),
+            (Some(ContextTarget::Pane(pid, _)), 4) => self.pane_paste(pid),
+            (Some(ContextTarget::Pane(pid, _)), 5) => self.pane_popout(pid, event_loop),
+            (Some(ContextTarget::Pane(pid, true)), 6) => self.close_pane(pid),
             (Some(ContextTarget::TerminalView), row @ 0..=3) => {
                 let (dir, before) = match row {
                     0 => (SplitDir::Horizontal, true),
@@ -1773,6 +1834,38 @@ impl App {
         }
         self.replace_selection_with(&text);
         true
+    }
+
+    /// Read the system clipboard as text (empty/unavailable -> `None`).
+    fn clipboard_text(&mut self) -> Option<String> {
+        self.clipboard.as_mut().and_then(|cb| cb.get_text().ok())
+    }
+
+    /// Write `text` to the system clipboard, ignoring backend errors.
+    fn set_clipboard_text(&mut self, text: String) {
+        if let Some(cb) = self.clipboard.as_mut() {
+            let _ = cb.set_text(text);
+        }
+    }
+
+    /// Paste clipboard text into pane `pid`: a terminal receives the bytes on
+    /// its PTY; an editor/doc tile pastes into the live buffer.
+    fn pane_paste(&mut self, pid: u64) {
+        let text = match self.clipboard_text() {
+            Some(t) if !t.is_empty() => t,
+            _ => return,
+        };
+        match self.pane_tree.content_of(pid) {
+            Some(PaneContent::Terminal(tid)) => {
+                if let Some(s) = self.pane_session(tid) {
+                    s.write(text.into_bytes());
+                }
+            }
+            _ => {
+                self.replace_selection_with(&text);
+                self.apply_view(true);
+            }
+        }
     }
 
     /// Set `ControlFlow` to the earliest pending wake (idle-RSS sample or the
@@ -2231,6 +2324,7 @@ impl App {
     /// Open `path` into the active tab when it is an empty untitled scratch
     /// (the "+ New Tab" flow), else into its own tab.
     fn open_into_current_or_new(&mut self, path: &std::path::Path) {
+        self.ensure_editor_pane();
         let untitled_empty = self.buffer.len_chars() == 0
             && self.buffer.path().is_none()
             && self.remote_file.is_none();
@@ -2259,6 +2353,7 @@ impl App {
 
     /// Ctrl+N / the sidebar "+ New Tab" row: a fresh untitled scratch tab.
     fn new_tab(&mut self) {
+        self.ensure_editor_pane();
         if self.term_tab_active {
             self.deactivate_terminal_tab();
         }
@@ -3273,9 +3368,11 @@ impl App {
     /// Focused pane's terminal id, when tiling is active and a terminal tile
     /// owns focus.
     fn focused_pane_term_id(&self) -> Option<u64> {
-        if self.pane_tree.is_single() {
-            return None;
-        }
+        // Gate on the focused content, NOT `is_single`: a lone terminal pane
+        // (editor closed, one terminal leaf left) is still a single leaf, and
+        // an `is_single` short-circuit here would report "no terminal focused"
+        // — collapsing `term_focused` to false so keystrokes route to the
+        // hidden editor instead of the shell.
         match self.pane_tree.focused_content() {
             PaneContent::Terminal(id) => Some(id),
             PaneContent::Editor | PaneContent::Doc(_) => None,
@@ -3289,12 +3386,40 @@ impl App {
             .map(|(_, s)| s)
     }
 
+    /// The highlighted terminal text (cell range → string), or `None` when there
+    /// is no active selection. Rows join with '\n'; the head cell is inclusive.
+    /// Trailing spaces are already trimmed per row by `styled_content`.
+    fn term_selection_text(&self) -> Option<String> {
+        let (id, a, b) = self.term_sel?;
+        if a == b {
+            return None;
+        }
+        let text = self.pane_session(id)?.styled_content().text;
+        let lines: Vec<&str> = text.split('\n').collect();
+        let (start, end) = if (a.0, a.1) <= (b.0, b.1) { (a, b) } else { (b, a) };
+        let mut out = String::new();
+        for row in start.0..=end.0 {
+            if row > start.0 {
+                out.push('\n');
+            }
+            let chars: Vec<char> = lines.get(row).copied().unwrap_or("").chars().collect();
+            let c0 = if row == start.0 { start.1 } else { 0 };
+            let c1_incl = if row == end.0 { end.1 } else { chars.len().saturating_sub(1) };
+            let lo = c0.min(chars.len());
+            let hi = (c1_incl + 1).min(chars.len());
+            if lo < hi {
+                out.extend(&chars[lo..hi]);
+            }
+        }
+        Some(out)
+    }
+
     /// Push the pane tree's layout into the renderer and resize each tile's
     /// PTY to its grid.
     fn sync_panes(&mut self) {
         let mut grids: Vec<(u64, usize, usize, u16, u16)> = Vec::new();
         if let Some(r) = self.renderer.as_mut() {
-            if self.pane_tree.is_single() {
+            if self.pane_tree.is_plain_editor() {
                 r.set_panes(None, &[], &[], &[]);
             } else {
                 let mut editor = None;
@@ -3406,7 +3531,123 @@ impl App {
     }
 
     /// Close a tiled pane by pane id (terminal tiles only).
+    /// Bring the editor surface back if it was closed/hidden: split it in
+    /// beside the focused pane. A no-op when an editor tile already exists,
+    /// so it's safe to call from every document-open path.
+    fn ensure_editor_pane(&mut self) {
+        if self.pane_tree.has_editor() {
+            return;
+        }
+        let id = self
+            .pane_tree
+            .split(SplitDir::Horizontal, PaneContent::Editor, true);
+        self.pane_tree.focused = id;
+        self.term_focused = false;
+        self.sync_panes();
+    }
+
+    /// Right-click → Pop Out on a pane. For now this opens the pop-out window
+    /// shell; the next increment renders the pane's live content (terminal
+    /// grid + PTY) into it, keyed off `_pane_id`.
+    /// Right-click → Pop Out on a terminal pane: move its live PTY session
+    /// into a new OS window. The tile closes; the pop-out renders the grid and
+    /// owns keyboard input for that shell from then on.
+    fn pane_popout(&mut self, pane_id: u64, event_loop: &ActiveEventLoop) {
+        let Some(PaneContent::Terminal(tid)) = self.pane_tree.content_of(pane_id) else {
+            self.modules_hint = Some("only terminal panes can pop out".to_string());
+            return;
+        };
+        let Some(i) = self.pane_terms.iter().position(|(t, _)| *t == tid) else {
+            return;
+        };
+        let Some(mut win) = self.create_popout_window(event_loop) else {
+            return;
+        };
+        let (_, sess) = self.pane_terms.remove(i);
+        self.pane_tree.close(pane_id);
+        self.term_focused = self.focused_pane_term_id().is_some();
+        self.sync_panes();
+        let (cols, rows) = win.grid();
+        let (cw, ch) = win.cell_px();
+        sess.resize(cols, rows, cw, ch);
+        win.set_content(&sess.styled_content().text);
+        win.request_redraw();
+        self.popouts.push(Popout {
+            win,
+            sess,
+            pointer: (0.0, 0.0),
+        });
+    }
+
+    /// Extract the highlighted text from pop-out `idx`'s terminal selection
+    /// (cell range → string; rows join with '\n', head cell inclusive).
+    fn popout_selection_text(&self, idx: usize) -> Option<String> {
+        let p = self.popouts.get(idx)?;
+        let (a, b) = p.win.selection()?;
+        let text = p.sess.styled_content().text;
+        let lines: Vec<&str> = text.split('\n').collect();
+        let (start, end) = if (a.0, a.1) <= (b.0, b.1) { (a, b) } else { (b, a) };
+        let mut out = String::new();
+        for row in start.0..=end.0 {
+            if row > start.0 {
+                out.push('\n');
+            }
+            let chars: Vec<char> = lines.get(row).copied().unwrap_or("").chars().collect();
+            let c0 = if row == start.0 { start.1 } else { 0 };
+            let c1_incl = if row == end.0 { end.1 } else { chars.len().saturating_sub(1) };
+            let lo = c0.min(chars.len());
+            let hi = (c1_incl + 1).min(chars.len());
+            if lo < hi {
+                out.extend(&chars[lo..hi]);
+            }
+        }
+        Some(out)
+    }
+
+    fn create_popout_window(&mut self, event_loop: &ActiveEventLoop) -> Option<PopoutWindow> {
+        let attributes = Window::default_attributes()
+            .with_title("umber \u{2014} terminal")
+            .with_decorations(false)
+            .with_inner_size(LogicalSize::new(720.0, 480.0));
+        let window = match event_loop.create_window(attributes) {
+            Ok(w) => Arc::new(w),
+            Err(err) => {
+                self.modules_hint = Some(format!("pop-out window failed: {err}"));
+                return None;
+            }
+        };
+        Some(PopoutWindow::new(window, event_loop))
+    }
+
     fn close_pane(&mut self, pane_id: u64) {
+        // The editor tile can't simply vanish — the app renders around a live
+        // editor. Closing it promotes a split-out document view to the editor;
+        // with only terminals beside it there's nowhere to edit, so it stays.
+        if matches!(self.pane_tree.content_of(pane_id), Some(PaneContent::Editor)) {
+            let promo = self
+                .pane_tree
+                .layout()
+                .into_iter()
+                .find_map(|p| matches!(p.content, PaneContent::Doc(_)).then_some(p.id));
+            match promo {
+                Some(doc_pane) => {
+                    self.pane_tree.set_content(doc_pane, PaneContent::Editor);
+                    self.pane_tree.force_close(pane_id);
+                    self.pane_tree.focused = doc_pane;
+                    self.term_focused = false;
+                    self.sync_panes();
+                }
+                None => {
+                    // No document view to promote: hide the editor entirely so
+                    // the remaining pane(s) fill. Opening a file or new tab
+                    // brings it back (ensure_editor_pane).
+                    self.pane_tree.force_close(pane_id);
+                    self.term_focused = self.focused_pane_term_id().is_some();
+                    self.sync_panes();
+                }
+            }
+            return;
+        }
         if let Some(PaneContent::Terminal(tid)) = self.pane_tree.close(pane_id) {
             if let Some(i) = self.pane_terms.iter().position(|(t, _)| *t == tid) {
                 let (_, mut sess) = self.pane_terms.remove(i);
@@ -3454,11 +3695,15 @@ impl App {
         }
     }
 
-    /// Return keyboard focus to the editor tile.
+    /// Return keyboard focus to the editor tile. No-ops when the editor has
+    /// been closed (only terminals remain) so focus never lands on a phantom
+    /// pane — the id is looked up, not assumed to be 0.
     fn pane_focus_editor(&mut self) {
-        self.pane_tree.focused = 0;
-        self.term_focused = false;
-        self.sync_panes();
+        if let Some(id) = self.pane_tree.editor_leaf() {
+            self.pane_tree.focused = id;
+            self.term_focused = false;
+            self.sync_panes();
+        }
     }
 
     fn open_pane_context_menu(&mut self, pane_id: u64, closable: bool) {
@@ -3478,6 +3723,8 @@ impl App {
                         "Split Right",
                         "Split Up",
                         "Split Down",
+                        "Paste",
+                        "Pop Out",
                         "Close Pane",
                     ],
                 );
@@ -3485,7 +3732,14 @@ impl App {
                 r.set_context_menu(
                     x,
                     y,
-                    &["Split Left", "Split Right", "Split Up", "Split Down"],
+                    &[
+                        "Split Left",
+                        "Split Right",
+                        "Split Up",
+                        "Split Down",
+                        "Paste",
+                        "Pop Out",
+                    ],
                 );
             }
         }
@@ -3545,26 +3799,26 @@ impl App {
 
     /// Ctrl+`/Ctrl+J: toggle the terminal content tab.
     fn terminal_toggle(&mut self) {
-        // Tiled panes: Ctrl+` walks focus editor <-> first terminal tile.
-        if !self.pane_tree.is_single() {
-            if self.focused_pane_term_id().is_some() {
-                self.pane_focus_editor();
-            } else if let Some(id) = self
-                .pane_tree
-                .layout()
-                .iter()
-                .find_map(|p| matches!(p.content, PaneContent::Terminal(_)).then_some(p.id))
-            {
-                self.pane_tree.focused = id;
-                self.term_focused = true;
-                self.sync_panes();
+        // Single source of truth: terminals are ALWAYS tiled panes. Ctrl+` and
+        // the activity-bar terminal walk focus editor <-> terminal, or spawn a
+        // terminal pane when none exists yet. No fullscreen tab / bottom panel.
+        let term_pane = self
+            .pane_tree
+            .layout()
+            .iter()
+            .find_map(|p| matches!(p.content, PaneContent::Terminal(_)).then_some(p.id));
+        match term_pane {
+            Some(id) => {
+                if self.focused_pane_term_id().is_some() {
+                    // Terminal already focused: hand the keyboard back to the editor.
+                    self.pane_focus_editor();
+                } else {
+                    self.pane_tree.focused = id;
+                    self.term_focused = true;
+                    self.sync_panes();
+                }
             }
-            return;
-        }
-        if self.term_tab_active {
-            self.deactivate_terminal_tab();
-        } else {
-            self.activate_terminal_tab();
+            None => self.split_pane(SplitDir::Horizontal, false),
         }
     }
 
@@ -4058,6 +4312,11 @@ impl App {
                 self.open_modules();
                 return;
             }
+            "terminal.popout" => {
+                let pid = self.pane_tree.focused;
+                self.pane_popout(pid, event_loop);
+                return;
+            }
             "app.quit" => {
                 event_loop.exit();
                 return;
@@ -4227,6 +4486,8 @@ impl ApplicationHandler<UserEvent> for App {
 
         let attributes = Window::default_attributes()
             .with_title("umber")
+            // Borderless: the top dock is our custom title bar (drag + controls).
+            .with_decorations(false)
             .with_inner_size(LogicalSize::new(1000.0, 700.0));
         let window = match event_loop.create_window(attributes) {
             Ok(w) => Arc::new(w),
@@ -4249,6 +4510,14 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::TerminalWakeup => {
+                // Popped-out terminals: feed each its own snapshot + repaint.
+                for p in &mut self.popouts {
+                    if p.sess.take_dirty() {
+                        let text = p.sess.styled_content().text;
+                        p.win.set_content(&text);
+                        p.win.request_redraw();
+                    }
+                }
                 // Tiled panes first: same coalescing contract per session.
                 let mut pane_updates = Vec::new();
                 for (tid, session) in &self.pane_terms {
@@ -4319,9 +4588,104 @@ impl ApplicationHandler<UserEvent> for App {
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
+        window_id: WindowId,
         event: WindowEvent,
     ) {
+        // Pop-out windows own their own surface + render loop; route by id.
+        if let Some(idx) = self.popouts.iter().position(|p| p.win.id() == window_id) {
+            match event {
+                WindowEvent::CloseRequested => {
+                    let mut p = self.popouts.remove(idx);
+                    p.sess.shutdown();
+                }
+                WindowEvent::Resized(size) => {
+                    self.popouts[idx].win.resize(size.width, size.height);
+                    let (cols, rows) = self.popouts[idx].win.grid();
+                    let (cw, ch) = self.popouts[idx].win.cell_px();
+                    self.popouts[idx].sess.resize(cols, rows, cw, ch);
+                    // Paint now so the resize is real-time, not deferred.
+                    self.popouts[idx].win.render();
+                }
+                WindowEvent::RedrawRequested => {
+                    self.popouts[idx].win.render();
+                }
+                WindowEvent::ModifiersChanged(modifiers) => {
+                    self.modifiers = modifiers.state();
+                }
+                WindowEvent::KeyboardInput { event: key, .. } => {
+                    if key.state == ElementState::Pressed {
+                        let ctrl = self.modifiers.control_key();
+                        let shift = self.modifiers.shift_key();
+                        // Ctrl+W closes the pop-out (no OS close button now).
+                        if ctrl
+                            && matches!(&key.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("w"))
+                        {
+                            let mut p = self.popouts.remove(idx);
+                            p.sess.shutdown();
+                            return;
+                        }
+                        // Ctrl+Shift+C copies the terminal selection.
+                        if ctrl
+                            && shift
+                            && matches!(&key.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("c"))
+                        {
+                            if let Some(text) = self.popout_selection_text(idx) {
+                                self.set_clipboard_text(text);
+                            }
+                            return;
+                        }
+                        if let Some(bytes) = Self::term_key_bytes(&key, ctrl) {
+                            self.popouts[idx].sess.write(bytes);
+                        }
+                    }
+                }
+                WindowEvent::CursorMoved { position, .. } => {
+                    self.popouts[idx].pointer = (position.x, position.y);
+                    let (x, y) = (position.x as f32, position.y as f32);
+                    let mut redraw = self.popouts[idx].win.set_hover(x, y);
+                    if self.popouts[idx].win.extend_selection(x, y) {
+                        redraw = true;
+                    }
+                    if redraw {
+                        self.popouts[idx].win.request_redraw();
+                    }
+                }
+                WindowEvent::MouseInput { state, button, .. } => {
+                    if button == MouseButton::Left {
+                        let (px, py) = self.popouts[idx].pointer;
+                        let (px, py) = (px as f32, py as f32);
+                        match state {
+                            ElementState::Pressed => {
+                                if let Some(dir) = self.popouts[idx].win.resize_dir_at(px, py) {
+                                    self.popouts[idx].win.start_resize(dir);
+                                } else if let Some(b) =
+                                    self.popouts[idx].win.window_button_at(px, py)
+                                {
+                                    match b {
+                                        0 => self.popouts[idx].win.set_minimized(),
+                                        1 => self.popouts[idx].win.toggle_maximized(),
+                                        _ => {
+                                            let mut p = self.popouts.remove(idx);
+                                            p.sess.shutdown();
+                                        }
+                                    }
+                                } else if self.popouts[idx].win.in_titlebar(px, py) {
+                                    self.popouts[idx].win.drag();
+                                } else {
+                                    // Anywhere else on the grid: start selecting.
+                                    self.popouts[idx].win.begin_selection(px, py);
+                                }
+                            }
+                            ElementState::Released => {
+                                self.popouts[idx].win.end_selection();
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         if self.renderer.is_none() {
             return;
         }
@@ -4349,12 +4713,19 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.view != View::Editor {
                     self.refresh_overlay();
                 }
+                // Reflow tiled pane PTYs to the new geometry.
+                if self.pane_tree.tiling_active() {
+                    self.sync_panes();
+                }
                 self.apply_view(false);
                 // The window geometry changed, so the pointer now maps to a
                 // different cell: drop the (possibly stale) hover highlight.
                 self.clear_hover();
-                if let Some(renderer) = self.renderer.as_ref() {
-                    renderer.window().request_redraw();
+                // Render synchronously so the content tracks the drag in real
+                // time — RedrawRequested is coalesced/deferred during an
+                // OS-driven interactive resize, which is what felt laggy.
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.render();
                 }
             }
 
@@ -4386,6 +4757,37 @@ impl ApplicationHandler<UserEvent> for App {
                         self.overlay_scroll(steps);
                     }
                     return;
+                }
+                // A terminal owns the wheel over its tile: scroll the shell's
+                // scrollback rather than the document. The fullscreen terminal
+                // tab takes it whole; otherwise route by the pane under the
+                // pointer.
+                if self.term_tab_active {
+                    if let Some(s) = self.terminal.as_ref() {
+                        let lines = match delta {
+                            MouseScrollDelta::LineDelta(_, y) => (y * WHEEL_LINES) as i32,
+                            MouseScrollDelta::PixelDelta(p) => (p.y / BASE_LINE_PX) as i32,
+                        };
+                        s.scroll(lines);
+                    }
+                    return;
+                }
+                let (px, py) = (self.pointer.0 as f32, self.pointer.1 as f32);
+                if let Some((fx, fy)) =
+                    self.renderer.as_ref().and_then(|r| r.content_frac_at(px, py))
+                {
+                    if let Some((_pid, PaneContent::Terminal(tid))) =
+                        self.pane_tree.pane_at(fx, fy)
+                    {
+                        let lines = match delta {
+                            MouseScrollDelta::LineDelta(_, y) => (y * WHEEL_LINES) as i32,
+                            MouseScrollDelta::PixelDelta(p) => (p.y / BASE_LINE_PX) as i32,
+                        };
+                        if let Some(s) = self.pane_session(tid) {
+                            s.scroll(lines);
+                        }
+                        return;
+                    }
                 }
                 // Scroll is a P0 exit-criterion path (100 MB fixture), so it
                 // feeds the D4 latency ring exactly like keystrokes do. It also
@@ -4419,6 +4821,13 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.pointer = (position.x, position.y);
+                // Window-control button hover (repaint only on change).
+                if let Some(r) = self.renderer.as_mut() {
+                    let h = r.window_button_at(position.x as f32, position.y as f32);
+                    if r.set_window_button_hover(h) {
+                        r.window().request_redraw();
+                    }
+                }
                 // Context menus own hover while open; do not leak hover state
                 // into tabs/editor underneath them.
                 if self
@@ -4579,6 +4988,28 @@ impl ApplicationHandler<UserEvent> for App {
                     self.terminal_resize_to(position.y);
                 } else if self.scrollbar_dragging {
                     self.drag_scrollbar(position.y);
+                } else if self.term_selecting {
+                    // Extend a terminal drag-selection to the cell under the
+                    // pointer (same tile only); a highlight appears once it
+                    // spans more than the anchor cell.
+                    let (x, y) = (position.x as f32, position.y as f32);
+                    if let Some((tid, row, col)) =
+                        self.renderer.as_ref().and_then(|r| r.term_pane_cell_at(x, y))
+                    {
+                        if let Some((sid, anchor, head)) = self.term_sel {
+                            if tid == sid && (row, col) != head {
+                                self.term_sel = Some((sid, anchor, (row, col)));
+                                let span = if (row, col) == anchor {
+                                    None
+                                } else {
+                                    Some((anchor, (row, col)))
+                                };
+                                if let Some(r) = self.renderer.as_mut() {
+                                    r.set_term_pane_selection(sid, span);
+                                }
+                            }
+                        }
+                    }
                 } else if self.selecting {
                     // Drag-extend the selection. Throttle: only re-render when the
                     // mapped char actually changes, not on raw mouse motion.
@@ -4629,7 +5060,7 @@ impl ApplicationHandler<UserEvent> for App {
                             r.context_menu_row_at(self.pointer.0 as f32, self.pointer.1 as f32)
                         });
                         if let Some(row) = row {
-                            self.activate_context_menu_row(row);
+                            self.activate_context_menu_row(row, event_loop);
                         } else {
                             self.dismiss_context_menu();
                         }
@@ -4637,6 +5068,41 @@ impl ApplicationHandler<UserEvent> for App {
                         self.dismiss_context_menu();
                     }
                     return;
+                }
+                // Window controls (min / max / close): the borderless window's
+                // title bar lives in the command strip. Checked before actions
+                // — the buttons sit at the far right, clear of them.
+                if state == ElementState::Pressed && button == MouseButton::Left {
+                    let (px, py) = (self.pointer.0 as f32, self.pointer.1 as f32);
+                    if let Some(btn) =
+                        self.renderer.as_ref().and_then(|r| r.window_button_at(px, py))
+                    {
+                        match btn {
+                            0 => {
+                                if let Some(r) = self.renderer.as_ref() {
+                                    r.window().set_minimized(true);
+                                }
+                            }
+                            1 => {
+                                if let Some(r) = self.renderer.as_ref() {
+                                    let w = r.window();
+                                    w.set_maximized(!w.is_maximized());
+                                }
+                            }
+                            _ => event_loop.exit(),
+                        }
+                        return;
+                    }
+                    // Corner resize on the borderless main window (after the
+                    // window buttons, so the close button keeps its corner).
+                    if let Some(r) = self.renderer.as_ref() {
+                        let (w, h) = r.size();
+                        let m = 14.0 * r.window().scale_factor() as f32;
+                        if let Some(dir) = resize_dir(px, py, w as f32, h as f32, m) {
+                            let _ = r.window().drag_resize_window(dir);
+                            return;
+                        }
+                    }
                 }
                 // Right-click a left-side editor/terminal tab opens its menu.
                 if button == MouseButton::Right && state == ElementState::Pressed {
@@ -4673,7 +5139,12 @@ impl ApplicationHandler<UserEvent> for App {
                             let (pid, closable) = match self.pane_tree.pane_at(fx, fy) {
                                 Some((pid, PaneContent::Terminal(_))) => (pid, true),
                                 Some((pid, PaneContent::Doc(_))) => (pid, true),
-                                Some((pid, PaneContent::Editor)) => (pid, false),
+                                // The editor is closable once tiling is active
+                                // (it hides, letting the other panes fill); the
+                                // lone editor stays put.
+                                Some((pid, PaneContent::Editor)) => {
+                                    (pid, !self.pane_tree.is_single())
+                                }
                                 None => (self.pane_tree.focused, false),
                             };
                             self.open_pane_context_menu(pid, closable);
@@ -4705,7 +5176,31 @@ impl ApplicationHandler<UserEvent> for App {
                 if state == ElementState::Released {
                     // End separator / divider drags no matter which view is up.
                     self.sidebar_resizing = false;
-                    self.pane_drag = None;
+                    // A divider released hard against a content edge closes the
+                    // single tile collapsing under it (drag-to-dismiss).
+                    if let Some((path, horiz)) = self.pane_drag.take() {
+                        let pos = self.renderer.as_ref().map(|r| {
+                            let (cx, cy, cw, ch) = r.content_area();
+                            if horiz {
+                                (self.pointer.0 as f32 - cx) / cw.max(1.0)
+                            } else {
+                                (self.pointer.1 as f32 - cy) / ch.max(1.0)
+                            }
+                        });
+                        if let Some(pos) = pos {
+                            const EDGE: f32 = 0.06;
+                            let victim = if pos <= EDGE {
+                                self.pane_tree.edge_child_leaf(path, true)
+                            } else if pos >= 1.0 - EDGE {
+                                self.pane_tree.edge_child_leaf(path, false)
+                            } else {
+                                None
+                            };
+                            if let Some(vid) = victim {
+                                self.close_pane(vid);
+                            }
+                        }
+                    }
                     // Drop a dragged tab: dock it as a document tile.
                     if let Some((doc_idx, _, past_slop, zone)) = self.tab_drag.take() {
                         if let Some(r) = self.renderer.as_mut() {
@@ -4752,8 +5247,12 @@ impl ApplicationHandler<UserEvent> for App {
                     // Tiled panes: a click focuses its tile. Terminal tiles
                     // swallow the press; the editor tile falls through to the
                     // caret/selection path.
+                    // `tiling_active`, not `!is_single`: a lone terminal pane
+                    // is a single leaf yet must still swallow clicks (focus the
+                    // shell) instead of falling through to the editor caret
+                    // path — otherwise the tile behaves like a scratch tab.
                     if self.view == View::Editor
-                        && !self.pane_tree.is_single()
+                        && self.pane_tree.tiling_active()
                         && !self.term_tab_active
                     {
                         if let Some((fx, fy)) = self.renderer.as_ref().and_then(|r| {
@@ -4763,6 +5262,23 @@ impl ApplicationHandler<UserEvent> for App {
                             match self.pane_tree.focused_content() {
                                 PaneContent::Terminal(_) => {
                                     self.term_focused = true;
+                                    // Begin a drag-selection at the pressed cell;
+                                    // a fresh press clears any prior highlight.
+                                    if let Some(r) = self.renderer.as_mut() {
+                                        r.clear_term_selections();
+                                    }
+                                    let cell = self.renderer.as_ref().and_then(|r| {
+                                        r.term_pane_cell_at(
+                                            self.pointer.0 as f32,
+                                            self.pointer.1 as f32,
+                                        )
+                                    });
+                                    if let Some((tid, row, col)) = cell {
+                                        self.term_sel = Some((tid, (row, col), (row, col)));
+                                        self.term_selecting = true;
+                                    } else {
+                                        self.term_sel = None;
+                                    }
                                     self.sync_panes();
                                     return;
                                 }
@@ -4794,23 +5310,9 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                         }
                     }
-                    // Empty untitled tab: clicking the canvas opens the picker.
-                    if self.view == View::Editor
-                        && !self.term_focused
-                        && !self.term_tab_active
-                        && self.buffer.len_chars() == 0
-                        && self.buffer.path().is_none()
-                        && self.remote_file.is_none()
-                    {
-                        if let Some(r) = self.renderer.as_ref() {
-                            let (ex, ey, ew, eh) = r.editor_card_rect();
-                            let (px, py) = (self.pointer.0 as f32, self.pointer.1 as f32);
-                            if px >= ex && px < ex + ew && py >= ey && py < ey + eh {
-                                self.open_file_picker();
-                                return;
-                            }
-                        }
-                    }
+                    // A new/empty tab is just an empty editor — clicking its
+                    // canvas does nothing (no file-picker pop). Open files via
+                    // Ctrl+P, the palette, or the sidebar "+ New Tab" row.
                     // Left bar = open file tabs: click switches.
                     if let Some(tab) = self.renderer.as_ref().and_then(|r| {
                         r.sidebar_tab_at(self.pointer.0 as f32, self.pointer.1 as f32)
@@ -4839,6 +5341,19 @@ impl ApplicationHandler<UserEvent> for App {
                         .and_then(|r| r.tabstrip_at(self.pointer.0 as f32, self.pointer.1 as f32))
                     {
                         self.sidebar_tab_activate(i);
+                        return;
+                    }
+                    // Empty command-bar area: drag to move the borderless window.
+                    if self
+                        .renderer
+                        .as_ref()
+                        .map_or(false, |r| {
+                            r.in_command_bar(self.pointer.0 as f32, self.pointer.1 as f32)
+                        })
+                    {
+                        if let Some(r) = self.renderer.as_ref() {
+                            let _ = r.window().drag_window();
+                        }
                         return;
                     }
                 }
@@ -4873,6 +5388,15 @@ impl ApplicationHandler<UserEvent> for App {
                         // A press changes the caret/selection context under the
                         // pointer: drop any hover highlight (redraws once).
                         self.clear_hover();
+                        // Terminal presses return earlier, so a press reaching
+                        // here is outside every terminal tile — drop terminal
+                        // highlights.
+                        if self.term_sel.is_some() {
+                            self.term_sel = None;
+                            if let Some(r) = self.renderer.as_mut() {
+                                r.clear_term_selections();
+                            }
+                        }
                         // Terminal top border: start a drag-resize (a few px
                         // band around the border, when not maximized).
                         if let Some(r) = self.renderer.as_ref() {
@@ -4969,6 +5493,19 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     ElementState::Released => {
                         self.selecting = false;
+                        // End a terminal drag: a plain click (no span) leaves no
+                        // highlight; a real drag keeps it for Ctrl+Shift+C.
+                        if self.term_selecting {
+                            self.term_selecting = false;
+                            if let Some((tid, anchor, head)) = self.term_sel {
+                                if anchor == head {
+                                    self.term_sel = None;
+                                    if let Some(r) = self.renderer.as_mut() {
+                                        r.set_term_pane_selection(tid, None);
+                                    }
+                                }
+                            }
+                        }
                         self.term_resizing = false;
                         if self.scrollbar_dragging {
                             self.scrollbar_dragging = false;
@@ -5008,6 +5545,14 @@ impl ApplicationHandler<UserEvent> for App {
                         self.terminal_toggle();
                         return;
                     }
+                    // Ctrl+B toggles the sidebar from anywhere, even while a
+                    // terminal owns the keyboard.
+                    if ctrl
+                        && matches!(&event.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("b"))
+                    {
+                        self.toggle_sidebar();
+                        return;
+                    }
                     if matches!(&event.logical_key, Key::Named(NamedKey::Escape)) {
                         // Esc: pane focus back to the editor tile, or leave
                         // the terminal tab for the document.
@@ -5034,6 +5579,37 @@ impl ApplicationHandler<UserEvent> for App {
                                 }
                                 "e" => {
                                     self.split_pane(SplitDir::Vertical, false);
+                                    return;
+                                }
+                                // Ctrl+Shift+V pastes the clipboard into the
+                                // focused terminal; Ctrl+Shift+C copies its
+                                // visible contents back out.
+                                "v" => {
+                                    if let Some(text) = self.clipboard_text() {
+                                        if !text.is_empty() {
+                                            let sess = self
+                                                .focused_pane_term_id()
+                                                .and_then(|id| self.pane_session(id))
+                                                .or(self.terminal.as_ref());
+                                            if let Some(s) = sess {
+                                                s.write(text.into_bytes());
+                                            }
+                                        }
+                                    }
+                                    return;
+                                }
+                                "c" => {
+                                    // Prefer the highlighted selection; fall back
+                                    // to the whole visible buffer when none.
+                                    let text = self.term_selection_text().or_else(|| {
+                                        self.focused_pane_term_id()
+                                            .and_then(|id| self.pane_session(id))
+                                            .or(self.terminal.as_ref())
+                                            .map(|s| s.content().0)
+                                    });
+                                    if let Some(t) = text {
+                                        self.set_clipboard_text(t);
+                                    }
                                     return;
                                 }
                                 _ => {}

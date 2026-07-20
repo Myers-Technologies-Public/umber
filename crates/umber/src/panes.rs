@@ -94,9 +94,62 @@ impl PaneTree {
         }
     }
 
-    /// True when the tree is only the editor leaf (no tiling active).
+    /// True when the tree is a single leaf (structural). The leaf may hold
+    /// the editor, a terminal, or a doc — so this is *not* a reliable test
+    /// for "no tiling / plain editor". Use [`is_plain_editor`] for that.
     pub fn is_single(&self) -> bool {
         matches!(self.root, PaneNode::Leaf { .. })
+    }
+
+    /// The "plain editor" state: the whole content area is the single editor
+    /// leaf. This — not [`is_single`] — is the correct gate for legacy
+    /// fullscreen editor / terminal-tab behaviour, because a lone terminal
+    /// or doc leaf is *also* a single leaf yet must be driven by the pane
+    /// path (its own focus, input routing, and render mode).
+    pub fn is_plain_editor(&self) -> bool {
+        matches!(
+            self.root,
+            PaneNode::Leaf {
+                content: PaneContent::Editor,
+                ..
+            }
+        )
+    }
+
+    /// True whenever the pane system owns the content area: a split exists,
+    /// or the single leaf is a terminal/doc rather than the editor. The
+    /// inverse of [`is_plain_editor`].
+    pub fn tiling_active(&self) -> bool {
+        !self.is_plain_editor()
+    }
+
+    /// The id of the leaf currently holding the editor surface, if any. The
+    /// editor tile is not always id 0 — once closed and reopened it takes a
+    /// fresh id — so callers that want to focus it must look it up here.
+    pub fn editor_leaf(&self) -> Option<u64> {
+        fn walk(n: &PaneNode) -> Option<u64> {
+            match n {
+                PaneNode::Leaf {
+                    id,
+                    content: PaneContent::Editor,
+                } => Some(*id),
+                PaneNode::Leaf { .. } => None,
+                PaneNode::Split { a, b, .. } => walk(a).or_else(|| walk(b)),
+            }
+        }
+        walk(&self.root)
+    }
+
+    /// True when any leaf still holds the editor surface. False once the
+    /// editor pane has been closed (the editor is hidden until reopened).
+    pub fn has_editor(&self) -> bool {
+        fn walk(n: &PaneNode) -> bool {
+            match n {
+                PaneNode::Leaf { content, .. } => matches!(content, PaneContent::Editor),
+                PaneNode::Split { a, b, .. } => walk(a) || walk(b),
+            }
+        }
+        walk(&self.root)
     }
 
     /// Split the focused pane in `dir`, placing `content` in the new half.
@@ -164,6 +217,20 @@ impl PaneTree {
         let closed = Self::close_node(&mut self.root, id)?;
         if !self.contains(self.focused) {
             // Focus falls back to the first leaf (leftmost/topmost).
+            self.focused = Self::first_leaf(&self.root);
+        }
+        Some(closed)
+    }
+
+    /// Close pane `id` even when it is the editor tile — the caller must
+    /// guarantee another editor surface exists (e.g. a promoted document
+    /// view). Refuses only if `id` is absent or the tree is a single leaf.
+    pub fn force_close(&mut self, id: u64) -> Option<PaneContent> {
+        if self.is_single() || Self::find(&self.root, id).is_none() {
+            return None;
+        }
+        let closed = Self::close_node(&mut self.root, id)?;
+        if !self.contains(self.focused) {
             self.focused = Self::first_leaf(&self.root);
         }
         Some(closed)
@@ -252,6 +319,40 @@ impl PaneTree {
 
     pub fn contains(&self, id: u64) -> bool {
         Self::find(&self.root, id).is_some()
+    }
+
+    /// Content of pane `id`, if it is present in the tree.
+    pub fn content_of(&self, id: u64) -> Option<PaneContent> {
+        Self::find(&self.root, id)
+    }
+
+    /// The direct leaf child on one side of the split identified by `path`
+    /// (see [`DividerRect::path`]): `first` selects the a/left/top child.
+    /// Returns the child's id only when it is a leaf (not a nested split),
+    /// so a divider dragged to the edge can close the single tile there.
+    pub fn edge_child_leaf(&self, path: u32, first: bool) -> Option<u64> {
+        let mut node = &self.root;
+        // Path is `1 b_{k-1} .. b_0`; the leading 1 is the root sentinel, each
+        // remaining bit (MSB->LSB) picks the a (0) or b (1) child.
+        let depth = 32 - path.leading_zeros();
+        for i in (0..depth.saturating_sub(1)).rev() {
+            match node {
+                PaneNode::Split { a, b, .. } => {
+                    node = if (path >> i) & 1 == 0 { a } else { b };
+                }
+                PaneNode::Leaf { .. } => return None,
+            }
+        }
+        match node {
+            PaneNode::Split { a, b, .. } => {
+                let child = if first { a.as_ref() } else { b.as_ref() };
+                match child {
+                    PaneNode::Leaf { id, .. } => Some(*id),
+                    PaneNode::Split { .. } => None,
+                }
+            }
+            PaneNode::Leaf { .. } => None,
+        }
     }
 
     pub fn find(node: &PaneNode, id: u64) -> Option<PaneContent> {
@@ -601,5 +702,37 @@ mod tests {
         assert!(t2.rect.y.abs() < 1e-6);
         assert!((t2.rect.x - 0.5).abs() < 1e-6);
         assert!((ed.rect.y - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn lone_terminal_pane_is_not_plain_editor() {
+        // Editor closed down to a single terminal leaf: still `is_single`,
+        // but the pane path must own it — `tiling_active`, not plain editor.
+        let mut t = PaneTree::new();
+        let term = t.split(SplitDir::Horizontal, PaneContent::Terminal(1), false);
+        // Force the editor tile out (as close_pane does when nothing promotes).
+        assert_eq!(t.force_close(0), Some(PaneContent::Editor));
+        assert!(t.is_single());
+        assert!(!t.is_plain_editor());
+        assert!(t.tiling_active());
+        assert_eq!(t.editor_leaf(), None);
+        // The surviving terminal keeps focus and reports as a terminal, so
+        // `focused_pane_term_id` upstream stays truthful.
+        assert_eq!(t.focused, term);
+        assert_eq!(t.focused_content(), PaneContent::Terminal(1));
+    }
+
+    #[test]
+    fn editor_leaf_tracks_reopened_id() {
+        let mut t = PaneTree::new();
+        assert_eq!(t.editor_leaf(), Some(0));
+        t.split(SplitDir::Horizontal, PaneContent::Terminal(1), false);
+        assert_eq!(t.force_close(0), Some(PaneContent::Editor));
+        assert_eq!(t.editor_leaf(), None);
+        // Reopen the editor beside the terminal: it takes a fresh id, not 0,
+        // which is exactly why `pane_focus_editor` must look the id up.
+        let reopened = t.split(SplitDir::Horizontal, PaneContent::Editor, true);
+        assert_ne!(reopened, 0);
+        assert_eq!(t.editor_leaf(), Some(reopened));
     }
 }
