@@ -678,6 +678,9 @@ pub struct Renderer {
     doc_panes: Vec<DocPaneView>,
     /// Pane name badges: (shaped label buffer, pane rect, text width px).
     pane_badges: Vec<(Buffer, [f32; 4], f32)>,
+    /// Optional pinned input overlay for a terminal pane scrolled away from the
+    /// bottom: (label buffer, pane rect). Drawn at the pane's bottom.
+    term_overlay: Option<(Buffer, [f32; 4])>,
     /// The editor tile owns focus (drives its accent ring when tiled).
     editor_pane_focused: bool,
     /// Editor focus-ring cross-fade + selection fade-in progress.
@@ -1085,6 +1088,7 @@ impl Renderer {
             pane_divs: Vec::new(),
             doc_panes: Vec::new(),
             pane_badges: Vec::new(),
+            term_overlay: None,
             editor_pane_focused: true,
             editor_focus_anim: 1.0,
             sel_anim: 0.0,
@@ -1335,6 +1339,23 @@ impl Renderer {
             buffer.shape_until_scroll(&mut self.font_system, false);
             let text_w = buffer.layout_runs().next().map(|r| r.line_w).unwrap_or(0.0);
             self.pane_badges.push((buffer, *rect, text_w));
+        }
+        self.window.request_redraw();
+    }
+
+    /// Pinned input overlay for a terminal pane scrolled off the bottom: text
+    /// + the pane rect. `None` clears it. Drawn at the pane's bottom strip.
+    pub fn set_term_overlay(&mut self, overlay: Option<([f32; 4], String)>) {
+        self.term_overlay = None;
+        if let Some((rect, text)) = overlay {
+            let metrics = self.doc_buffer.metrics();
+            let attrs = Attrs::new().family(Family::SansSerif);
+            let mut buffer = Buffer::new(&mut self.font_system, metrics);
+            buffer.set_wrap(Wrap::None);
+            buffer.set_text(&text, &attrs, Shaping::Advanced, None);
+            buffer.set_size(Some(600.0), Some(self.line_px()));
+            buffer.shape_until_scroll(&mut self.font_system, false);
+            self.term_overlay = Some((buffer, rect));
         }
         self.window.request_redraw();
     }
@@ -3156,7 +3177,11 @@ impl Renderer {
         // a pass after the dim quad (glyphon renders a renderer's areas in one
         // pass). Areas borrow the overlay buffers; geometry is snapshotted from
         // the immutable accessors first.
-        if self.overlay_active || self.context_active || !self.pane_badges.is_empty() {
+        if self.overlay_active
+            || self.context_active
+            || !self.pane_badges.is_empty()
+            || self.term_overlay.is_some()
+        {
             let mut ov_areas: Vec<TextArea> = Vec::with_capacity(6);
             // Pane name badges ride the late pass so the label composites OVER
             // its post-text pill, sitting below the pane's top bar.
@@ -3168,6 +3193,28 @@ impl Renderer {
                     buffer,
                     left: bx + pd * 1.5,
                     top: by + lp * 1.7,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left: 0,
+                        top: 0,
+                        right: w,
+                        bottom: h,
+                    },
+                    default_color: OVERLAY_INPUT_COLOR,
+                    custom_glyphs: &[],
+                });
+            }
+            // Pinned terminal input overlay: the live bottom rows shown while
+            // that pane is scrolled away from the prompt.
+            if let Some((buffer, rect)) = &self.term_overlay {
+                let (bx, by, _, ph) = self.pane_card_px(*rect);
+                let lp = self.line_px();
+                let pd = self.pad_px();
+                let strip_h = lp * 1.4;
+                ov_areas.push(TextArea {
+                    buffer,
+                    left: bx + pd * 1.5,
+                    top: by + ph - strip_h - pd,
                     scale: 1.0,
                     bounds: TextBounds {
                         left: 0,
@@ -4158,6 +4205,25 @@ impl Renderer {
                 6.0 * s,
             );
         }
+        // Terminal input overlay pill (pinned at the pane's bottom).
+        if let Some((_, rect)) = &self.term_overlay {
+            let (bx, by, pw, ph) = self.pane_card_px(*rect);
+            let s = self.scale_factor as f32;
+            let lp = self.line_px();
+            let pd = self.pad_px();
+            let strip_h = lp * 1.4;
+            sidebar_verts += push_rquad(
+                &mut self.sidebar_bytes,
+                fw,
+                fh,
+                bx + pd * 0.9,
+                by + ph - strip_h - pd,
+                (pw - pd * 2.4).max(1.0),
+                strip_h,
+                CONTEXT_MENU_COLOR,
+                6.0 * s,
+            );
+        }
         // Drag-to-dock preview: a translucent accent wash over the target
         // half, in the post-text range so it reads over the glyphs.
         if let Some((pxr, pyr, pwr, phr)) = self.drop_preview {
@@ -4303,7 +4369,11 @@ impl Renderer {
                 pass.set_vertex_buffer(0, self.sidebar_vbuf.slice(..));
                 pass.draw(ctx_quad_start..sidebar_verts, 0..1);
             }
-            if self.overlay_active || self.context_active || !self.pane_badges.is_empty() {
+            if self.overlay_active
+                || self.context_active
+                || !self.pane_badges.is_empty()
+                || self.term_overlay.is_some()
+            {
                 self.overlay_text_renderer
                     .render(&self.atlas, &self.viewport, &mut pass)
                     .expect("render overlay text");

@@ -4940,6 +4940,20 @@ impl ApplicationHandler<UserEvent> for App {
                         if let Some(s) = self.pane_session(tid) {
                             s.scroll(lines);
                         }
+                        // While scrolled up, pin the live bottom rows (the
+                        // prompt + what you're typing) at the pane's bottom.
+                        if let Some(rect) = self
+                            .pane_tree
+                            .layout()
+                            .iter()
+                            .find(|p| matches!(p.content, PaneContent::Terminal(t2) if t2 == tid))
+                            .map(|p| [p.rect.x, p.rect.y, p.rect.w, p.rect.h])
+                        {
+                            let text = self.pane_session(tid).and_then(|s| s.bottom_text(8));
+                            if let Some(r) = self.renderer.as_mut() {
+                                r.set_term_overlay(text.map(|t| (rect, t)));
+                            }
+                        }
                         return;
                     }
                 }
