@@ -592,7 +592,12 @@ fn resize_dir(x: f32, y: f32, w: f32, h: f32, m: f32) -> Option<winit::window::R
 
 struct Popout {
     win: PopoutWindow,
-    sess: TerminalSession<UmberNotifier>,
+    /// Popout-local pane tree: real in-popout splits reuse the same shape the
+    /// in-app layout uses (see umber::panes). The first leaf holds the
+    /// terminal that opened the popout; split-grow operations extend this tree.
+    pane_tree: PaneTree,
+    pane_terms: Vec<(u64, TerminalSession<UmberNotifier>)>,
+    next_pane_term: u64,
     /// Last pointer position in this window (physical px), for chrome hits.
     pointer: (f64, f64),
 }
@@ -3748,65 +3753,106 @@ impl App {
         };
         let (cols, rows) = win.grid();
         let (cw, ch) = win.cell_px();
-        if lone {
+        // Build the popout with its own PaneTree seeded with a single Terminal
+        // leaf at id 0 holding session id 0. Both lone + multi-tile go through
+        // the same construction so splits on this popout reuse the App's
+        // PaneTree logic for free.
+        let mut pane_tree = PaneTree::new();
+        pane_tree.set_content(0, PaneContent::Terminal(0));
+        pane_tree.focused = 0;
+        let sess = if lone {
             // Don't strip the sole terminal away from the main page: spawn a
             // FRESH shell in the popup so both stay responsive.
             match TerminalSession::spawn_with_shell(
                 UmberNotifier(self.event_proxy.clone()),
                 cols, rows, cw, ch, None,
             ) {
-                Ok(sess) => {
-                    let snap = sess.styled_content();
-                    let spans: Vec<TerminalTextSpan> = snap
-                        .spans
-                        .iter()
-                        .map(|sp| TerminalTextSpan {
-                            start: sp.start,
-                            end: sp.end,
-                            rgb: sp.rgb,
-                            bold: sp.bold,
-                            italic: sp.italic,
-                        })
-                        .collect();
-                    win.set_styled_content(&snap.text, snap.cursor, &spans);
-                    win.request_redraw();
-                    self.popouts.push(Popout {
-                        win,
-                        sess,
-                        pointer: (0.0, 0.0),
-                    });
-                }
+                Ok(s) => s,
                 Err(e) => {
                     self.modules_hint = Some(format!("pop-out spawn failed: {e}"));
+                    return;
                 }
             }
         } else {
-            // Multi-tile: move the live session into the pop-out (the rest of
-            // the layout keeps working).
-            let (_, sess) = self.pane_terms.remove(i);
+            // Multi-tile: move the live session into the pop-out, close the
+            // main-side tile once the session is gone.
+            let (_, s) = self.pane_terms.remove(i);
             self.pane_tree.close(pane_id);
             self.term_focused = self.focused_pane_term_id().is_some();
             self.sync_panes();
-            sess.resize(cols, rows, cw, ch);
-            let snap = sess.styled_content();
-            let spans: Vec<TerminalTextSpan> = snap
-                .spans
-                .iter()
-                .map(|sp| TerminalTextSpan {
-                    start: sp.start,
-                    end: sp.end,
-                    rgb: sp.rgb,
-                    bold: sp.bold,
-                    italic: sp.italic,
-                })
-                .collect();
-            win.set_styled_content(&snap.text, snap.cursor, &spans);
-            win.request_redraw();
-            self.popouts.push(Popout {
-                win,
-                sess,
-                pointer: (0.0, 0.0),
-            });
+            s
+        };
+        let pane_terms = vec![(0, sess)];
+        let idx_new = self.popouts.len();
+        self.popouts.push(Popout {
+            win,
+            pane_tree,
+            pane_terms,
+            next_pane_term: 1,
+            pointer: (0.0, 0.0),
+        });
+        self.popout_sync_panes(idx_new);
+    }
+
+    /// Borrow the session for terminal id `tid` inside pop-out `idx`.
+    fn popout_session(&self, idx: usize, tid: u64) -> Option<&TerminalSession<UmberNotifier>> {
+        self.popouts.get(idx)?.pane_terms.iter().find(|(t, _)| *t == tid).map(|(_, s)| s)
+    }
+
+    fn popout_session_mut(&mut self, idx: usize, tid: u64) -> Option<&mut TerminalSession<UmberNotifier>> {
+        self.popouts.get_mut(idx)?.pane_terms.iter_mut().find(|(t, _)| *t == tid).map(|(_, s)| s)
+    }
+
+    /// Focused leaf's terminal session for pop-out `idx`.
+    fn popout_focused_session(&self, idx: usize) -> Option<&TerminalSession<UmberNotifier>> {
+        let p = self.popouts.get(idx)?;
+        match p.pane_tree.focused_content() {
+            PaneContent::Terminal(tid) => Some(
+                p.pane_terms.iter().find(|(t, _)| *t == tid).map(|(_, s)| s)?,
+            ),
+            _ => None,
+        }
+    }
+
+    /// Mirror the pop-out's pane layout into PopoutWindow's tile batch and
+    /// resize each session's grid to its real tile size. Mirrors App::sync_panes
+    /// for the pop-out's own tree.
+    fn popout_sync_panes(&mut self, idx: usize) {
+        let Some(p) = self.popouts.get_mut(idx) else { return; };
+        let layout = p.pane_tree.layout();
+        let terms: Vec<(u64, [f32; 4], bool)> = layout
+            .iter()
+            .filter_map(|pr| match pr.content {
+                PaneContent::Terminal(tid) => Some((tid, [pr.rect.x, pr.rect.y, pr.rect.w, pr.rect.h], p.pane_tree.focused == pr.id)),
+                _ => None,
+            })
+            .collect();
+        let divs: Vec<PaneDividerSpec> = p.pane_tree.dividers().iter().map(|d| PaneDividerSpec {
+            path: d.path,
+            horizontal_split: matches!(d.dir, SplitDir::Horizontal),
+            x: d.rect.x, y: d.rect.y, w: d.rect.w, h: d.rect.h,
+        }).collect();
+        p.win.set_term_panes(&terms, &divs);
+        let cw = p.win.cell_px().0 as u16;
+        let ch = p.win.cell_px().1 as u16;
+        // Push each tile's snapshot into the renderer so the spawn-on-split case
+        // paints immediately, and resize its PTY grid to the new tile.
+        let mut grids = Vec::new();
+        for &(tid, _, _) in &terms {
+            let snap = p.pane_terms.iter().find(|(t, _)| *t == tid).map(|(_, s)| s.styled_content());
+            if let Some(snap) = snap {
+                let spans: Vec<TerminalTextSpan> = snap.spans.iter().map(|sp| TerminalTextSpan {
+                    start: sp.start, end: sp.end, rgb: sp.rgb, bold: sp.bold, italic: sp.italic,
+                }).collect();
+                p.win.set_term_pane_content(tid, &snap.text, snap.cursor, &spans, snap.display_offset);
+                let grid = p.win.term_pane_grid(tid).unwrap_or((80, 24));
+                grids.push((tid, grid, cw, ch));
+            }
+        }
+        p.win.request_redraw();
+        // Resize sessions after we drop the borrow — we mutate per-term below.
+        for (tid, (cols, rows), cw, ch) in grids {
+            if let Some(s) = self.popout_session_mut(idx, tid) { s.resize(cols, rows, cw, ch); }
         }
     }
 
@@ -3814,8 +3860,9 @@ impl App {
     /// (cell range → string; rows join with '\n', head cell inclusive).
     fn popout_selection_text(&self, idx: usize) -> Option<String> {
         let p = self.popouts.get(idx)?;
-        let (a, b) = p.win.selection()?;
-        let text = p.sess.styled_content().text;
+        let (tid, (a, b)) = p.win.term_pane_selection()?;
+        let s = p.pane_terms.iter().find(|(t, _)| *t == tid).map(|(_, sess)| sess)?;
+        let text = s.styled_content().text;
         let lines: Vec<&str> = text.split('\n').collect();
         let (start, end) = if (a.0, a.1) <= (b.0, b.1) { (a, b) } else { (b, a) };
         let mut out = String::new();
@@ -4761,30 +4808,32 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::TerminalWakeup => {
-                // Popped-out terminals: feed each its own styled snapshot
-                // (colours, bold/italic, cursor) + repaint — same data the
-                // in-app pane uses so a pop-out reads identical to the tile.
+                // Popped-out terminals: feed each per-tile styled snapshot +
+                // repaint — same data flow as the in-app pane uses.
                 for p in &mut self.popouts {
-                    if p.sess.take_dirty() {
-                        let snap = p.sess.styled_content();
-                        let spans: Vec<TerminalTextSpan> = snap
-                            .spans
-                            .iter()
-                            .map(|sp| TerminalTextSpan {
-                                start: sp.start,
-                                end: sp.end,
-                                rgb: sp.rgb,
-                                bold: sp.bold,
-                                italic: sp.italic,
-                            })
-                            .collect();
-                        p.win.set_styled_content(&snap.text, snap.cursor, &spans);
-                        // Keep the scroll-back input overlay fresh as text streams
-                        // in while the pop-out is scrolled up.
-                        let overlay = p.sess.bottom_text(1);
-                        p.win.set_overlay_text(overlay);
-                        p.win.request_redraw();
+                    let mut updates: Vec<(u64, String, Option<(usize, usize)>, Vec<TerminalTextSpan>, usize)> = Vec::new();
+                    for (tid, sess) in &mut p.pane_terms {
+                        if sess.take_dirty() {
+                            let snap = sess.styled_content();
+                            let spans: Vec<TerminalTextSpan> = snap
+                                .spans
+                                .iter()
+                                .map(|sp| TerminalTextSpan {
+                                    start: sp.start,
+                                    end: sp.end,
+                                    rgb: sp.rgb,
+                                    bold: sp.bold,
+                                    italic: sp.italic,
+                                })
+                                .collect();
+                            updates.push((*tid, snap.text, snap.cursor, spans, snap.display_offset));
+                        }
                     }
+                    for (tid, text, cursor, spans, off) in &updates {
+                        p.win.set_term_pane_content(*tid, text, *cursor, spans, *off);
+                    }
+                    p.win.request_redraw();
+                    let _ = &updates;
                 }
                 // Tiled panes first: same coalescing contract per session.
                 let mut pane_updates = Vec::new();
@@ -4866,16 +4915,34 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::TerminalExited => {
-                // One shell ended. Reap ONLY the session/surface that exited,
+                // One shell ended. Reap ONLY the exited terminal session,
                 // leaving every other terminal pane and every other popped-out
-                // window untouched (each pop-out + pane is independent).
-                let dropped_popout = self
-                    .popouts
-                    .iter()
-                    .position(|p| p.sess.has_exited());
-                if let Some(i) = dropped_popout {
-                    let mut p = self.popouts.remove(i);
-                    p.sess.shutdown();
+                // window untouched (each pop-out + pane is independent). A
+                // pop-out's pane_tree is just like the main one: a closed leaf
+                // collapses a split, and a lone terminal close closes the whole
+                // pop-out.
+                let pidx_session = self.popouts.iter().enumerate().find_map(|(i, p)| {
+                    p.pane_terms.iter().position(|(_, s)| s.has_exited()).map(|j| (i, j))
+                });
+                if let Some((i, j)) = pidx_session {
+                    let (id, mut sess) = self.popouts[i].pane_terms.remove(j);
+                    sess.shutdown();
+                    // Close that leaf in the pop-out's pane_tree; if the tree is
+                    // now empty/the lone terminal went, drop the whole pop-out.
+                    let lone_after = self.popouts[i].pane_terms.is_empty();
+                    if lone_after {
+                        let mut p = self.popouts.remove(i);
+                        let _ = &mut p;
+                    } else {
+                        // Find the pane_tree leaf holding tid==id and close it.
+                        let leaf = self.popouts[i].pane_tree.layout().into_iter()
+                            .find(|pr| matches!(pr.content, PaneContent::Terminal(t2) if t2 == id))
+                            .map(|pr| pr.id);
+                        if let Some(leaf) = leaf {
+                            self.popouts[i].pane_tree.force_close(leaf);
+                        }
+                        self.popout_sync_panes(i);
+                    }
                 } else {
                     let pane_dead = self
                         .pane_terms
@@ -4930,14 +4997,13 @@ impl ApplicationHandler<UserEvent> for App {
             match event {
                 WindowEvent::CloseRequested => {
                     let mut p = self.popouts.remove(idx);
-                    p.sess.shutdown();
+                    for (_, mut s) in p.pane_terms.drain(..) { s.shutdown(); }
                 }
                 WindowEvent::Resized(size) => {
                     self.popouts[idx].win.resize(size.width, size.height);
-                    let (cols, rows) = self.popouts[idx].win.grid();
-                    let (cw, ch) = self.popouts[idx].win.cell_px();
-                    self.popouts[idx].sess.resize(cols, rows, cw, ch);
-                    // Paint now so the resize is real-time, not deferred.
+                    // Re-sync the per-tile layout so each session's PTY gridd
+                    // tracks its (resized) tile.
+                    self.popout_sync_panes(idx);
                     self.popouts[idx].win.render();
                 }
                 WindowEvent::RedrawRequested => {
@@ -4955,7 +5021,7 @@ impl ApplicationHandler<UserEvent> for App {
                             && matches!(&key.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("w"))
                         {
                             let mut p = self.popouts.remove(idx);
-                            p.sess.shutdown();
+                            for (_, mut s) in p.pane_terms.drain(..) { s.shutdown(); }
                             return;
                         }
                         // Ctrl+Shift+C copies the terminal selection.
@@ -4979,13 +5045,19 @@ impl ApplicationHandler<UserEvent> for App {
                             {
                                 self.last_term_intr_at = None;
                                 let mut p = self.popouts.remove(idx);
-                                p.sess.shutdown();
+                                for (_, mut s) in p.pane_terms.drain(..) { s.shutdown(); }
                                 return;
                             }
                             self.last_term_intr_at = Some(now);
                         }
                         if let Some(bytes) = Self::term_key_bytes(&key, ctrl, shift) {
-                            self.popouts[idx].sess.write(bytes);
+                            // Route keyboard to the focused tile's session.
+                            let tid_in = self.popouts.get(idx).and_then(|p| match p.pane_tree.focused_content() { PaneContent::Terminal(tid) => Some(tid), _ => None });
+                            if let Some(tid) = tid_in {
+                                if let Some(s) = self.popout_session_mut(idx, tid) {
+                                    s.write(bytes);
+                                }
+                            }
                         }
                     }
                 }
@@ -5044,63 +5116,76 @@ impl ApplicationHandler<UserEvent> for App {
                             self.popouts[idx].win.clear_context_menu();
                             if let Some(row) = row {
                                 match row {
-                                    // Splits open a fresh pop-out terminal from
-                                    // the existing template (events above).
+                                    // Real in-popout splits: split the focused leaf of the
+                                    // pop-out's own pane_tree and spawn a fresh shell into the
+                                    // new tile. Reuses the in-app PaneTree logic verbatim.
                                     0..=3 => {
-                                        if let Some(mut win) = self.create_popout_window(event_loop) {
-                                            let (cols, rows) = win.grid();
-                                            let (cw, ch) = win.cell_px();
-                                            if let Ok(sess) = TerminalSession::spawn_with_shell(
-                                                UmberNotifier(self.event_proxy.clone()),
-                                                cols, rows, cw, ch, None,
-                                            ) {
-                                                let s_snap = sess.styled_content();
-                                                let spans: Vec<TerminalTextSpan> = s_snap
-                                                    .spans
-                                                    .iter()
-                                                    .map(|sp| TerminalTextSpan {
-                                                        start: sp.start,
-                                                        end: sp.end,
-                                                        rgb: sp.rgb,
-                                                        bold: sp.bold,
-                                                        italic: sp.italic,
-                                                    })
-                                                    .collect();
-                                                win.set_styled_content(
-                                                    &s_snap.text,
-                                                    s_snap.cursor,
-                                                    &spans,
-                                                );
-                                                win.request_redraw();
-                                                self.popouts.push(Popout {
-                                                    win,
-                                                    sess,
-                                                    pointer: (0.0, 0.0),
-                                                });
-                                            }
-                                        }
+                                        let split_dir = match row {
+                                            0 => (SplitDir::Horizontal, true),
+                                            1 => (SplitDir::Horizontal, false),
+                                            2 => (SplitDir::Vertical, true),
+                                            _ => (SplitDir::Vertical, false),
+                                        };
+                                        let (cols, rows, cw, ch) = {
+                                            // Preview the to-be-created tile's grid by
+                                            // running the split on a scratch tree then reading
+                                            // the new leaf's bounds from the pop-out's
+                                            // PopoutWindow::term_pane_grid AFTER sync_panes.
+                                            // Simpler: spawn at the popup's whole grid for now,
+                                            // then popout_sync_panes will resize once laid.
+                                            let g = self.popouts.get(idx).map(|p| p.win.grid()).unwrap_or((80, 24));
+                                            let c = self.popouts.get(idx).map(|p| p.win.cell_px()).unwrap_or((8, 18));
+                                            (g.0, g.1, c.0, c.1)
+                                        };
+                                        if let Ok(sess) = TerminalSession::spawn_with_shell(
+                                            UmberNotifier(self.event_proxy.clone()),
+                                            cols, rows, cw, ch, None,
+                                        ) {
+                                            Some(sess)
+                                        } else { None }.map(|sess| {
+                                            let (tid, before) = (split_dir.0, split_dir.1);
+                                            // Insert the new session into the pop-out's
+                                            // pane_terms and split the focused leaf in its
+                                            // pane_tree.
+                                            let new_tid = self.popouts[idx].next_pane_term;
+                                            self.popouts[idx].next_pane_term += 1;
+                                            self.popouts[idx].pane_terms.push((new_tid, sess));
+                                            let focused_leaf = self.popouts[idx].pane_tree.focused;
+                                            self.popouts[idx].pane_tree.split(tid, PaneContent::Terminal(new_tid), before);
+                                            self.popout_sync_panes(idx);
+                                            // Sync will resize the new session to its real grid.
+                                        });
                                     }
                                     // Copy: popped-out selection -> clipboard.
                                     4 => {
                                         let text = self
                                             .popout_selection_text(idx)
-                                            .or_else(|| self.popouts.get(idx).map(|p| p.sess.content().0));
+                                            .or_else(|| self.popouts.get(idx).and_then(|p| {
+                                                match p.pane_tree.focused_content() {
+                                                    PaneContent::Terminal(tid) => p.pane_terms.iter().find(|(t, _)| *t == tid).map(|(_, s)| s.content().0),
+                                                    _ => None,
+                                                }
+                                            }));
                                         if let Some(t) = text {
                                             self.set_clipboard_text(t);
                                         }
                                     }
-                                    // Paste: clipboard -> session bytes.
+                                    // Paste: clipboard -> focused tile session bytes.
                                     5 => {
                                         if let Some(text) = self.clipboard_text() {
                                             if !text.is_empty() {
-                                                self.popouts[idx].sess.write(text.into_bytes());
+                                                let tid_in = self.popouts.get(idx).and_then(|p| match p.pane_tree.focused_content() { PaneContent::Terminal(tid) => Some(tid), _ => None });
+                                                if let Some(tid) = tid_in {
+                                                    let bytes = text.into_bytes();
+                                                    if let Some(s) = self.popout_session_mut(idx, tid) { s.write(bytes); }
+                                                }
                                             }
                                         }
                                     }
                                     // Close Pop-out.
                                     _ => {
                                         let mut p = self.popouts.remove(idx);
-                                        p.sess.shutdown();
+                                        for (_, mut s) in p.pane_terms.drain(..) { s.shutdown(); }
                                         return;
                                     }
                                 }
@@ -5122,7 +5207,7 @@ impl ApplicationHandler<UserEvent> for App {
                                         1 => self.popouts[idx].win.toggle_maximized(),
                                         _ => {
                                             let mut p = self.popouts.remove(idx);
-                                            p.sess.shutdown();
+                                            for (_, mut s) in p.pane_terms.drain(..) { s.shutdown(); }
                                         }
                                     }
                                 } else if self.popouts[idx].win.in_titlebar(px, py) {
@@ -5143,25 +5228,19 @@ impl ApplicationHandler<UserEvent> for App {
                         MouseScrollDelta::LineDelta(_, y) => (y * WHEEL_LINES) as i32,
                         MouseScrollDelta::PixelDelta(p) => (p.y / BASE_LINE_PX) as i32,
                     };
-                    self.popouts[idx].win.clear_selection();
-                    self.popouts[idx].sess.scroll(lines);
-                    let overlay = self.popouts[idx].sess.bottom_text(1);
-                    self.popouts[idx].win.set_overlay_text(overlay);
-                    let snap = self.popouts[idx].sess.styled_content();
-                    let spans: Vec<TerminalTextSpan> = snap
-                        .spans
-                        .iter()
-                        .map(|sp| TerminalTextSpan {
-                            start: sp.start,
-                            end: sp.end,
-                            rgb: sp.rgb,
-                            bold: sp.bold,
-                            italic: sp.italic,
-                        })
-                        .collect();
-                    self.popouts[idx]
-                        .win
-                        .set_styled_content(&snap.text, snap.cursor, &spans);
+                    self.popouts[idx].win.clear_term_pane_selections();
+                    // Route the scroll to whichever tile is under the pointer;
+                    // when the pointer is off-tile (just to chrome), scroll the
+                    // focused tile's session.
+                    let (px, py) = self.popouts[idx].pointer;
+                    let cell_target = self.popouts[idx].win.term_pane_cell_at(px as f32, py as f32).map(|(tid, ..)| tid).or_else(|| self.popouts.get(idx).and_then(|p| match p.pane_tree.focused_content() { PaneContent::Terminal(tid) => Some(tid), _ => None }));
+                    if let Some(tid) = cell_target {
+                        if let Some(s) = self.popout_session_mut(idx, tid) { s.scroll(lines); }
+                        if let Some(snap) = self.popout_session(idx, tid).map(|s| s.styled_content()) {
+                            let spans: Vec<TerminalTextSpan> = snap.spans.iter().map(|sp| TerminalTextSpan { start: sp.start, end: sp.end, rgb: sp.rgb, bold: sp.bold, italic: sp.italic }).collect();
+                            self.popouts[idx].win.set_term_pane_content(tid, &snap.text, snap.cursor, &spans, snap.display_offset);
+                        }
+                    }
                     self.popouts[idx].win.request_redraw();
                 }
                 _ => {}

@@ -78,6 +78,18 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 "#;
 
 /// Append one rounded rect (6 verts) to `out` (LE f32 bytes). Returns vert count.
+/// Pure tile-card calc (kept a free fn so it can be invoked from inside a
+/// mutable borrow of `PopoutWindow.tiles`).
+fn tile_card_px(r: [f32; 4], ix: f32, iy: f32, iw: f32, ih: f32, pad: f32) -> (f32, f32, f32, f32) {
+    let g = pad * 0.5;
+    (
+        ix + r[0] * iw + g,
+        iy + r[1] * ih + g,
+        (r[2] * iw - g * 2.0).max(1.0),
+        (r[3] * ih - g * 2.0).max(1.0),
+    )
+}
+
 fn push_rquad(
     out: &mut Vec<u8>,
     sw: f32,
@@ -707,6 +719,190 @@ impl PopoutWindow {
         self.reshape_buffer();
     }
 
+    /// Wipe + rebuild the per-tile terminal batch with `terms` + their dividers.
+    /// Mirrors `Renderer::set_panes` (terminal-only, no editor/doc leaves):
+    /// tiles are reused by id when they survive a split-close.
+    pub fn set_term_panes(
+        &mut self,
+        terms: &[(u64, [f32; 4], bool)],
+        divs: &[PaneDividerSpec],
+    ) {
+        self.pane_divs = divs.to_vec();
+        self.tiles.retain(|t| terms.iter().any(|(tid, ..)| *tid == t.id));
+        let metrics = self.buffer.metrics();
+        for &(id, rect, focused) in terms {
+            if let Some(t) = self.tiles.iter_mut().find(|t| t.id == id) {
+                t.rect = rect;
+                t.focused = focused;
+                if focused {
+                    self.focused_tile = Some(id);
+                }
+            } else {
+                let mut buf = Buffer::new(&mut self.font_system, metrics);
+                buf.set_wrap(Wrap::None);
+                self.tiles.push(PopoutTile {
+                    id,
+                    rect,
+                    buffer: buf,
+                    cursor: None,
+                    focused,
+                    display_offset: 0,
+                    sel: None,
+                    focus_anim: if focused { 1.0 } else { 0.0 },
+                });
+                if focused {
+                    self.focused_tile = Some(id);
+                }
+            }
+        }
+        let (ix, iy, iw, ih) = self.term_island();
+        let pad = self.pad;
+        for t in &mut self.tiles {
+            let (_, _, pw, ph) = tile_card_px(t.rect, ix, iy, iw, ih, pad);
+            let w = (pw - pad * 2.0).max(1.0);
+            let h = (ph - pad * 2.0).max(1.0);
+            t.buffer.set_size(Some(w), Some(h));
+            t.buffer.shape_until_scroll(&mut self.font_system, false);
+        }
+        self.window.request_redraw();
+    }
+
+    pub fn set_term_pane_content(
+        &mut self,
+        id: u64,
+        text: &str,
+        cursor: Option<(usize, usize)>,
+        spans: &[crate::renderer::TerminalTextSpan],
+        display_offset: usize,
+    ) {
+        let (ix, iy, iw, ih) = self.term_island();
+        let pad = self.pad;
+        let Some(t) = self.tiles.iter_mut().find(|t| t.id == id) else { return; };
+        t.cursor = cursor;
+        t.display_offset = display_offset;
+        let default_attrs = Attrs::new().family(Family::Monospace);
+        if spans.is_empty() {
+            t.buffer.set_text(text, &default_attrs, Shaping::Advanced, None);
+        } else {
+            let mut rich: Vec<(&str, Attrs)> = Vec::with_capacity(spans.len() * 2 + 1);
+            let mut pos = 0;
+            for span in spans {
+                if span.start > pos {
+                    if let Some(seg) = text.get(pos..span.start) {
+                        rich.push((seg, default_attrs.clone()));
+                    }
+                }
+                if let Some(seg) = text.get(span.start..span.end) {
+                    let mut attrs = default_attrs
+                        .clone()
+                        .color(Color::rgb(span.rgb[0], span.rgb[1], span.rgb[2]));
+                    if span.bold {
+                        attrs = attrs.weight(Weight::BOLD);
+                    }
+                    if span.italic {
+                        attrs = attrs.style(Style::Italic);
+                    }
+                    rich.push((seg, attrs));
+                }
+                pos = span.end;
+            }
+            if let Some(seg) = text.get(pos..) {
+                rich.push((seg, default_attrs.clone()));
+            }
+            t.buffer.set_rich_text(rich, &default_attrs, Shaping::Advanced, None);
+        }
+        let r = t.rect;
+        let (_, _, pw, ph) = tile_card_px(r, ix, iy, iw, ih, pad);
+        t.buffer.set_size(
+            Some((pw - pad * 2.0).max(1.0)),
+            Some((ph - pad * 2.0).max(1.0)),
+        );
+        t.buffer.shape_until_scroll(&mut self.font_system, false);
+        self.window.request_redraw();
+    }
+
+    pub fn set_term_pane_selection(&mut self, id: u64, sel: Option<((usize, usize), (usize, usize))>) {
+        if let Some(t) = self.tiles.iter_mut().find(|t| t.id == id) {
+            t.sel = sel;
+            self.window.request_redraw();
+        }
+    }
+
+    pub fn clear_term_pane_selections(&mut self) {
+        let mut changed = false;
+        for t in &mut self.tiles {
+            if t.sel.take().is_some() { changed = true; }
+        }
+        if changed { self.window.request_redraw(); }
+    }
+
+    /// Hit-test a tile under `(x, y)` and map to a GRID cell row/col (viewport
+    /// row + current tile display_offset, same framing as the in-app pane).
+    pub fn term_pane_cell_at(&self, x: f32, y: f32) -> Option<(u64, usize, usize)> {
+        for t in &self.tiles {
+            let (px, py, pw, ph) = self.tile_card_px(t.rect);
+            if x < px || x > px + pw || y < py || y > py + ph { continue; }
+            let ct = py + self.pad;
+            let cols = ((pw - self.pad * 2.0) / self.cell_w).floor().max(1.0) as usize;
+            let rows = ((ph - self.pad * 2.0) / self.line_px).floor().max(1.0) as usize;
+            let viewport_row = (((y - ct) / self.line_px).floor().max(0.0) as usize).min(rows - 1);
+            let col = (((x - px - self.pad) / self.cell_w).floor().max(0.0) as usize).min(cols - 1);
+            return Some((t.id, viewport_row + t.display_offset, col));
+        }
+        None
+    }
+
+    pub fn term_pane_selection(&self) -> Option<(u64, ((usize, usize), (usize, usize)))> {
+        for t in &self.tiles {
+            if let Some((a, b)) = t.sel.filter(|(a, b)| a != b) {
+                return Some((t.id, (a, b)));
+            }
+        }
+        None
+    }
+
+    pub fn term_pane_grid(&self, id: u64) -> Option<(usize, usize)> {
+        let t = self.tiles.iter().find(|t| t.id == id)?;
+        let (_, _, pw, ph) = self.tile_card_px(t.rect);
+        let cols = ((pw - self.pad * 2.0) / self.cell_w).floor().max(1.0) as usize;
+        let rows = ((ph - self.pad * 2.0) / self.line_px).floor().max(1.0) as usize;
+        Some((cols, rows))
+    }
+
+    /// Resize direction for an inside-popout divider at `(x, y)`.
+    pub fn pane_divider_at(&self, x: f32, y: f32) -> Option<(u32, bool)> {
+        let (ix, iy, iw, ih) = self.term_island();
+        let tol = self.pad;
+        for d in &self.pane_divs {
+            let dx = ix + d.x * iw;
+            let dy = iy + d.h;
+            let y0 = iy + d.y * ih;
+            let y1 = y0 + d.h * ih;
+            if d.horizontal_split {
+                let px = dx;
+                if (x - px).abs() <= tol && y >= y0 && y <= y1 {
+                    return Some((d.path, true));
+                }
+            } else {
+                let py = dy;
+                let x0 = ix + d.x * iw;
+                let x1 = x0 + d.w * iw;
+                if (y - py).abs() <= tol && x >= x0 && x <= x1 {
+                    return Some((d.path, false));
+                }
+            }
+        }
+        None
+    }
+
+    /// Tile card px inside the popup's terminal island (deflate by half a pad,
+    /// the same gap the in-app renderer uses between tiles). Pure free fn so it
+    /// can be called from within a mut borrow of `self.tiles`.
+    fn tile_card_px(&self, r: [f32; 4]) -> (f32, f32, f32, f32) {
+        let (ix, iy, iw, ih) = self.term_island();
+        tile_card_px(r, ix, iy, iw, ih, self.pad)
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         self.config.width = width.max(1);
         self.config.height = height.max(1);
@@ -763,6 +959,7 @@ impl PopoutWindow {
         // Terminal island fills the window (rust focus ring + dark fill), like
         // an editor pane tile — the pop-out is essentially one tile.
         let (ix, iy, iw, ih) = self.term_island();
+        if self.tiles.is_empty() {
         verts += push_rquad(&mut bytes, sw, sh, ix, iy, iw, ih, PANE_FOCUS_BORDER_COLOR, radius);
         verts += push_rquad(
             &mut bytes,
@@ -814,6 +1011,54 @@ impl PopoutWindow {
                     TERM_CURSOR_COLOR,
                     2.0 * s,
                 );
+            }
+        }
+        } else {
+            // Multi-tile path: per-tile dark-fill card + rust focus ring on the
+            // focused tile, plus selection highlight, cursor block, and dividers.
+            for t in &self.tiles {
+                let (px, py, pw, ph) = tile_card_px(t.rect, ix, iy, iw, ih, self.pad);
+                let ring = if t.focused { PANE_FOCUS_BORDER_COLOR } else { PANEL_BORDER_COLOR };
+                verts += push_rquad(&mut bytes, sw, sh, px, py, pw, ph, ring, radius);
+                verts += push_rquad(&mut bytes, sw, sh,
+                    px + border, py + border,
+                    (pw - border * 2.0).max(1.0),
+                    (ph - border * 2.0).max(1.0),
+                    TERM_BG_COLOR, (radius - border).max(1.0));
+                if let Some((a, b)) = t.sel.filter(|(a, b)| a != b) {
+                    let (start, end) = if (a.0, a.1) <= (b.0, b.1) { (a, b) } else { (b, a) };
+                    let cols = ((pw - self.pad * 2.0) / self.cell_w).floor().max(1.0) as usize;
+                    let rows_visible = ((ph - self.pad * 2.0) / self.line_px).floor().max(1.0) as usize;
+                    let tx = px + self.pad;
+                    let ty = py + self.pad;
+                    for grid_row in start.0..=end.0 {
+                        if grid_row < t.display_offset { continue; }
+                        let view_row = grid_row - t.display_offset;
+                        if view_row >= rows_visible { continue; }
+                        let c0 = if grid_row == start.0 { start.1 } else { 0 };
+                        let c1 = if grid_row == end.0 { end.1 } else { cols.saturating_sub(1) };
+                        let x0 = tx + c0 as f32 * self.cell_w;
+                        let y0 = ty + view_row as f32 * self.line_px;
+                        let wq = (((c1 + 1).saturating_sub(c0)) as f32 * self.cell_w).min((px + pw - self.pad - x0).max(0.0));
+                        if wq > 0.0 && y0 + self.line_px <= py + ph - self.pad {
+                            verts += push_rquad(&mut bytes, sw, sh, x0, y0, wq, self.line_px, SELECTION_COLOR, 0.0);
+                        }
+                    }
+                }
+                if let Some((row, col)) = t.cursor {
+                    let cx0 = px + self.pad + col as f32 * self.cell_w;
+                    let cy0 = py + self.pad + (row as i64 - t.display_offset as i64).max(0) as f32 * self.line_px;
+                    if cx0 + self.cell_w <= px + pw - self.pad && cy0 + self.line_px <= py + ph - self.pad {
+                        verts += push_rquad(&mut bytes, sw, sh, cx0, cy0, self.cell_w, self.line_px, TERM_CURSOR_COLOR, 2.0 * s);
+                    }
+                }
+            }
+            for d in &self.pane_divs {
+                let gx = ix + d.x * iw;
+                let gy = iy + d.y * ih;
+                let gw = d.w * iw;
+                let gh = d.h * ih;
+                verts += push_rquad(&mut bytes, sw, sh, gx, gy, gw.max(1.0), gh.max(1.0), PANEL_BORDER_COLOR, 0.0);
             }
         }
         // Everything above draws UNDER the terminal text; the control island
@@ -943,7 +1188,7 @@ impl PopoutWindow {
         // `bytes` above (they had to be written before the quad vbuf upload).
         // The label TextArea for the menu must be appended here, where the
         // areas vec is assembled for glyphon.
-        let mut areas = Vec::with_capacity(3);
+        let mut areas = Vec::with_capacity(3 + self.tiles.len());
         if let Some(buf) = &self.overlay {
             areas.push(TextArea {
                 buffer: buf,
@@ -980,7 +1225,31 @@ impl PopoutWindow {
                 custom_glyphs: &[],
             });
         }
-        areas.push(term_area);
+        // Single-tile buffer pushes when multi-tile isn't active; otherwise
+        // emit one TextArea per tile so glyphs land inside their cards.
+        if self.tiles.is_empty() {
+            areas.push(term_area);
+        } else {
+            let (ix2, iy2, iw2, ih2) = self.term_island();
+            let pad = self.pad;
+            for t in &self.tiles {
+                let (px, py, pw, ph) = tile_card_px(t.rect, ix2, iy2, iw2, ih2, pad);
+                areas.push(TextArea {
+                    buffer: &t.buffer,
+                    left: px + pad,
+                    top: py + pad,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left: px as i32,
+                        top: py as i32,
+                        right: (px + pw) as i32,
+                        bottom: (py + ph) as i32,
+                    },
+                    default_color: Color::rgb(220, 214, 201),
+                    custom_glyphs: &[],
+                });
+            }
+        }
         if self
             .text_renderer
             .prepare(
