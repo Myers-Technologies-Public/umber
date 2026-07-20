@@ -4088,6 +4088,7 @@ impl App {
         };
         let empty_hint = self.view == View::Editor
             && !self.term_tab_active
+            && self.pane_terms.is_empty()
             && self.buffer.len_chars() == 0
             && self.buffer.path().is_none()
             && self.remote_file.is_none();
