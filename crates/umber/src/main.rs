@@ -4132,9 +4132,13 @@ impl App {
     /// shell (it returns focus to the editor); Ctrl+letter becomes the C0
     /// control byte, so Ctrl+C is SIGINT to the PTY, deliberately NOT the
     /// editor copy command.
-    fn term_key_bytes(event: &KeyEvent, ctrl: bool) -> Option<Vec<u8>> {
+    fn term_key_bytes(event: &KeyEvent, ctrl: bool, shift: bool) -> Option<Vec<u8>> {
         match &event.logical_key {
-            Key::Named(NamedKey::Enter) => Some(b"\r".to_vec()),
+            // Plain Enter submits (CR); Shift+Enter inserts a newline (LF) so
+            // multiline TUIs (pi/Claude, REPLs) can add a line without sending.
+            Key::Named(NamedKey::Enter) => {
+                Some(if shift { b"\n".to_vec() } else { b"\r".to_vec() })
+            }
             Key::Named(NamedKey::Backspace) => Some(vec![0x7f]),
             Key::Named(NamedKey::Tab) => Some(b"\t".to_vec()),
             Key::Named(NamedKey::ArrowUp) => Some(b"\x1b[A".to_vec()),
@@ -4670,7 +4674,7 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             return;
                         }
-                        if let Some(bytes) = Self::term_key_bytes(&key, ctrl) {
+                        if let Some(bytes) = Self::term_key_bytes(&key, ctrl, shift) {
                             self.popouts[idx].sess.write(bytes);
                         }
                     }
@@ -5657,7 +5661,7 @@ impl ApplicationHandler<UserEvent> for App {
                         .and_then(|id| self.pane_session(id))
                         .or(self.terminal.as_ref());
                     if let (Some(session), Some(bytes)) =
-                        (session, Self::term_key_bytes(&event, ctrl))
+                        (session, Self::term_key_bytes(&event, ctrl, self.modifiers.shift_key()))
                     {
                         session.write(bytes);
                     }
