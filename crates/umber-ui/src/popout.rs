@@ -1269,6 +1269,35 @@ impl PopoutWindow {
                     (1.0 * s).max(1.0), PANEL_BORDER_COLOR, 0.0);
             }
         }
+        // Rename modal card — POST-text so it draws OVER terminal glyphs.
+        // A small centered card at the top of the island with the input prompt.
+        let rename_area_desc: Option<(f32, f32, f32)> = if self.is_rename_active() {
+            let card_w = 300.0 * s;
+            let card_h = self.line_px * 3.0;
+            let card_x = (sw - card_w) * 0.5;
+            let card_y = self.pad * 2.0;
+            verts += push_rquad(&mut bytes, sw, sh,
+                card_x, card_y, card_w, card_h,
+                PANEL_BORDER_COLOR, 8.0 * s);
+            verts += push_rquad(&mut bytes, sw, sh,
+                card_x + s, card_y + s,
+                (card_w - 2.0 * s).max(1.0),
+                (card_h - 2.0 * s).max(1.0),
+                EDITOR_PANEL_COLOR, 7.0 * s);
+            // Shape the rename prompt text into context_buffer.
+            let prompt = format!("name> {}\u{258f}", self.rename_input);
+            self.context_buffer.set_text(
+                &prompt,
+                &Attrs::new().family(Family::Monospace),
+                Shaping::Advanced,
+                None,
+            );
+            self.context_buffer.set_size(Some(card_w - self.pad * 2.0), Some(self.line_px));
+            self.context_buffer.shape_until_scroll(&mut self.font_system, false);
+            Some((card_x + self.pad, card_y + self.line_px * 0.5, card_w))
+        } else {
+            None
+        };
         if !bytes.is_empty() {
             self.queue.write_buffer(&self.quad_vbuf, 0, &bytes);
         }
@@ -1351,9 +1380,11 @@ impl PopoutWindow {
         // Overlay text pass: render menu labels on top of the menu card via
         // the overlay_text_renderer. The card paints over terminal glyphs,
         // and the label renders clearly above it.
+        // Overlay text pass: menu labels OR rename modal label over their cards.
+        let mut ov_areas: Vec<TextArea> = Vec::new();
         if self.context_active {
             if let Some((mx, my, mw, _)) = menu_area_desc {
-                let ov_areas = vec![TextArea {
+                ov_areas.push(TextArea {
                     buffer: &self.context_buffer,
                     left: mx,
                     top: my,
@@ -1366,17 +1397,36 @@ impl PopoutWindow {
                     },
                     default_color: Color::rgb(226, 219, 205),
                     custom_glyphs: &[],
-                }];
-                let _ = self.overlay_text_renderer.prepare(
-                    &self.device,
-                    &self.queue,
-                    &mut self.font_system,
-                    &mut self.atlas,
-                    &self.viewport,
-                    ov_areas,
-                    &mut self.swash_cache,
-                );
+                });
             }
+        }
+        if let Some((rx, ry, rw)) = rename_area_desc {
+            // Rename modal reuses context_buffer (already shaped above).
+            ov_areas.push(TextArea {
+                buffer: &self.context_buffer,
+                left: rx,
+                top: ry,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: (rx - self.pad) as i32,
+                    top: ry as i32,
+                    right: (rx + rw) as i32,
+                    bottom: self.config.height as i32,
+                },
+                default_color: Color::rgb(232, 232, 238),
+                custom_glyphs: &[],
+            });
+        }
+        if !ov_areas.is_empty() {
+            let _ = self.overlay_text_renderer.prepare(
+                &self.device,
+                &self.queue,
+                &mut self.font_system,
+                &mut self.atlas,
+                &self.viewport,
+                ov_areas,
+                &mut self.swash_cache,
+            );
         }
         if self
             .text_renderer
@@ -1463,7 +1513,7 @@ impl PopoutWindow {
             }
             // Overlay text — menu labels composited over the post-text card
             // so they sit on top instead of bleeding terminal glyphs through.
-            if self.context_active {
+            if self.context_active || self.is_rename_active() {
                 let _ = self
                     .overlay_text_renderer
                     .render(&self.atlas, &self.viewport, &mut pass);

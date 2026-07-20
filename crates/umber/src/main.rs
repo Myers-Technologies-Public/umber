@@ -5041,6 +5041,18 @@ impl ApplicationHandler<UserEvent> for App {
                     self.modifiers = modifiers.state();
                 }
                 WindowEvent::KeyboardInput { event: key, .. } => {
+                    if self.popouts[idx].win.is_rename_active() {
+                        use umber_ui::RenameOutcome;
+                        let outcome = self.popouts[idx].win.rename_handle_key(&key);
+                        if let Some(RenameOutcome::Commit { id, name }) = &outcome {
+                            if let Some(p) = self.popouts.get_mut(idx) {
+                                if name.is_empty() { p.pane_names.remove(id); }
+                                else { p.pane_names.insert(*id, name.clone()); }
+                            }
+                            self.popout_sync_panes(idx);
+                        }
+                        return;
+                    }
                     if key.state == ElementState::Pressed {
                         let ctrl = self.modifiers.control_key();
                         let shift = self.modifiers.shift_key();
