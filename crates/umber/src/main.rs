@@ -4995,6 +4995,15 @@ impl ApplicationHandler<UserEvent> for App {
                         if let Some(s) = self.pane_session(tid) {
                             s.scroll(lines);
                         }
+                        // A scroll invalidates any drag-selection: the
+                        // selection is captured in viewport-relative rows, so
+                        // re-render would otherwise leave it pinned at the
+                        // old screen y. Drop it (matches every real terminal).
+                        self.term_sel = None;
+                        self.term_selecting = false;
+                        if let Some(r) = self.renderer.as_mut() {
+                            r.clear_term_selections();
+                        }
                         // Re-push the scrolled content so the term pane
                         // reshapes at its new viewport. The drag-selection is
                         // stored in CELL coords (row,col) on TermPaneView, so
