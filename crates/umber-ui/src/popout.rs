@@ -834,7 +834,12 @@ impl PopoutWindow {
             verts += push_rquad(&mut bytes, sw, sh,
                 ix + self.pad * 0.9, py,
                 (iw - self.pad * 1.8).max(1.0), strip_h,
-                EDITOR_PANEL_COLOR, 6.0 * s);
+                PANEL_BORDER_COLOR, 6.0 * s);
+            verts += push_rquad(&mut bytes, sw, sh,
+                ix + self.pad * 0.9 + s, py + s,
+                (iw - self.pad * 1.8 - 2.0 * s).max(1.0),
+                (strip_h - 2.0 * s).max(1.0),
+                EDITOR_PANEL_COLOR, 5.0 * s);
             overlay_top = Some(py);
         }
         let under_verts = verts;

@@ -4862,7 +4862,19 @@ impl ApplicationHandler<UserEvent> for App {
         event: WindowEvent,
     ) {
         // Pop-out windows own their own surface + render loop; route by id.
-        if let Some(idx) = self.popouts.iter().position(|p| p.win.id() == window_id) {
+        let known_popout = self.popouts.iter().position(|p| p.win.id() == window_id);
+        let is_main = self
+            .renderer
+            .as_ref()
+            .is_some_and(|r| r.window().id() == window_id);
+        if !is_main && known_popout.is_none() {
+            // Stale events for a window that was just dropped (e.g. a pop-out that
+            // `popouts.remove`'d seconds ago dispatching its final
+            // CloseRequested/Destroyed): ignore entirely so they don't cascade
+            // into the main window's event loop and kill the app.
+            return;
+        }
+        if let Some(idx) = known_popout {
             match event {
                 WindowEvent::CloseRequested => {
                     let mut p = self.popouts.remove(idx);
