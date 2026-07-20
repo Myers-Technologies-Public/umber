@@ -1305,10 +1305,13 @@ impl Renderer {
         let fw = self.surface_config.width as f32;
         let fh = self.surface_config.height as f32;
         let x = self.sidebar_w() + gap;
-        // Panels fill to the top; the command + controls islands float over
-        // them in the draggable strip (mirrors the pop-out layout).
-        let y = gap;
-        (x, y, (fw - x - gap).max(1.0), (fh - gap - y).max(1.0))
+        // Panels begin below the floating top island (the activity strip +
+        // its height), so they never collide with it. Mirrors the gap a popout
+        // leaves below its chrome. Only the main window is shifted, never the
+        // pop-outs (their own layout is untouched above them).
+        let ts = self.tabstrip_h().max(self.line_px() * 1.3);
+        let y = gap + ts + gap;
+        (x, y, (fw - x - gap).max(1.0), (fh - y - gap).max(1.0))
     }
 
     /// A pane's floating card in physical px: its normalized share of the
