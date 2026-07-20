@@ -3658,10 +3658,25 @@ impl App {
         let Some((cw, ch)) = self.renderer.as_ref().map(|r| r.cell_px()) else {
             return;
         };
-        // Split the tree FIRST so the tile's real grid exists before the
-        // shell spawns — spawning small and resizing garbles the first paint.
+        // Special case: the editor is the ONLY panel and its only open doc is
+        // an empty untitled scratch — opening a terminal should fully replace
+        // the vanished editor pane (not split-beside it), so there's no dead
+        // empty panel around the shell.
+        let lone_scratch = self.pane_tree.is_plain_editor()
+            && self.docs.len() == 1
+            && self.buffer.path().is_none()
+            && self.buffer.len_chars() == 0;
         let id = self.next_pane_term;
-        let pane_id = self.pane_tree.split(dir, PaneContent::Terminal(id), before);
+        let pane_id = if lone_scratch {
+            // Swap the editor leaf for this terminal (no split).
+            let leaf = self.pane_tree.editor_leaf().unwrap_or(0);
+            self.pane_tree.set_content(leaf, PaneContent::Terminal(id));
+            leaf
+        } else {
+            // Split the tree FIRST so the tile's real grid exists before the
+            // shell spawns — spawning small and resizing garbles the first paint.
+            self.pane_tree.split(dir, PaneContent::Terminal(id), before)
+        };
         self.sync_panes();
         let (cols, rows) = self
             .renderer
