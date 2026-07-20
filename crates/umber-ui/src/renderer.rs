@@ -2265,7 +2265,10 @@ impl Renderer {
                 // Lift viewport row to a GRID row so the selection survives
                 // scroll (stored cell coords are grid-relative, see TermPaneView::sel).
                 let viewport_row = (((y - ct) / lh).floor().max(0.0) as usize).min(rows - 1);
-                let row = viewport_row + p.display_offset;
+                // Store GRID rows: alacritty's framing is `viewport_row = grid_row + offset`, so
+                // grid_row = viewport_row - offset. Use wrapping_sub so negative grid rows (older
+                // content) survive as usize values the draw can reconstitute via wrapping_add.
+                let row = viewport_row.wrapping_sub(p.display_offset);
                 return Some((p.id, row, col));
             }
         }
@@ -3830,13 +3833,12 @@ impl Renderer {
                     let cols = ((pw - ppad * 2.0) / pcell_w).floor().max(1.0) as usize;
                     let rows_visible = ((ph - ppad * 2.0) / pline_px).floor().max(1.0) as usize;
                     for grid_row in start.0..=end.0 {
-                        // Skip rows scrolled below the visible viewport (off-screen
-                        // under the current scroll position — the highlight follows
-                        // the text, so when the row is gone, the highlight is too).
-                        if grid_row < p.display_offset {
-                            continue;
-                        }
-                        let view_row = grid_row - p.display_offset;
+                        // Reconstitute the viewport row at the CURRENT scroll
+                        // position: viewport_row = grid_row + display_offset
+                        // (alacritty's framing). wrapping_add handles negative
+                        // grid_row (older content) so it skips off-top rows
+                        // via the >= rows_visible check below.
+                        let view_row = grid_row.wrapping_add(p.display_offset);
                         if view_row >= rows_visible {
                             continue;
                         }

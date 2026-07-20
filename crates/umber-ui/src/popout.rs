@@ -170,6 +170,10 @@ pub struct PopoutWindow {
     atlas: TextAtlas,
     viewport: Viewport,
     text_renderer: TextRenderer,
+    /// Second text renderer (mirrors the in-app renderer's overlay pipeline): it
+    /// runs AFTER the post-text quad pass so the context-menu card can sit on
+    /// top of terminal glyphs with its labels visible above the card.
+    overlay_text_renderer: TextRenderer,
     buffer: Buffer,
     /// Grid cell coords of the text cursor, like the main renderer's TermPane.
     cursor: Option<(usize, usize)>,
@@ -265,6 +269,9 @@ impl PopoutWindow {
         let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
         let text_renderer =
             TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
+        // Second instance for the post-text label pass (context menu labels).
+        let overlay_text_renderer =
+            TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
 
         let font_px = BASE_FONT * scale;
         let line_px = BASE_LINE * scale;
@@ -356,6 +363,7 @@ impl PopoutWindow {
             atlas,
             viewport,
             text_renderer,
+            overlay_text_renderer,
             buffer,
             cursor: None,
             tiles: Vec::new(),
@@ -847,7 +855,9 @@ impl PopoutWindow {
             let rows = ((ph - self.pad * 2.0) / self.line_px).floor().max(1.0) as usize;
             let viewport_row = (((y - ct) / self.line_px).floor().max(0.0) as usize).min(rows - 1);
             let col = (((x - px - self.pad) / self.cell_w).floor().max(0.0) as usize).min(cols - 1);
-            return Some((t.id, viewport_row + t.display_offset, col));
+            // Store GRID rows: alacritty framing is viewport_row = grid_row + offset, so
+            // grid_row = viewport_row - offset. wrapping_sub so negative grid rows survive.
+            return Some((t.id, viewport_row.wrapping_sub(t.display_offset), col));
         }
         None
     }
@@ -1032,8 +1042,8 @@ impl PopoutWindow {
                     let tx = px + self.pad;
                     let ty = py + self.pad;
                     for grid_row in start.0..=end.0 {
-                        if grid_row < t.display_offset { continue; }
-                        let view_row = grid_row - t.display_offset;
+                        // Reconstitute viewport_row = grid_row + display_offset (alacritty framing).
+                        let view_row = grid_row.wrapping_add(t.display_offset);
                         if view_row >= rows_visible { continue; }
                         let c0 = if grid_row == start.0 { start.1 } else { 0 };
                         let c1 = if grid_row == end.0 { end.1 } else { cols.saturating_sub(1) };
@@ -1064,39 +1074,12 @@ impl PopoutWindow {
         // Everything above draws UNDER the terminal text; the control island
         // and buttons below draw OVER it, so the grid is truly cut out beneath
         // them (a bordered island, no glyphs bleeding through).
-        // Pointer context-menu card + scroll-back overlay pill, pushed BEFORE
-        // the under/post split so they draw BEHIND their labels (label goes
-        // via the text pass that runs after under-verts and before post-quad).
-        let menu_area_desc: Option<(f32, f32, f32, usize)> = if self.context_active {
-            let pad_y = 5.0 * s;
-            let row_h = self.line_px;
-            let menu_h = self.context_rows as f32 * row_h + pad_y * 2.0;
-            verts += push_rquad(&mut bytes, sw, sh,
-                self.context_x, self.context_y,
-                self.context_width, menu_h, PANEL_BORDER_COLOR, 8.0 * s);
-            verts += push_rquad(&mut bytes, sw, sh,
-                self.context_x + s, self.context_y + s,
-                (self.context_width - 2.0 * s).max(1.0),
-                (menu_h - 2.0 * s).max(1.0), EDITOR_PANEL_COLOR, 7.0 * s);
-            if let Some(row) = self.context_hover {
-                verts += push_rquad(&mut bytes, sw, sh,
-                    self.context_x + 4.0 * s,
-                    self.context_y + pad_y + row as f32 * row_h,
-                    (self.context_width - 8.0 * s).max(1.0),
-                    row_h, SELECTION_COLOR, 5.0 * s);
-            }
-            let seps = self.context_separators.clone();
-            for sep in seps {
-                let ly = self.context_y + pad_y + (sep + 1) as f32 * row_h;
-                verts += push_rquad(&mut bytes, sw, sh,
-                    self.context_x + 6.0 * s, ly,
-                    (self.context_width - 12.0 * s).max(1.0),
-                    (1.0 * s).max(1.0), PANEL_BORDER_COLOR, 0.0);
-            }
-            Some((self.context_x + 10.0 * s, self.context_y + 5.0 * s, self.context_width, self.context_rows))
-        } else {
-            None
-        };
+        // Compute the menu's draw descriptor (deferring the card quads to the
+        // POST-text sector so terminal glyphs sit BENEATH the card — labels go
+        // through the overlay_text_renderer over both).
+        let menu_area_desc: Option<(f32, f32, f32, usize)> = self.context_active.then(||
+            (self.context_x + 10.0 * s, self.context_y + 5.0 * s, self.context_width, self.context_rows)
+        );
         let mut overlay_top: Option<f32> = None;
         if let Some(buf) = &self.overlay {
             let n = buf.layout_runs().count().max(1) as f32;
@@ -1156,6 +1139,35 @@ impl PopoutWindow {
                 *bw + grow, *bh + grow, c, (*bw + grow) * 0.5,
             );
         }
+        // Context menu card — POST-text so it draws OVER terminal glyphs,
+        // and the menu labels go through overlay_text_renderer right after.
+        if self.context_active {
+            let pad_y = 5.0 * s;
+            let row_h = self.line_px;
+            let menu_h = self.context_rows as f32 * row_h + pad_y * 2.0;
+            verts += push_rquad(&mut bytes, sw, sh,
+                self.context_x, self.context_y,
+                self.context_width, menu_h, PANEL_BORDER_COLOR, 8.0 * s);
+            verts += push_rquad(&mut bytes, sw, sh,
+                self.context_x + s, self.context_y + s,
+                (self.context_width - 2.0 * s).max(1.0),
+                (menu_h - 2.0 * s).max(1.0), EDITOR_PANEL_COLOR, 7.0 * s);
+            if let Some(row) = self.context_hover {
+                verts += push_rquad(&mut bytes, sw, sh,
+                    self.context_x + 4.0 * s,
+                    self.context_y + pad_y + row as f32 * row_h,
+                    (self.context_width - 8.0 * s).max(1.0),
+                    row_h, SELECTION_COLOR, 5.0 * s);
+            }
+            let seps = self.context_separators.clone();
+            for sep in seps {
+                let ly = self.context_y + pad_y + (sep + 1) as f32 * row_h;
+                verts += push_rquad(&mut bytes, sw, sh,
+                    self.context_x + 6.0 * s, ly,
+                    (self.context_width - 12.0 * s).max(1.0),
+                    (1.0 * s).max(1.0), PANEL_BORDER_COLOR, 0.0);
+            }
+        }
         if !bytes.is_empty() {
             self.queue.write_buffer(&self.quad_vbuf, 0, &bytes);
         }
@@ -1205,26 +1217,13 @@ impl PopoutWindow {
                 custom_glyphs: &[],
             });
         }
-        // NOTE: popout's overlay pill was previously pushed here in `bytes`.
-        // It is now drawn above as part of the menu+pill batch so we can do a
-        // single write_buffer before the text pass (avoiding the push_rquad
-        // borrow conflict against `self.overlay`).
-        if let Some((mx, my, mw, _)) = menu_area_desc {
-            areas.push(TextArea {
-                buffer: &self.context_buffer,
-                left: mx,
-                top: my,
-                scale: 1.0,
-                bounds: TextBounds {
-                    left: (mx - 10.0 * s) as i32,
-                    top: my as i32,
-                    right: (mx + mw) as i32,
-                    bottom: self.config.height as i32,
-                },
-                default_color: Color::rgb(226, 219, 205),
-                custom_glyphs: &[],
-            });
-        }
+        // Menu labels are rendered via the overlay_text_renderer (after the
+        // post-text quad pass) so they sit on top of the menu card.
+        // When the context menu is open, hide terminal text so the menu's
+        // card reads cleanly (no terminal glyphs under the menu). The card
+        // itself was already pushed in the post-text quad pass; the labels below
+        // are rendered by overlay_text_renderer over the card.
+        if !self.context_active {
         // Single-tile buffer pushes when multi-tile isn't active; otherwise
         // emit one TextArea per tile so glyphs land inside their cards.
         if self.tiles.is_empty() {
@@ -1248,6 +1247,37 @@ impl PopoutWindow {
                     default_color: Color::rgb(220, 214, 201),
                     custom_glyphs: &[],
                 });
+            }
+        }
+        }
+        // Overlay text pass: render menu labels on top of the menu card via
+        // the overlay_text_renderer. The card paints over terminal glyphs,
+        // and the label renders clearly above it.
+        if self.context_active {
+            if let Some((mx, my, mw, _)) = menu_area_desc {
+                let ov_areas = vec![TextArea {
+                    buffer: &self.context_buffer,
+                    left: mx,
+                    top: my,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left: (mx - 10.0 * s) as i32,
+                        top: my as i32,
+                        right: (mx + mw) as i32,
+                        bottom: self.config.height as i32,
+                    },
+                    default_color: Color::rgb(226, 219, 205),
+                    custom_glyphs: &[],
+                }];
+                let _ = self.overlay_text_renderer.prepare(
+                    &self.device,
+                    &self.queue,
+                    &mut self.font_system,
+                    &mut self.atlas,
+                    &self.viewport,
+                    ov_areas,
+                    &mut self.swash_cache,
+                );
             }
         }
         if self
@@ -1332,6 +1362,13 @@ impl PopoutWindow {
                 pass.set_pipeline(&self.quad_pipeline);
                 pass.set_vertex_buffer(0, self.quad_vbuf.slice(..));
                 pass.draw(under_verts..verts, 0..1);
+            }
+            // Overlay text — menu labels composited over the post-text card
+            // so they sit on top instead of bleeding terminal glyphs through.
+            if self.context_active {
+                let _ = self
+                    .overlay_text_renderer
+                    .render(&self.atlas, &self.viewport, &mut pass);
             }
         }
         self.queue.submit(std::iter::once(encoder.finish()));
