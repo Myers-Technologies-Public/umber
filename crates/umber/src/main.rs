@@ -4995,6 +4995,30 @@ impl ApplicationHandler<UserEvent> for App {
                         if let Some(s) = self.pane_session(tid) {
                             s.scroll(lines);
                         }
+                        // Re-push the scrolled content so the term pane
+                        // reshapes at its new viewport. The drag-selection is
+                        // stored in CELL coords (row,col) on TermPaneView, so
+                        // reshaping makes the highlight follow the text rather
+                        // than staying pinned at the old screen y.
+                        if let Some(snap) = self
+                            .pane_session(tid)
+                            .map(|s| s.styled_content())
+                        {
+                            let spans: Vec<TerminalTextSpan> = snap
+                                .spans
+                                .iter()
+                                .map(|sp| TerminalTextSpan {
+                                    start: sp.start,
+                                    end: sp.end,
+                                    rgb: sp.rgb,
+                                    bold: sp.bold,
+                                    italic: sp.italic,
+                                })
+                                .collect();
+                            if let Some(r) = self.renderer.as_mut() {
+                                r.set_term_pane_content(tid, &snap.text, snap.cursor, &spans);
+                            }
+                        }
                         // While scrolled up, pin the live bottom rows (the
                         // prompt + what you're typing) at the pane's bottom.
                         if let Some(rect) = self
