@@ -450,6 +450,33 @@ impl<N: TermNotifier> TerminalSession<N> {
         }
     }
 
+    /// Live rows from the bottom of the active viewport (the recent prompt /
+    /// what you're typing now), read **ignoring** the user's scroll position
+    /// and restoring it after. Returns `None` when the terminal is already at
+    /// the bottom (no overlay needed). Used by the scroll-back input overlay.
+    pub fn bottom_text(&self, n: usize) -> Option<String> {
+        let mut term = self.term.lock();
+        let off = term.renderable_content().display_offset;
+        if off == 0 {
+            return None;
+        }
+        term.scroll_display(Scroll::Bottom);
+        let lines = term.screen_lines();
+        let take = n.min(lines);
+        let content = term.renderable_content();
+        let mut rows: Vec<String> = vec![String::new(); lines];
+        for indexed in content.display_iter {
+            let row = indexed.point.line.0 as usize;
+            if row < lines {
+                rows[row].push(indexed.c);
+            }
+        }
+        term.scroll_display(Scroll::Delta(off as i32)); // restore user scroll
+        let start = lines.saturating_sub(take);
+        let text = rows[start..].join("\n").trim_end().to_string();
+        if text.is_empty() { None } else { Some(text) }
+    }
+
     /// Compatibility helper used by plain-text consumers and existing tests.
     pub fn content(&self) -> (String, Option<(usize, usize)>) {
         let snapshot = self.styled_content();
