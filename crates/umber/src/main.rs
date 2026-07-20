@@ -5093,13 +5093,13 @@ impl ApplicationHandler<UserEvent> for App {
                             px,
                             py,
                             &[
-                                "Open Pop-out (Left)",
-                                "Open Pop-out (Right)",
-                                "Open Pop-out (Up)",
-                                "Open Pop-out (Down)",
+                                "Split Left",
+                                "Split Right",
+                                "Split Up",
+                                "Split Down",
                                 "Copy",
                                 "Paste",
-                                "Close Pop-out",
+                                "Close Pane",
                             ],
                         );
                         self.popouts[idx].win.set_context_separators(&[3, 5]);
@@ -5182,7 +5182,9 @@ impl ApplicationHandler<UserEvent> for App {
                                             }
                                         }
                                     }
-                                    // Close Pop-out.
+                                    // Close Pane (closes the whole pop-out
+                                    // since each pop-out is one tile, but the
+                                    // label matches the in-app pane menu).
                                     _ => {
                                         let mut p = self.popouts.remove(idx);
                                         for (_, mut s) in p.pane_terms.drain(..) { s.shutdown(); }
