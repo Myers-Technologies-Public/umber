@@ -5579,6 +5579,20 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             return;
                         }
+                        // Ctrl+click a URL opens it in the default browser
+                        // instead of placing the caret.
+                        if self.modifiers.control_key() {
+                            if let Some(pos) = self.pointer_to_char() {
+                                let line = self.buffer.char_to_line(pos);
+                                let ls = self.buffer.line_to_char(line);
+                                let len = self.buffer.visual_line_len_chars(line);
+                                let line_str = self.buffer.slice_chars(ls, ls + len);
+                                if let Some(url) = url_at(&line_str, pos - ls) {
+                                    open_url(&url);
+                                    return;
+                                }
+                            }
+                        }
                         // Text press: place the caret and set the selection
                         // anchor. Shift extends from the existing anchor/caret; a
                         // plain press collapses (anchor == caret) and arms a drag.
@@ -6164,6 +6178,52 @@ fn is_word_char(c: char) -> bool {
 /// treats that as a line-only hover). A word char expands left/right over the
 /// maximal run of word chars; a punctuation char is a single-char span. `col`
 /// and the returned bounds are char indices, not bytes.
+/// The URL under `col` in `line`, if the whitespace-delimited token there is an
+/// `http(s)://` or `www.` link. Surrounding punctuation is trimmed; `www.` is
+/// promoted to `https://`.
+fn url_at(line: &str, col: usize) -> Option<String> {
+    let chars: Vec<char> = line.chars().collect();
+    if col >= chars.len() || chars[col].is_whitespace() {
+        return None;
+    }
+    let mut start = col;
+    while start > 0 && !chars[start - 1].is_whitespace() {
+        start -= 1;
+    }
+    let mut end = col + 1;
+    while end < chars.len() && !chars[end].is_whitespace() {
+        end += 1;
+    }
+    let raw: String = chars[start..end].iter().collect();
+    let trimmed = raw
+        .trim_start_matches(['(', '[', '{', '<', '"', '\''])
+        .trim_end_matches(['.', ',', ')', ']', '}', '>', '"', '\'', ';', ':', '!', '?']);
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        Some(trimmed.to_string())
+    } else if lower.starts_with("www.") {
+        Some(format!("https://{trimmed}"))
+    } else {
+        None
+    }
+}
+
+/// Open `url` in the OS default browser (best-effort, detached).
+fn open_url(url: &str) {
+    #[cfg(target_os = "linux")]
+    let mut cmd = std::process::Command::new("xdg-open");
+    #[cfg(target_os = "macos")]
+    let mut cmd = std::process::Command::new("open");
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "start", ""]);
+        c
+    };
+    cmd.arg(url);
+    let _ = cmd.spawn();
+}
+
 fn word_span_at(line: &str, col: usize) -> Option<(usize, usize)> {
     let chars: Vec<char> = line.chars().collect();
     let c = *chars.get(col)?;
