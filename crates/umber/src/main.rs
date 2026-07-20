@@ -582,6 +582,10 @@ fn resize_dir(x: f32, y: f32, w: f32, h: f32, m: f32) -> Option<winit::window::R
         (true, _, _, true) => NorthEast,
         (_, true, true, _) => SouthWest,
         (_, true, _, true) => SouthEast,
+        (true, _, _, _) => North,
+        (_, true, _, _) => South,
+        (_, _, true, _) => West,
+        (_, _, _, true) => East,
         _ => return None,
     })
 }
@@ -3677,6 +3681,8 @@ impl App {
                 self.pane_terms.push((id, sess));
                 self.term_focused = true;
                 self.sync_panes();
+                // Opening a terminal consumed the empty scratch tab.
+                self.close_scratch_tab();
             }
             Err(e) => {
                 // Roll the split back; an empty tile helps nobody.
@@ -4707,9 +4713,35 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
                 if !pane_updates.is_empty() {
+                    // Collect terminal pane rects + their live bottom line
+                    // before the mutable renderer borrow, so the pinned
+                    // scroll-back input overlay can refresh alongside content.
+                    let term_rects: Vec<(u64, [f32; 4])> = self
+                        .pane_tree
+                        .layout()
+                        .iter()
+                        .filter_map(|p| match p.content {
+                            PaneContent::Terminal(tid) => {
+                                Some((tid, [p.rect.x, p.rect.y, p.rect.w, p.rect.h]))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    let overlays: Vec<(u64, Option<([f32; 4], String)>)> = term_rects
+                        .iter()
+                        .map(|(tid, r)| {
+                            (*tid, self
+                                .pane_session(*tid)
+                                .and_then(|s| s.bottom_text(1))
+                                .map(|t| (*r, t)))
+                        })
+                        .collect();
                     if let Some(renderer) = self.renderer.as_mut() {
                         for (tid, text, cursor, spans) in &pane_updates {
                             renderer.set_term_pane_content(*tid, text, *cursor, spans);
+                            if let Some((_, ov)) = overlays.iter().find(|(t, _)| t == tid) {
+                                renderer.set_term_overlay(ov.clone());
+                            }
                         }
                         renderer.window().request_redraw();
                     }
@@ -4964,7 +4996,9 @@ impl ApplicationHandler<UserEvent> for App {
                             .find(|p| matches!(p.content, PaneContent::Terminal(t2) if t2 == tid))
                             .map(|p| [p.rect.x, p.rect.y, p.rect.w, p.rect.h])
                         {
-                            let text = self.pane_session(tid).and_then(|s| s.bottom_text(8));
+                            // Show just the being-typed input line (not 6-10
+                            // rows): one live row at the pane bottom.
+                            let text = self.pane_session(tid).and_then(|s| s.bottom_text(1));
                             if let Some(r) = self.renderer.as_mut() {
                                 r.set_term_overlay(text.map(|t| (rect, t)));
                             }
