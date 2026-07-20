@@ -40,11 +40,13 @@ winit = "0.30"
 cosmic-text = "0.19"
 ropey = "1.6"
 pollster = "1.0"
-# Wayland-first system clipboard. `wayland-data-control` adds the wl-clipboard-rs
-# backend (works without a focused surface); default features (image-data) are
-# off since a text editor never puts images on the clipboard. Resolved to
-# arboard 3.6.1 against crates.io on 2026-07-16.
-arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }
+# System clipboard. Backend selection is platform-split at the consuming crate
+# (crates/umber): Linux re-adds the `wayland-data-control` (wl-clipboard-rs)
+# backend that works without a focused surface, while Windows/macOS use arboard's
+# always-on native backends. Default features (image-data) stay off since a text
+# editor never puts images on the clipboard. Resolved to arboard 3.6.1 against
+# crates.io on 2026-07-16.
+arboard = { version = "3.6", default-features = false }
 
 # P2 module host (D9). Versions resolved against crates.io on 2026-07-16 via a
 # scratch `cargo add`. wasmtime carries the `wat` feature so the host compiles

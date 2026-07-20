@@ -297,7 +297,8 @@ impl Drop for ModuleHost {
 // Discovery + enabled-set persistence
 // ===========================================================================
 
-/// `$XDG_CONFIG_HOME/umber/modules`, else `$HOME/.config/umber/modules`. Mirrors
+/// `<config-root>/umber/modules`, where the config root is `$XDG_CONFIG_HOME`
+/// (else `$HOME/.config`) on unix and `%APPDATA%` on Windows. Mirrors
 /// umber-kernel's `Config::path` resolution so modules sit beside the config.
 pub fn modules_dir() -> Option<PathBuf> {
     config_root().map(|r| r.join("modules"))
@@ -311,13 +312,23 @@ pub fn enabled_path() -> Option<PathBuf> {
 }
 
 fn config_root() -> Option<PathBuf> {
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-        if !xdg.is_empty() {
-            return Some(PathBuf::from(xdg).join("umber"));
-        }
+    // Windows has no XDG/HOME convention; native apps store per-user config
+    // under %APPDATA% (roaming). unix keeps the prior XDG -> ~/.config order.
+    #[cfg(windows)]
+    {
+        let appdata = std::env::var_os("APPDATA")?;
+        Some(PathBuf::from(appdata).join("umber"))
     }
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".config").join("umber"))
+    #[cfg(not(windows))]
+    {
+        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+            if !xdg.is_empty() {
+                return Some(PathBuf::from(xdg).join("umber"));
+            }
+        }
+        let home = std::env::var_os("HOME")?;
+        Some(PathBuf::from(home).join(".config").join("umber"))
+    }
 }
 
 /// One entry found by [`discover`]: its directory and its parsed (or failed)

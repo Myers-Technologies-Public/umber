@@ -18,4 +18,13 @@ umber-kernel.workspace = true
 umber-host.workspace = true
 umber-proto = { workspace = true }
 winit.workspace = true
-arboard.workspace = true
+
+# Clipboard backend is platform-split. Linux re-enables arboard's
+# `wayland-data-control` (wl-clipboard-rs) backend on top of the workspace base;
+# Windows/macOS use arboard's always-on native backends (workspace base, default
+# features off). Splitting here keeps the Linux build byte-for-byte identical.
+[target.'cfg(target_os = "linux")'.dependencies]
+arboard = { workspace = true, features = ["wayland-data-control"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+arboard = { workspace = true }

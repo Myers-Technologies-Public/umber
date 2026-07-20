@@ -186,21 +186,31 @@ impl Default for Config {
 }
 
 impl Config {
-    /// `$XDG_CONFIG_HOME/umber/config.toml`, falling back to
-    /// `$HOME/.config/umber/config.toml`. `None` only if neither var is set.
+    /// On unix `$XDG_CONFIG_HOME/umber/config.toml`, falling back to
+    /// `$HOME/.config/umber/config.toml`; on Windows `%APPDATA%\umber\config.toml`.
+    /// `None` only if the underlying directory var is unset.
     pub fn path() -> Option<PathBuf> {
-        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-            if !xdg.is_empty() {
-                return Some(PathBuf::from(xdg).join("umber").join("config.toml"));
-            }
+        // Windows keys off %APPDATA%; unix keeps the XDG -> ~/.config order.
+        #[cfg(windows)]
+        {
+            let appdata = std::env::var_os("APPDATA")?;
+            Some(PathBuf::from(appdata).join("umber").join("config.toml"))
         }
-        let home = std::env::var_os("HOME")?;
-        Some(
-            PathBuf::from(home)
-                .join(".config")
-                .join("umber")
-                .join("config.toml"),
-        )
+        #[cfg(not(windows))]
+        {
+            if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+                if !xdg.is_empty() {
+                    return Some(PathBuf::from(xdg).join("umber").join("config.toml"));
+                }
+            }
+            let home = std::env::var_os("HOME")?;
+            Some(
+                PathBuf::from(home)
+                    .join(".config")
+                    .join("umber")
+                    .join("config.toml"),
+            )
+        }
     }
 
     /// Load config from [`Config::path`]. A missing/unreadable file returns
@@ -305,7 +315,7 @@ impl Config {
         let path = Self::path().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                "no config directory ($XDG_CONFIG_HOME/$HOME unset)",
+                "no config directory ($XDG_CONFIG_HOME/$HOME/%APPDATA% unset)",
             )
         })?;
         if let Some(parent) = path.parent() {
