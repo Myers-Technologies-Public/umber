@@ -18,6 +18,9 @@ version = "0.1.0-alpha.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Mason Myers <mason@myerscorp.net>"]
+description = "A minimalist, keyboard-first, GPU-rendered code editor."
+repository = "https://github.com/Myers-Technologies-Public/umber"
+homepage = "https://github.com/Myers-Technologies-Public/umber"
 
 [workspace.dependencies]
 alacritty_terminal = "0.26.0"

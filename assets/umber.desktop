@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Umber
+GenericName=Code Editor
+Comment=Minimalist, keyboard-first, GPU-rendered code editor
+Exec=umber %F
+Icon=umber
+Terminal=false
+Categories=Development;TextEditor;IDE;
+Keywords=editor;code;text;developer;
+StartupNotify=true
+StartupWMClass=umber

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Umber application icon — placeholder, generated for v0.1.0-alpha.1.
+     Swap this file and regenerate assets/umber-*.png + assets/umber.ico
+     (see assets/README.md) to replace the branding mark. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="umberGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#E9A23B"/>
+      <stop offset="1" stop-color="#6E4A2A"/>
+    </linearGradient>
+  </defs>
+  <rect x="64" y="64" width="896" height="896" rx="232" ry="232" fill="url(#umberGrad)"/>
+  <!-- Stylized "u" glyph, upward-facing cup -->
+  <path d="M 360 280 L 360 620 Q 360 744 512 744 Q 664 744 664 620 L 664 280"
+        fill="none" stroke="#FFFFFF" stroke-width="138" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Insertion-caret underscore, signalling a text editor -->
+  <rect x="392" y="792" width="240" height="138" rx="69" ry="69" fill="#FFFFFF"/>
+</svg>

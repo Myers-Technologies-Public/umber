@@ -22,3 +22,8 @@ First tagged pre-release. Research-phase build; expect rough edges.
   `%ComSpec%`, and `%APPDATA%`-based config resolution.
 - Open-source release scaffolding: dual MIT/Apache-2.0 licensing, CI workflow
   (Linux + Windows), and a tag-driven release workflow.
+- Installers: Windows MSI (WiX Toolset via cargo-wix) with a Start Menu shortcut
+  + PATH entry, and a self-contained Linux AppImage (linuxdeploy/appimagetool);
+  both are published to the Releases page alongside portable archives. A
+  placeholder brand icon ships under `assets/` (swap `assets/icon.svg` and
+  regenerate per `assets/README.md`).
