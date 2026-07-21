@@ -35,12 +35,17 @@ jobs:
       - name: Build MSI installer
         shell: bash
         run: |
-          mkdir -p target/wix
-          cargo wix --no-build \
+          # Absolute --target-bin-dir: cargo-wix may run the WiX linker (light)
+          # with the package dir as CWD, so a relative `target\...` could be
+          # resolved against crates/umber instead of the workspace root.
+          # $GITHUB_WORKSPACE is the checkout root; backslashes in bash double
+          # quotes stay literal, so the value is a clean Windows path.
+          mkdir -p "$GITHUB_WORKSPACE/target/wix"
+          cargo wix --no-build --nocapture \
             --target x86_64-pc-windows-msvc \
-            --target-bin-dir 'target\x86_64-pc-windows-msvc\release' \
+            --target-bin-dir "$GITHUB_WORKSPACE\target\x86_64-pc-windows-msvc\release" \
             --package umber \
-            -o "target/wix/umber-${{ github.ref_name }}-x86_64-windows.msi"
+            -o "$GITHUB_WORKSPACE/target/wix/umber-${{ github.ref_name }}-x86_64-windows.msi"
 
       - name: Build portable archive
         shell: bash
