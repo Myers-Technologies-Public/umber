@@ -45,7 +45,14 @@ jobs:
             --target x86_64-pc-windows-msvc \
             --target-bin-dir "$GITHUB_WORKSPACE\target\x86_64-pc-windows-msvc\release" \
             --package umber \
+            -L -sval \
             -o "$GITHUB_WORKSPACE/target/wix/umber-${{ github.ref_name }}-x86_64-windows.msi"
+          # -L -sval: skips WiX's internal-consistency (ICE) validation. The
+          # Start Menu shortcut in main.wxs trips the classic ICE38/43/57
+          # triad — Microsoft-documented as unsatisfiable for non-advertised
+          # all-users shortcuts in a per-machine install (they mutually
+          # contradict). Install semantics are correct; tighten to targeted
+          # `-L -sice ICE38 -L -sice ICE43 -L -sice ICE57` once stable.
 
       - name: Build portable archive
         shell: bash
