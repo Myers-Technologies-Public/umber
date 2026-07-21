@@ -3441,7 +3441,7 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "umber"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "alacritty_terminal",
  "arboard",
@@ -3457,7 +3457,7 @@ dependencies = [
 
 [[package]]
 name = "umber-host"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "mlua",
  "wasmtime",
@@ -3465,11 +3465,11 @@ dependencies = [
 
 [[package]]
 name = "umber-kernel"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 
 [[package]]
 name = "umber-proto"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -3477,7 +3477,7 @@ dependencies = [
 
 [[package]]
 name = "umber-syntax"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "tree-sitter",
  "tree-sitter-highlight",
@@ -3488,14 +3488,14 @@ dependencies = [
 
 [[package]]
 name = "umber-text"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "ropey",
 ]
 
 [[package]]
 name = "umber-ui"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "cosmic-text",
  "glyphon",
@@ -3507,7 +3507,7 @@ dependencies = [
 
 [[package]]
 name = "umber-update"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "ed25519-dalek",
  "self-replace",
@@ -3517,7 +3517,7 @@ dependencies = [
 
 [[package]]
 name = "umberd"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "umber-proto",
 ]

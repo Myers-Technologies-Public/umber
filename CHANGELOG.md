@@ -11,5 +11,14 @@ reaches a first tagged release.
 - Windows support: platform-split clipboard backend (arboard native backends on
   Windows/macOS, `wayland-data-control` on Linux), ConPTY terminals via
   `%ComSpec%`, and `%APPDATA%`-based config resolution.
+
+## [0.1.0-alpha.1] - 2026-07-21
+
+First tagged pre-release. Research-phase build; expect rough edges.
+
+### Added
+- Windows support: platform-split clipboard backend (arboard native backends on
+  Windows/macOS, `wayland-data-control` on Linux), ConPTY terminals via
+  `%ComSpec%`, and `%APPDATA%`-based config resolution.
 - Open-source release scaffolding: dual MIT/Apache-2.0 licensing, CI workflow
   (Linux + Windows), and a tag-driven release workflow.
